@@ -227,39 +227,144 @@ def generate_test_inputs(
     return np.vstack(inputs)
 
 
+def resolve_onnx_for_st(st_file: Path, onnx_dir: Path = None) -> Path:
+    """
+    Find the ONNX model that corresponds to a given ST file.
+
+    Matching strategy (first match wins):
+      1. Exact stem match:       conv_temp.st  → conv_temp.onnx
+      2. Prefix/timestamp match: conv_temp.st  → conv_temp_20260310_095535.onnx
+    """
+    if onnx_dir is None:
+        onnx_dir = st_file.parent.parent / "onnx"
+
+    stem = st_file.stem
+
+    # 1. Exact match
+    exact = onnx_dir / f"{stem}.onnx"
+    if exact.exists():
+        return exact
+
+    # 2. Prefix match (handles timestamped names)
+    candidates = sorted(onnx_dir.glob(f"{stem}*.onnx"))
+    if candidates:
+        return candidates[0]
+
+    raise FileNotFoundError(
+        f"No ONNX model found for '{st_file.name}' in {onnx_dir}.\n"
+        f"  Tried: {exact}\n"
+        f"  Glob:  {stem}*.onnx (0 matches)\n"
+        f"  Hint:  pass --onnx <path> explicitly."
+    )
+
+
+def infer_input_size(onnx_model_path: Path) -> int:
+    """Read the ONNX model to determine the flat input size."""
+    import onnx
+
+    model = onnx.load(str(onnx_model_path))
+    inp = model.graph.input[0]
+    dims = [
+        d.dim_value if d.dim_value > 0 else 1 for d in inp.type.tensor_type.shape.dim
+    ]
+    # Skip batch dimension (first), multiply the rest
+    flat = 1
+    for d in dims[1:]:
+        flat *= d
+    return flat
+
+
 def main():
-    file_name = "test4_531k"
-    st_dir = Path("examples/models/structured_text")
-    st_file = st_dir / f"{file_name}.st"
+    import argparse
 
-    save_dir = Path("src/translation_validation/tmp")
+    parser = argparse.ArgumentParser(
+        description="Translation-validation: compare ST output against ONNX model."
+    )
+    parser.add_argument(
+        "st_file",
+        type=Path,
+        help="Path to the Structured Text (.st) file to validate.",
+    )
+    parser.add_argument(
+        "--onnx",
+        type=Path,
+        default=None,
+        help="Path to the ONNX model. If omitted, auto-resolved from the ST filename.",
+    )
+    parser.add_argument(
+        "--input-size",
+        type=int,
+        default=None,
+        help="Flat input size (e.g. 5). If omitted, inferred from the ONNX model.",
+    )
+    parser.add_argument(
+        "-n",
+        "--num-samples",
+        type=int,
+        default=100,
+        help="Number of random test samples (default: 100).",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print all sample comparisons, not just the first 3.",
+    )
+    args = parser.parse_args()
 
-    func_name = translate_and_save(st_file=st_file, save_file=save_dir / "test.py")
-    print(f"Translated function: {func_name}")
+    st_file = args.st_file
+    if not st_file.exists():
+        parser.error(f"ST file not found: {st_file}")
 
-    # Use ONNX model instead of Keras
-    onnx_model_file = Path(f"examples/models/onnx/{file_name}.onnx")
+    # Resolve ONNX model
+    if args.onnx is not None:
+        onnx_model_file = args.onnx
+    else:
+        onnx_model_file = resolve_onnx_for_st(st_file)
+    print(f"ST file:    {st_file}")
+    print(f"ONNX model: {onnx_model_file}")
 
-    # Generate synthetic test inputs
-    test_inputs = generate_test_inputs(num_samples=100, input_size=5)
+    # Determine input size
+    input_size = args.input_size or infer_input_size(onnx_model_file)
+    print(f"Input size: {input_size}")
 
+    # Generate test inputs
+    test_inputs = generate_test_inputs(
+        num_samples=args.num_samples, input_size=input_size
+    )
+
+    # Run full pipeline
     results = validate_translation(st_file, onnx_model_file, test_inputs)
-    print(f"Validation passed: {results.get('passed', False)}")
-    print(f"Max absolute difference: {results.get('max_abs_diff', 'N/A')}")
-    print(f"Max relative difference: {results.get('max_rel_diff', 'N/A')}")
 
-    if not results.get("passed", True):
-        print(f"Failed on {len(results.get('failed_indices', []))} samples")
+    if "error" in results:
+        print(f"\nERROR: {results['error']}")
+        return
 
-    # Print sample comparisons for debugging
-    if "sample_comparisons" in results:
-        print("\n--- Sample Comparisons (first 3) ---")
-        for sample in results["sample_comparisons"][:3]:
-            print(f"\nSample {sample['index']}:")
-            print(f"  Input: {sample['input'][:3]}...")
-            print(f"  Model:      {sample['model_output']}")
-            print(f"  Translated: {sample['translated_output']}")
-            print(f"  Abs Diff:   {sample['abs_diff']}")
+    # Report
+    passed = results.get("passed", False)
+    print(f"\n{'=' * 50}")
+    print(f"  Validation {'PASSED ✓' if passed else 'FAILED ✗'}")
+    print(f"{'=' * 50}")
+    print(f"  Max absolute difference: {results.get('max_abs_diff', 'N/A'):.2e}")
+    print(f"  Max relative difference: {results.get('max_rel_diff', 'N/A'):.2e}")
+
+    if not passed:
+        failed = results.get("failed_indices", [])
+        print(f"  Failed on {len(failed)} / {args.num_samples} samples")
+
+    # Sample comparisons
+    comparisons = results.get("sample_comparisons", [])
+    show = comparisons if args.verbose else comparisons[:3]
+    if show:
+        print(f"\n--- Sample Comparisons ({len(show)} shown) ---")
+        for sample in show:
+            print(f"\n  Sample {sample['index']}:")
+            print(
+                f"    Input:      {sample['input'][:5]}{'...' if len(sample['input']) > 5 else ''}"
+            )
+            print(f"    Model:      {sample['model_output']}")
+            print(f"    Translated: {sample['translated_output']}")
+            print(f"    Abs Diff:   {sample['abs_diff']}")
 
 
 if __name__ == "__main__":

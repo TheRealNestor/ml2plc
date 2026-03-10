@@ -341,6 +341,202 @@ def extract_dropout_layer(
     )
 
 
+def extract_conv2d_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> Conv2DLayer:
+    """Extract Conv2D layer from ONNX Conv node."""
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+
+    # Weight tensor: (out_channels, in_channels/groups, kH, kW)
+    weight_tensor = inputs[1]
+    weights = weight_tensor.value
+    if weights is None:
+        raise ValueError(f"Conv layer {layer_id}: weight tensor must be constant")
+
+    bias = None
+    if len(inputs) > 2 and inputs[2].is_weight and inputs[2].value is not None:
+        bias = inputs[2].value
+
+    kernel_shape = tuple(attrs.get("kernel_shape", list(weights.shape[2:])))
+    strides = tuple(attrs.get("strides", [1, 1]))
+    pads = tuple(attrs.get("pads", [0, 0, 0, 0]))
+    dilations = tuple(attrs.get("dilations", [1, 1]))
+    group = attrs.get("group", 1)
+
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    return Conv2DLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(t.name for t in inputs),
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        weights=weights,
+        bias=bias,
+        kernel_shape=kernel_shape,
+        strides=strides,
+        pads=pads,
+        dilations=dilations,
+        group=group,
+    )
+
+
+def extract_pool2d_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel, pool_type: str
+) -> Pool2DLayer:
+    """Extract MaxPool or AveragePool layer."""
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+
+    kernel_shape = tuple(attrs.get("kernel_shape", [2, 2]))
+    strides = tuple(
+        attrs.get("strides", kernel_shape)
+    )  # ONNX default: strides = kernel_shape
+    pads = tuple(attrs.get("pads", [0, 0, 0, 0]))
+
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    return Pool2DLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(t.name for t in inputs),
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        pool_type=pool_type,
+        kernel_shape=kernel_shape,
+        strides=strides,
+        pads=pads,
+    )
+
+
+def extract_maxpool_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> Pool2DLayer:
+    """Extract MaxPool layer."""
+    return extract_pool2d_layer(layer, layer_id, analyzer, pool_type="max")
+
+
+def extract_avgpool_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> Pool2DLayer:
+    """Extract AveragePool layer."""
+    return extract_pool2d_layer(layer, layer_id, analyzer, pool_type="avg")
+
+
+def extract_global_avgpool_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> Pool2DLayer:
+    """
+    Extract GlobalAveragePool layer.
+
+    GlobalAveragePool pools each channel over the entire spatial extent,
+    so kernel_shape = (H, W) of the input.
+    """
+    inputs = layer["resolved_inputs"]
+    input_shape, output_shape = infer_layer_shapes(layer)
+
+    h_in = input_shape[-2] if len(input_shape) >= 2 else 1
+    w_in = input_shape[-1] if len(input_shape) >= 1 else 1
+
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    return Pool2DLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(t.name for t in inputs),
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        pool_type="avg",
+        kernel_shape=(h_in, w_in),
+        strides=(h_in, w_in),
+        pads=(0, 0, 0, 0),
+    )
+
+
+def extract_flatten_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> FlattenLayer:
+    """Extract Flatten layer."""
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+    axis = attrs.get("axis", 1)
+
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    return FlattenLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(t.name for t in inputs),
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        axis=axis,
+    )
+
+
+def extract_transpose_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> TransposeLayer:
+    """Extract Transpose layer."""
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+    perm = tuple(attrs.get("perm", ()))
+
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    # Adjust perm for batch-stripped shapes (same logic as shape inference)
+    if perm and len(perm) == len(input_shape) + 1:
+        perm = tuple(p - 1 for p in perm if p != 0)
+
+    return TransposeLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(t.name for t in inputs),
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        perm=perm,
+    )
+
+
 # Registry of layer extractors
 LAYER_EXTRACTORS = {
     "MatMul": extract_matmul_layer,
@@ -355,4 +551,10 @@ LAYER_EXTRACTORS = {
     "QuantizeLinear": extract_quantize_linear_layer,
     "DequantizeLinear": extract_dequantize_linear_layer,
     "Dropout": extract_dropout_layer,
+    "Conv": extract_conv2d_layer,
+    "MaxPool": extract_maxpool_layer,
+    "AveragePool": extract_avgpool_layer,
+    "GlobalAveragePool": extract_global_avgpool_layer,
+    "Flatten": extract_flatten_layer,
+    "Transpose": extract_transpose_layer,
 }

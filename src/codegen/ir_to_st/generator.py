@@ -439,6 +439,36 @@ def generate_var_section(
         builder.add_line("j : DINT;")
         builder.add_line("sum : REAL;")
 
+    # Extra loop indices needed by Conv2D / Pool2D layers
+    has_spatial_layers = any(
+        isinstance(network.layers[ln], (Conv2DLayer, Pool2DLayer))
+        for ln in network.execution_order
+    )
+    if has_spatial_layers:
+        with builder.indent():
+            builder.add_line("(* Spatial loop variables for Conv / Pool layers *)")
+            builder.add_line("oc : DINT;")
+            builder.add_line("oh : DINT;")
+            builder.add_line("ow : DINT;")
+            builder.add_line("ic : DINT;")
+            builder.add_line("kh : DINT;")
+            builder.add_line("kw : DINT;")
+            builder.add_line("ih : DINT;")
+            builder.add_line("iw : DINT;")
+
+    # Transpose layers use dynamically-named loop vars (t<id>_d<dim>)
+    for ln in network.execution_order:
+        layer = network.layers[ln]
+        if isinstance(layer, TransposeLayer) and layer.output_shape:
+            ndim = len(layer.output_shape)
+            if ndim > 0 and layer.input_size > 1:
+                with builder.indent():
+                    builder.add_line(
+                        f"(* Transpose layer {layer.layer_id} loop variables *)"
+                    )
+                    for d in range(ndim):
+                        builder.add_line(f"t{layer.layer_id}_d{d} : DINT;")
+
     # Check if any layer uses softmax activation
     has_softmax = any(
         getattr(network.layers[layer_name], "activation", None)
@@ -725,6 +755,333 @@ def generate_dropout_code(
     pass
 
 
+def generate_conv2d_code(layer: Conv2DLayer, input_var: str, output_var: str) -> STCode:
+    """
+    Generate Conv2D layer code.
+
+    All tensors are stored as flat 1-D arrays.  The index arithmetic
+    follows the NCHW layout (batch dim already stripped for PLC):
+
+        input  layout: [C_in][H_in][W_in]
+        weight layout: [C_out][C_in/group][kH][kW]   (flattened row-major)
+        output layout: [C_out][H_out][W_out]
+
+    Generates 6 nested FOR loops with a boundary check for padding.
+    """
+    builder = STCodeBuilder()
+
+    # Unpack spatial parameters
+    in_c, in_h, in_w = (
+        layer.input_shape[-3],
+        layer.input_shape[-2],
+        layer.input_shape[-1],
+    )
+    out_c, out_h, out_w = (
+        layer.output_shape[-3],
+        layer.output_shape[-2],
+        layer.output_shape[-1],
+    )
+    kH, kW = layer.kernel_shape
+    sH, sW = layer.strides
+    pH, pW = layer.pads[0], layer.pads[1]  # top, left
+    dH, dW = layer.dilations
+    group = layer.group
+    in_c_per_group = in_c // group
+
+    # Weight layout sizes for index arithmetic
+    w_ic_size = in_c_per_group * kH * kW  # elements per output-channel slice
+    w_kh_size = kH * kW  # per input-channel slice (unused var kept for clarity)
+
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: Conv2D  "
+        f"in={in_c}x{in_h}x{in_w}  out={out_c}x{out_h}x{out_w}  "
+        f"kernel={kH}x{kW}  stride={sH}x{sW}  pad={layer.pads}  "
+        f"group={group} *)"
+    )
+
+    # -- output channels --
+    builder.add_line(f"FOR oc := 0 TO {out_c - 1} DO")
+    with builder.indent():
+        # -- output height --
+        builder.add_line(f"FOR oh := 0 TO {out_h - 1} DO")
+        with builder.indent():
+            # -- output width --
+            builder.add_line(f"FOR ow := 0 TO {out_w - 1} DO")
+            with builder.indent():
+                # Initialise accumulator with bias (or 0)
+                if layer.bias is not None:
+                    builder.add_line(f"sum := bias_{layer.layer_id}[oc];")
+                else:
+                    builder.add_line("sum := 0.0;")
+
+                # Determine the input channel range for this group
+                if group == 1:
+                    ic_start = "0"
+                    ic_end = str(in_c_per_group - 1)
+                else:
+                    ic_start = f"(oc * {in_c_per_group} / {out_c // group})"
+                    # For depthwise (group==in_c) each output channel uses 1 input channel
+                    if group == in_c:
+                        ic_start = "oc"
+                        ic_end = "oc"
+                    else:
+                        ic_end = f"({ic_start} + {in_c_per_group - 1})"
+
+                # -- input channels --
+                builder.add_line(f"FOR ic := {ic_start} TO {ic_end} DO")
+                with builder.indent():
+                    # -- kernel height --
+                    builder.add_line(f"FOR kh := 0 TO {kH - 1} DO")
+                    with builder.indent():
+                        # -- kernel width --
+                        builder.add_line(f"FOR kw := 0 TO {kW - 1} DO")
+                        with builder.indent():
+                            # Compute input coordinates
+                            if dH == 1:
+                                builder.add_line(f"ih := oh * {sH} - {pH} + kh;")
+                            else:
+                                builder.add_line(f"ih := oh * {sH} - {pH} + kh * {dH};")
+                            if dW == 1:
+                                builder.add_line(f"iw := ow * {sW} - {pW} + kw;")
+                            else:
+                                builder.add_line(f"iw := ow * {sW} - {pW} + kw * {dW};")
+
+                            # Boundary check (needed when padding > 0)
+                            has_padding = any(p != 0 for p in layer.pads)
+                            if has_padding:
+                                builder.add_line(
+                                    f"IF (ih >= 0) AND (ih < {in_h}) AND (iw >= 0) AND (iw < {in_w}) THEN"
+                                )
+                                indent_ctx = builder.indent()
+                                indent_ctx.__enter__()
+
+                            # input index:  ic * H_in * W_in  +  ih * W_in  +  iw
+                            input_idx = f"ic * {in_h * in_w} + ih * {in_w} + iw"
+
+                            # weight index: oc * (C_in_per_group * kH * kW)
+                            #             + (ic - ic_group_start) * kH * kW
+                            #             + kh * kW + kw
+                            if group == 1:
+                                weight_idx = f"oc * {w_ic_size} + ic * {kH * kW} + kh * {kW} + kw"
+                            elif group == in_c:
+                                # Depthwise: weight shape is (C_out, 1, kH, kW)
+                                weight_idx = f"oc * {kH * kW} + kh * {kW} + kw"
+                            else:
+                                weight_idx = f"oc * {w_ic_size} + (ic - {ic_start}) * {kH * kW} + kh * {kW} + kw"
+
+                            builder.add_line(
+                                f"sum := sum + {input_var}[{input_idx}] "
+                                f"* weights_{layer.layer_id}[{weight_idx}];"
+                            )
+
+                            if has_padding:
+                                indent_ctx.__exit__(None, None, None)
+                                builder.add_line("END_IF;")
+
+                        builder.add_line("END_FOR;")  # kw
+                    builder.add_line("END_FOR;")  # kh
+                builder.add_line("END_FOR;")  # ic
+
+                # Store result: flat index = oc * H_out * W_out + oh * W_out + ow
+                output_idx = f"oc * {out_h * out_w} + oh * {out_w} + ow"
+                builder.add_line(f"{output_var}[{output_idx}] := sum;")
+
+            builder.add_line("END_FOR;")  # ow
+        builder.add_line("END_FOR;")  # oh
+    builder.add_line("END_FOR;")  # oc
+
+    return builder.build()
+
+
+def generate_pool2d_code(layer: Pool2DLayer, input_var: str, output_var: str) -> STCode:
+    """
+    Generate MaxPool or AveragePool layer code.
+
+    Tensors stored as flat arrays in CHW order (batch dim stripped).
+    """
+    builder = STCodeBuilder()
+
+    channels = layer.input_shape[-3]
+    in_h, in_w = layer.input_shape[-2], layer.input_shape[-1]
+    out_h, out_w = layer.output_shape[-2], layer.output_shape[-1]
+    kH, kW = layer.kernel_shape
+    sH, sW = layer.strides
+    pH, pW = layer.pads[0], layer.pads[1]
+    is_max = layer.pool_type == "max"
+
+    pool_label = "MaxPool" if is_max else "AvgPool"
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: {pool_label}  "
+        f"kernel={kH}x{kW}  stride={sH}x{sW} *)"
+    )
+
+    # -- channels (preserved) --
+    builder.add_line(f"FOR oc := 0 TO {channels - 1} DO")
+    with builder.indent():
+        builder.add_line(f"FOR oh := 0 TO {out_h - 1} DO")
+        with builder.indent():
+            builder.add_line(f"FOR ow := 0 TO {out_w - 1} DO")
+            with builder.indent():
+                if is_max:
+                    # Initialise to first valid element (large negative as fallback)
+                    builder.add_line("sum := -3.402823E+38;")  # -FLT_MAX
+                else:
+                    builder.add_line("sum := 0.0;")
+
+                builder.add_line(f"FOR kh := 0 TO {kH - 1} DO")
+                with builder.indent():
+                    builder.add_line(f"FOR kw := 0 TO {kW - 1} DO")
+                    with builder.indent():
+                        builder.add_line(f"ih := oh * {sH} - {pH} + kh;")
+                        builder.add_line(f"iw := ow * {sW} - {pW} + kw;")
+
+                        has_padding = any(p != 0 for p in layer.pads)
+                        if has_padding:
+                            builder.add_line(
+                                f"IF (ih >= 0) AND (ih < {in_h}) AND (iw >= 0) AND (iw < {in_w}) THEN"
+                            )
+                            indent_ctx = builder.indent()
+                            indent_ctx.__enter__()
+
+                        input_idx = f"oc * {in_h * in_w} + ih * {in_w} + iw"
+                        if is_max:
+                            builder.add_line(f"IF {input_var}[{input_idx}] > sum THEN")
+                            with builder.indent():
+                                builder.add_line(f"sum := {input_var}[{input_idx}];")
+                            builder.add_line("END_IF;")
+                        else:
+                            builder.add_line(f"sum := sum + {input_var}[{input_idx}];")
+
+                        if has_padding:
+                            indent_ctx.__exit__(None, None, None)
+                            builder.add_line("END_IF;")
+
+                    builder.add_line("END_FOR;")  # kw
+                builder.add_line("END_FOR;")  # kh
+
+                output_idx = f"oc * {out_h * out_w} + oh * {out_w} + ow"
+                if is_max:
+                    builder.add_line(f"{output_var}[{output_idx}] := sum;")
+                else:
+                    kernel_area = kH * kW
+                    builder.add_line(
+                        f"{output_var}[{output_idx}] := sum / {float(kernel_area)};"
+                    )
+
+            builder.add_line("END_FOR;")  # ow
+        builder.add_line("END_FOR;")  # oh
+    builder.add_line("END_FOR;")  # oc
+
+    return builder.build()
+
+
+def generate_flatten_code(
+    layer: FlattenLayer, input_var: str, output_var: str
+) -> STCode:
+    """
+    Generate Flatten layer code.
+
+    Since both input and output are already stored as flat 1-D arrays
+    this is simply a memcopy (same as Reshape with identical sizes).
+    """
+    builder = STCodeBuilder()
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: Flatten (axis={layer.axis}) — copy *)"
+    )
+    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+    with builder.indent():
+        builder.add_line(f"{output_var}[i] := {input_var}[i];")
+    builder.add_line("END_FOR;")
+    return builder.build()
+
+
+def generate_transpose_code(
+    layer: TransposeLayer, input_var: str, output_var: str
+) -> STCode:
+    """
+    Generate Transpose layer code.
+
+    Permutes the dimensions of a tensor stored as a flat 1-D array.
+    Uses nested loops over the output shape and computes the
+    corresponding input index via the inverse permutation.
+
+    Example: NCHW→NHWC with batch stripped means (C,H,W)→(H,W,C)
+             perm = (1, 2, 0)
+    """
+    builder = STCodeBuilder()
+    in_shape = layer.input_shape
+    out_shape = layer.output_shape
+    perm = layer.perm
+    ndim = len(out_shape)
+
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: Transpose perm={perm}  "
+        f"{in_shape} -> {out_shape} *)"
+    )
+
+    if ndim == 0 or layer.input_size <= 1:
+        # Scalar or single element — just copy
+        builder.add_line(f"{output_var}[0] := {input_var}[0];")
+        return builder.build()
+
+    # Compute input strides (row-major) for each dimension
+    in_strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        in_strides[d] = in_strides[d + 1] * in_shape[d + 1]
+
+    # Compute output strides (row-major) for each dimension
+    out_strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        out_strides[d] = out_strides[d + 1] * out_shape[d + 1]
+
+    # Generate unique loop variable names based on layer id and dimension
+    # e.g. t3_d0, t3_d1, t3_d2 — scales to any number of dimensions
+    loop_vars = [f"t{layer.layer_id}_d{d}" for d in range(ndim)]
+
+    # Build nested loops over the OUTPUT shape
+    for d in range(ndim):
+        indent = "    " * d
+        builder.add_line(f"{indent}FOR {loop_vars[d]} := 0 TO {out_shape[d] - 1} DO")
+
+    # At the innermost level, compute flat indices
+    inner_indent = "    " * ndim
+
+    # Output flat index:  sum of loop_var[d] * out_stride[d]
+    out_idx_parts = []
+    for d in range(ndim):
+        if out_strides[d] == 1:
+            out_idx_parts.append(loop_vars[d])
+        else:
+            out_idx_parts.append(f"{loop_vars[d]} * {out_strides[d]}")
+    out_idx = " + ".join(out_idx_parts)
+
+    # Input flat index:  output dim d corresponds to input dim perm[d]
+    # So input_coord[perm[d]] = loop_vars[d]
+    # We need input_coord[k] for each input dim k
+    # inv_perm[perm[d]] = d  →  input_coord[k] = loop_vars[inv_perm[k]]
+    inv_perm = [0] * ndim
+    for d in range(ndim):
+        inv_perm[perm[d]] = d
+
+    in_idx_parts = []
+    for k in range(ndim):
+        var = loop_vars[inv_perm[k]]
+        if in_strides[k] == 1:
+            in_idx_parts.append(var)
+        else:
+            in_idx_parts.append(f"{var} * {in_strides[k]}")
+    in_idx = " + ".join(in_idx_parts)
+
+    builder.add_line(f"{inner_indent}{output_var}[{out_idx}] := {input_var}[{in_idx}];")
+
+    # Close loops in reverse order
+    for d in range(ndim - 1, -1, -1):
+        indent = "    " * d
+        builder.add_line(f"{indent}END_FOR;")
+
+    return builder.build()
+
+
 # ============================================================================
 # Forward Pass Generation
 # ============================================================================
@@ -747,6 +1104,10 @@ LAYER_CODE_GENERATORS = {
     QuantizeLinearLayer: _single_input_wrapper(generate_quantize_linear_code),
     DequantizeLinearLayer: _single_input_wrapper(generate_dequantize_linear_code),
     DropoutLayer: _single_input_wrapper(generate_dropout_code),
+    Conv2DLayer: _single_input_wrapper(generate_conv2d_code),
+    Pool2DLayer: _single_input_wrapper(generate_pool2d_code),
+    FlattenLayer: _single_input_wrapper(generate_flatten_code),
+    TransposeLayer: _single_input_wrapper(generate_transpose_code),
 }
 
 

@@ -217,6 +217,11 @@ def translate_expression(expr: str) -> str:
     # Replace operators
     expr = expr.replace(":=", "=")
 
+    # Replace logical operators (ST → Python)
+    expr = re.sub(r"\bAND\b", "and", expr)
+    expr = re.sub(r"\bOR\b", "or", expr)
+    expr = re.sub(r"\bNOT\b", "not", expr)
+
     # Remove trailing semicolon
     expr = expr.rstrip(";")
 
@@ -225,7 +230,7 @@ def translate_expression(expr: str) -> str:
 
 if __name__ == "__main__":
     st_folder = Path("examples/models/structured_text")
-    st_file = st_folder / "better_temp_classifier.st"
+    st_file = st_folder / "conv_temp.st"
 
     with open(st_file, "r") as file:
         st_code = file.read()

@@ -141,6 +141,42 @@ class DequantizeLinearLayer(BaseLayer):
     axis: Optional[int] = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class Conv2DLayer(LinearLayer):
+    """Represents a 2D Convolution layer: Y = Conv(X, W) + B"""
+
+    kernel_shape: Tuple[int, int]  # (kH, kW)
+    strides: Tuple[int, int] = (1, 1)
+    pads: Tuple[int, int, int, int] = (0, 0, 0, 0)  # (top, left, bottom, right)
+    dilations: Tuple[int, int] = (1, 1)
+    group: int = 1
+    # input_shape/output_shape from BaseLayer carry (C,H,W) or (N,C,H,W)
+
+
+@dataclass(frozen=True, kw_only=True)
+class Pool2DLayer(BaseLayer):
+    """Represents a 2D Pooling layer (Max or Average)"""
+
+    pool_type: str  # "max" or "avg"
+    kernel_shape: Tuple[int, int]
+    strides: Tuple[int, int] = (1, 1)
+    pads: Tuple[int, int, int, int] = (0, 0, 0, 0)
+
+
+@dataclass(frozen=True, kw_only=True)
+class FlattenLayer(BaseLayer):
+    """Reshape from N-D to 1-D (bridges Conv→Dense)"""
+
+    axis: int = 1  # ONNX default: flatten from axis=1
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransposeLayer(BaseLayer):
+    """Represents an ONNX Transpose layer that permutes tensor dimensions."""
+
+    perm: Tuple[int, ...]  # Permutation of dimensions, e.g. (0, 2, 3, 1) for NCHW -> NHWC
+
+
 @dataclass(frozen=True)
 class NetworkIR:
     """Intermediate graph-based representation of a neural network"""
