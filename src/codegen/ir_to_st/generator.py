@@ -374,6 +374,20 @@ def generate_constants_section(network: NetworkIR) -> STCode:
                     code += quant_params.indent()
                     has_constants = True
 
+        # BatchNorm precomputed parameters
+        if isinstance(layer, BatchNormLayer):
+            code += generate_array_constant(
+                f"bn_scale_{layer.layer_id}",
+                layer.combined_scale,
+                "REAL",
+            ).indent()
+            code += generate_array_constant(
+                f"bn_bias_{layer.layer_id}",
+                layer.combined_bias,
+                "REAL",
+            ).indent()
+            has_constants = True
+
         if has_constants:
             code += STCode.blank_line()
 
@@ -444,6 +458,9 @@ def generate_var_section(
         isinstance(network.layers[ln], (Conv2DLayer, Pool2DLayer))
         for ln in network.execution_order
     )
+    has_batchnorm = any(
+        isinstance(network.layers[ln], BatchNormLayer) for ln in network.execution_order
+    )
     if has_spatial_layers:
         with builder.indent():
             builder.add_line("(* Spatial loop variables for Conv / Pool layers *)")
@@ -455,6 +472,11 @@ def generate_var_section(
             builder.add_line("kw : DINT;")
             builder.add_line("ih : DINT;")
             builder.add_line("iw : DINT;")
+    elif has_batchnorm:
+        # BatchNorm uses 'oc' for channel loop but doesn't need full spatial vars
+        with builder.indent():
+            builder.add_line("(* Channel loop variable for BatchNorm *)")
+            builder.add_line("oc : DINT;")
 
     # Transpose layers use dynamically-named loop vars (t<id>_d<dim>)
     for ln in network.execution_order:
@@ -995,6 +1017,26 @@ def generate_flatten_code(
     return builder.build()
 
 
+def generate_squeeze_code(
+    layer: "SqueezeLayer", input_var: str, output_var: str
+) -> STCode:
+    """
+    Generate Squeeze layer code.
+
+    Squeeze removes dimensions of size 1.  Since both input and output
+    are stored as flat 1-D arrays with the same number of elements,
+    this is simply a memcopy — identical to Flatten.
+    """
+    builder = STCodeBuilder()
+    axes_str = ",".join(str(a) for a in layer.axes) if layer.axes else "auto"
+    builder.add_line(f"(* Layer {layer.layer_id}: Squeeze (axes={axes_str}) — copy *)")
+    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+    with builder.indent():
+        builder.add_line(f"{output_var}[i] := {input_var}[i];")
+    builder.add_line("END_FOR;")
+    return builder.build()
+
+
 def generate_transpose_code(
     layer: TransposeLayer, input_var: str, output_var: str
 ) -> STCode:
@@ -1083,6 +1125,71 @@ def generate_transpose_code(
 
 
 # ============================================================================
+# BatchNorm Code Generation
+# ============================================================================
+
+
+def generate_batchnorm_code(
+    layer: "BatchNormLayer", input_var: str, output_var: str
+) -> STCode:
+    """
+    Generate Structured Text for a BatchNormalization layer (inference mode).
+
+    The extractor has already precomputed:
+        combined_scale[c] = γ[c] / sqrt(σ²[c] + ε)
+        combined_bias[c]  = β[c] − μ[c] · combined_scale[c]
+
+    So at runtime:
+        output[c, h, w] = combined_scale[c] * input[c, h, w] + combined_bias[c]
+
+    This is emitted as a per-channel loop over the spatial elements.
+    """
+    builder = STCodeBuilder()
+    lid = layer.layer_id
+    C = layer.num_channels
+
+    # Determine spatial size per channel
+    if layer.input_shape and len(layer.input_shape) >= 3:
+        # Shape is (C, H, W) — spatial_size = H * W
+        spatial_size = int(np.prod(layer.input_shape[1:]))
+    elif layer.input_shape and len(layer.input_shape) == 1:
+        # 1-D: treat each element as its own "channel" (unlikely but safe)
+        spatial_size = 1
+    else:
+        # Fallback: total_size / num_channels
+        spatial_size = layer.input_size // C if C > 0 else layer.input_size
+
+    builder.add_line(
+        f"(* Layer {lid}: BatchNorm  channels={C}  spatial={spatial_size} *)"
+    )
+
+    if spatial_size == 1:
+        # Simple per-channel case (e.g. after GlobalAveragePool)
+        builder.add_line(f"FOR oc := 0 TO {C - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"{output_var}[oc] := bn_scale_{lid}[oc] * {input_var}[oc] "
+                f"+ bn_bias_{lid}[oc];"
+            )
+        builder.add_line("END_FOR;")
+    else:
+        # General spatial case: for each channel, apply to all spatial positions
+        builder.add_line(f"FOR oc := 0 TO {C - 1} DO")
+        with builder.indent():
+            builder.add_line(f"FOR i := 0 TO {spatial_size - 1} DO")
+            with builder.indent():
+                builder.add_line(
+                    f"{output_var}[oc * {spatial_size} + i] := "
+                    f"bn_scale_{lid}[oc] * {input_var}[oc * {spatial_size} + i] "
+                    f"+ bn_bias_{lid}[oc];"
+                )
+            builder.add_line("END_FOR;")
+        builder.add_line("END_FOR;")
+
+    return builder.build()
+
+
+# ============================================================================
 # Forward Pass Generation
 # ============================================================================
 
@@ -1108,6 +1215,8 @@ LAYER_CODE_GENERATORS = {
     Pool2DLayer: _single_input_wrapper(generate_pool2d_code),
     FlattenLayer: _single_input_wrapper(generate_flatten_code),
     TransposeLayer: _single_input_wrapper(generate_transpose_code),
+    BatchNormLayer: _single_input_wrapper(generate_batchnorm_code),
+    SqueezeLayer: _single_input_wrapper(generate_squeeze_code),
 }
 
 

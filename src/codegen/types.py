@@ -171,10 +171,41 @@ class FlattenLayer(BaseLayer):
 
 
 @dataclass(frozen=True, kw_only=True)
+class SqueezeLayer(BaseLayer):
+    """
+    Represents an ONNX Squeeze layer that removes dimensions of size 1.
+
+    E.g. (C, 1, 1) → (C,) after GlobalAveragePool before a Dense layer.
+    In flat-array PLC code this is a no-op (same data, different logical shape).
+    """
+
+    axes: Tuple[int, ...]  # Which dimensions to squeeze (already batch-adjusted)
+
+
+@dataclass(frozen=True, kw_only=True)
 class TransposeLayer(BaseLayer):
     """Represents an ONNX Transpose layer that permutes tensor dimensions."""
 
-    perm: Tuple[int, ...]  # Permutation of dimensions, e.g. (0, 2, 3, 1) for NCHW -> NHWC
+    perm: Tuple[
+        int, ...
+    ]  # Permutation of dimensions, e.g. (0, 2, 3, 1) for NCHW -> NHWC
+
+
+@dataclass(frozen=True, kw_only=True)
+class BatchNormLayer(BaseLayer):
+    """
+    Represents a BatchNormalization layer (inference mode).
+
+    During inference BN is a per-channel affine transform:
+        Y[c] = scale[c] * (X[c] - mean[c]) / sqrt(var[c] + eps) + bias[c]
+
+    We precompute combined_scale and combined_bias at compile time so the
+    PLC only needs:  Y[c] = combined_scale[c] * X[c] + combined_bias[c]
+    """
+
+    num_channels: int
+    combined_scale: np.ndarray  # shape (C,)  — precomputed γ / sqrt(σ² + ε)
+    combined_bias: np.ndarray  # shape (C,)  — precomputed β − μ·combined_scale
 
 
 @dataclass(frozen=True)

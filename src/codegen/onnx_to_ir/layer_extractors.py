@@ -537,6 +537,118 @@ def extract_transpose_layer(
     )
 
 
+def extract_batchnorm_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> "BatchNormLayer":
+    """
+    Extract BatchNormalization layer (inference mode).
+
+    ONNX inputs: X, scale (γ), B (β), input_mean (μ), input_var (σ²)
+    Attribute:   epsilon (default 1e-5)
+
+    At inference:
+        Y = γ * (X − μ) / sqrt(σ² + ε) + β
+
+    We precompute per-channel parameters so the PLC only needs:
+        Y[c] = combined_scale[c] * X[c] + combined_bias[c]
+    """
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+    epsilon = attrs.get("epsilon", 1e-5)
+
+    # Validate constant inputs
+    scale = inputs[1].value  # γ  — shape (C,)
+    bias = inputs[2].value  # β  — shape (C,)
+    mean = inputs[3].value  # μ  — shape (C,)
+    var = inputs[4].value  # σ² — shape (C,)
+
+    for idx, (name, val) in enumerate(
+        [("scale", scale), ("bias", bias), ("mean", mean), ("var", var)]
+    ):
+        if val is None:
+            raise ValueError(
+                f"BatchNormalization layer {layer_id}: "
+                f"input '{name}' (index {idx + 1}) must be a constant tensor"
+            )
+
+    num_channels = scale.shape[0]
+
+    # Precompute combined parameters
+    combined_scale = scale / np.sqrt(var + epsilon)
+    combined_bias = bias - mean * combined_scale
+
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    return BatchNormLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=(inputs[0].name,),  # Only the data tensor is an edge input
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        num_channels=num_channels,
+        combined_scale=combined_scale.astype(np.float32),
+        combined_bias=combined_bias.astype(np.float32),
+    )
+
+
+def extract_squeeze_layer(
+    layer: Dict, layer_id: int, analyzer: ONNXModel
+) -> "SqueezeLayer":
+    """
+    Extract Squeeze layer.
+
+    Squeeze removes dimensions of size 1.  In ONNX opset < 13 the axes
+    come from an attribute; in opset >= 13 they come from a second constant
+    input tensor.
+
+    For the flat-array PLC representation this is essentially a no-op
+    (same data, different logical shape).
+    """
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+
+    # Get axes — attribute (opset < 13) or constant input (opset >= 13)
+    axes = tuple(attrs.get("axes", ()))
+    if (
+        not axes
+        and len(inputs) > 1
+        and inputs[1].is_weight
+        and inputs[1].value is not None
+    ):
+        axes = tuple(int(a) for a in inputs[1].value)
+
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    # Adjust axes for batch-dim-stripped shapes
+    if axes and any(a > 0 for a in axes):
+        axes = tuple(a - 1 for a in axes if a != 0)
+
+    return SqueezeLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=(inputs[0].name,),  # Only the data tensor
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        axes=axes,
+    )
+
+
 # Registry of layer extractors
 LAYER_EXTRACTORS = {
     "MatMul": extract_matmul_layer,
@@ -557,4 +669,6 @@ LAYER_EXTRACTORS = {
     "GlobalAveragePool": extract_global_avgpool_layer,
     "Flatten": extract_flatten_layer,
     "Transpose": extract_transpose_layer,
+    "BatchNormalization": extract_batchnorm_layer,
+    "Squeeze": extract_squeeze_layer,
 }

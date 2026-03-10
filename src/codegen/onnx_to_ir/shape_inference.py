@@ -229,6 +229,50 @@ def infer_transpose_output_shape(
     return tuple(input_shape[p] for p in perm)
 
 
+def infer_batchnorm_output_shape(
+    input_shape: Tuple[int, ...],
+) -> Tuple[int, ...]:
+    """
+    Infer output shape for BatchNormalization.
+
+    BatchNorm preserves input shape exactly (per-channel affine transform).
+    Input/Output: (C, H, W)  or (C,) for 1-D
+    """
+    return input_shape
+
+
+def infer_squeeze_output_shape(
+    input_shape: Tuple[int, ...], axes: Tuple[int, ...]
+) -> Tuple[int, ...]:
+    """
+    Infer output shape for Squeeze operation.
+
+    Removes dimensions of size 1 at the given axes.
+    E.g. input (8, 1, 1) with axes=(1, 2) → (8,)
+
+    If axes is empty, all dims of size 1 are removed.
+    """
+    if not input_shape:
+        return ()
+
+    if not axes:
+        # Squeeze all dims of size 1
+        return tuple(d for d in input_shape if d != 1) or (1,)
+
+    # Remove specified axes (iterate in reverse to keep indices stable)
+    result = list(input_shape)
+    for ax in sorted(axes, reverse=True):
+        if 0 <= ax < len(result) and result[ax] == 1:
+            result.pop(ax)
+        else:
+            logger.warning(
+                f"Squeeze axis {ax} is out of range or dim != 1 "
+                f"(shape={input_shape}), skipping"
+            )
+
+    return tuple(result) if result else (1,)
+
+
 def infer_reshape_output_shape(
     input_shape: Tuple[int, ...], target_shape: Optional[Tuple[int, ...]]
 ) -> Tuple[int, ...]:
@@ -382,6 +426,22 @@ def infer_layer_shapes(
         attrs = layer_dict.get("attributes", {})
         perm = tuple(attrs.get("perm", ()))
         output_shape = infer_transpose_output_shape(input_shape, perm)
+
+    elif op_type == "BatchNormalization":
+        output_shape = infer_batchnorm_output_shape(input_shape)
+
+    elif op_type == "Squeeze":
+        # Axes can come from attributes (opset < 13) or from a constant input
+        attrs = layer_dict.get("attributes", {})
+        axes = tuple(attrs.get("axes", ()))
+        if not axes and len(resolved_inputs) > 1 and resolved_inputs[1].is_weight:
+            axes_val = resolved_inputs[1].value
+            if axes_val is not None:
+                axes = tuple(int(a) for a in axes_val)
+        # Adjust for batch-dim-stripped shapes
+        if axes and any(a > 0 for a in axes):
+            axes = tuple(a - 1 for a in axes if a != 0)
+        output_shape = infer_squeeze_output_shape(input_shape, axes)
 
     else:
         logger.warning(f"No shape inference for op_type '{op_type}', using input shape")
