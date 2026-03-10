@@ -1,8 +1,0 @@
-- Add Conv layers
-- Figure out how to access the temperature sensor on the HW. 
-- Record real sensor readings, including time and conditions behind the data. 
-- Try regression instead of classifier
-- Refactor generator.py (modularize code, split into multiple files)
-
-
-
