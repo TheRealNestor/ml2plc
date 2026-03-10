@@ -1029,7 +1029,7 @@ def generate_squeeze_code(
     """
     builder = STCodeBuilder()
     axes_str = ",".join(str(a) for a in layer.axes) if layer.axes else "auto"
-    builder.add_line(f"(* Layer {layer.layer_id}: Squeeze (axes={axes_str}) — copy *)")
+    builder.add_line(f"(* Layer {layer.layer_id}: Squeeze *)")
     builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
         builder.add_line(f"{output_var}[i] := {input_var}[i];")
