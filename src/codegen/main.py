@@ -8,10 +8,13 @@ import sys
 from pathlib import Path
 
 from codegen.onnx_model import ONNXModel
-from codegen.onnx_to_ir import onnx_to_ir
+from codegen.onnx_to_ir import onnx_to_ir, regionize_network_ir
 from codegen.ir_optimizer import IROptimizer, OptimizationResult
 from codegen.memory_check.memory_analyzer import check_memory
 from codegen.ir_to_st import translate_ir_to_st
+from codegen.types import graph_ir_to_network_ir
+from codegen.backends import default_st_backend_capabilities
+from codegen.planner import create_execution_plan
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +45,23 @@ def compile_onnx_to_st(
     ir = onnx_to_ir(analyzer)
     logger.info(f"  Created IR with {len(ir.layers)} layers")
 
-    # Step 3: Optimize IR (optional)
+    # Step 3: Regionize model (milestone-1: single acyclic region)
+    logger.info("Step 3: Regionizing model...")
+    model_ir = regionize_network_ir(ir)
+    logger.info(f"  Regionized model into {len(model_ir.regions)} region(s)")
+
+    # Step 4: Plan execution against backend capabilities
+    logger.info("Step 4: Planning execution...")
+    capabilities = default_st_backend_capabilities()
+    execution_plan = create_execution_plan(model_ir, capabilities)
+
+    # Bridge back to legacy NetworkIR for existing optimizer/codegen stack
+    ir = graph_ir_to_network_ir(execution_plan.model_ir.first_region().graph)
+
+    # Step 5: Optimize IR (optional)
     buffer_allocations = None
     if optimize:
-        logger.info("Step 3: Optimizing IR...")
+        logger.info("Step 5: Optimizing IR...")
         optimizer = IROptimizer(ir)
         result: OptimizationResult = optimizer.optimize()
         ir = result.ir
@@ -54,22 +70,22 @@ def compile_onnx_to_st(
         logger.info(f"  Optimized IR has {len(ir.layers)} layers")
 
     else:
-        logger.info("Step 3: Skipping optimization (optimize=False)")
+        logger.info("Step 5: Skipping optimization (optimize=False)")
 
-    # Step 4: Check memory consumption
-    logger.info("Step 4: Checking memory consumption...")
+    # Step 6: Check memory consumption
+    logger.info("Step 6: Checking memory consumption...")
     memory_report = check_memory(ir, memory_limit_kb=96, fail_on_exceed=False)
     logger.info(f"  Memory utilization: {memory_report.utilization_percent:.1f}%")
 
-    # Step 5: Generate Structured Text code
-    logger.info("Step 5: Generating Structured Text code...")
+    # Step 7: Generate Structured Text code
+    logger.info("Step 7: Generating Structured Text code...")
     st_code = translate_ir_to_st(
         ir, fb_name="NeuralNetworkFB", buffer_allocations=buffer_allocations
     )
 
-    # Step 6: Save to file (optional)
+    # Step 8: Save to file (optional)
     if output_path:
-        logger.info(f"Step 6: Writing to {output_path}")
+        logger.info(f"Step 8: Writing to {output_path}")
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, "w") as f:

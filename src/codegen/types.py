@@ -18,6 +18,15 @@ class ActivationType(Enum):
     SOFTMAX = "softmax"
 
 
+class RegionKind(Enum):
+    """Execution region kinds for structured model planning."""
+
+    ACYCLIC = "acyclic"
+    RECURRENT = "recurrent"
+    LOOP = "loop"
+    UNSUPPORTED = "unsupported"
+
+
 @dataclass(frozen=True, kw_only=True)
 class BaseLayer:
     """Base class for all layers"""
@@ -263,3 +272,96 @@ class NetworkIR:
             f"NetworkIR(layers={len(self.layers)})\n"
             f"Layer types (in order):\n  {layers_str}"
         )
+
+
+@dataclass(frozen=True)
+class GraphIR:
+    """Global graph form of the model (neutral, not backend-specific)."""
+
+    layers: Dict[str, BaseLayer]
+    execution_order: List[str]
+    tensor_producers: Dict[str, str] = field(default_factory=dict)
+    tensor_consumers: Dict[str, List[str]] = field(default_factory=dict)
+    input_tensors: Tuple[str, ...] = ()
+    output_tensors: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RegionIR:
+    """Base region contract for planning and optimization."""
+
+    region_id: str
+    kind: RegionKind
+    graph: GraphIR
+
+
+@dataclass(frozen=True)
+class AcyclicRegionIR(RegionIR):
+    """Region representing an acyclic, topologically sorted subgraph."""
+
+    def __post_init__(self):
+        if self.kind != RegionKind.ACYCLIC:
+            raise ValueError("AcyclicRegionIR.kind must be RegionKind.ACYCLIC")
+
+
+@dataclass(frozen=True)
+class RecurrentRegionIR(RegionIR):
+    """Region representing recurrent step execution with explicit state tensors."""
+
+    state_inputs: Tuple[str, ...] = ()
+    state_outputs: Tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if self.kind != RegionKind.RECURRENT:
+            raise ValueError("RecurrentRegionIR.kind must be RegionKind.RECURRENT")
+
+
+@dataclass(frozen=True)
+class LoopRegionIR(RegionIR):
+    """Region representing control-flow loop semantics (e.g. ONNX Loop/Scan)."""
+
+    loop_inputs: Tuple[str, ...] = ()
+    loop_outputs: Tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if self.kind != RegionKind.LOOP:
+            raise ValueError("LoopRegionIR.kind must be RegionKind.LOOP")
+
+
+@dataclass(frozen=True)
+class ModelIR:
+    """Structured model representation as ordered execution regions."""
+
+    regions: Tuple[RegionIR, ...]
+    input_tensors: Tuple[str, ...] = ()
+    output_tensors: Tuple[str, ...] = ()
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+    def first_region(self) -> RegionIR:
+        if not self.regions:
+            raise ValueError("ModelIR has no regions")
+        return self.regions[0]
+
+
+def network_ir_to_graph_ir(network_ir: NetworkIR) -> GraphIR:
+    """Adapter for legacy pipeline compatibility."""
+    return GraphIR(
+        layers=network_ir.layers,
+        execution_order=network_ir.execution_order,
+        tensor_producers=network_ir.tensor_producers,
+        tensor_consumers=network_ir.tensor_consumers,
+        input_tensors=network_ir.input_tensors,
+        output_tensors=network_ir.output_tensors,
+    )
+
+
+def graph_ir_to_network_ir(graph_ir: GraphIR) -> NetworkIR:
+    """Adapter for existing optimizer/codegen components using NetworkIR."""
+    return NetworkIR(
+        layers=graph_ir.layers,
+        execution_order=graph_ir.execution_order,
+        tensor_producers=graph_ir.tensor_producers,
+        tensor_consumers=graph_ir.tensor_consumers,
+        input_tensors=graph_ir.input_tensors,
+        output_tensors=graph_ir.output_tensors,
+    )
