@@ -5,64 +5,16 @@ Main ONNX to IR conversion orchestration.
 import numpy as np
 import logging
 from typing import Dict, List
-from collections import deque, defaultdict
+from collections import defaultdict
 
 from ..types import NetworkIR, BaseLayer
 from ..onnx_model import ONNXModel
+from ..graph_algorithms import topological_sort
 from .tensor_resolution import TensorResolver, ResolvedTensor
 from .shape_inference import infer_layer_shapes
 from .layer_extractors import LAYER_EXTRACTORS
 
 logger = logging.getLogger(__name__)
-
-
-def topological_sort(
-    layers: Dict[str, BaseLayer],
-    tensor_producers: Dict[str, str],
-    input_tensors: tuple,
-) -> List[str]:
-    """
-    Perform topological sort on the layer graph using Kahn's algorithm.
-
-    Args:
-        layers: Dictionary of IR layer objects
-        tensor_producers: Mapping of tensor names to producing layer names
-        input_tensors: Network input tensor names
-
-    Returns:
-        List of layer names in execution order
-    """
-    adj_list = defaultdict(list)
-    in_degree = {name: 0 for name in layers.keys()}
-
-    for layer_name, layer in layers.items():
-        for input_tensor in layer.inputs:
-            if input_tensor in input_tensors:
-                continue
-
-            if input_tensor in tensor_producers:
-                producer = tensor_producers[input_tensor]
-                if producer != layer_name:
-                    adj_list[producer].append(layer_name)
-                    in_degree[layer_name] += 1
-
-    queue = deque([name for name, degree in in_degree.items() if degree == 0])
-    sorted_order = []
-
-    while queue:
-        current = queue.popleft()
-        sorted_order.append(current)
-
-        for neighbor in adj_list[current]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
-
-    if len(sorted_order) != len(layers):
-        missing = set(layers.keys()) - set(sorted_order)
-        raise ValueError(f"Cycle detected in layer graph: {missing}")
-
-    return sorted_order
 
 
 def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:

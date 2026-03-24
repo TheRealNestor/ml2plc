@@ -1,15 +1,18 @@
 """
 Main IR optimizer that orchestrates optimization passes.
+
+Uses region strategies to dispatch passes based on region kind.
+Only applies passes that declare support for each region type.
 """
 
 import logging
 from typing import List, Optional, Dict
 from collections import defaultdict
-from dataclasses import dataclass
 
 from ..onnx_to_ir.converter import topological_sort
-from ..types import NetworkIR
+from ..types import NetworkIR, ModelIR, RegionKind
 from .base_pass import OptimizationPass
+from .result import OptimizationResult
 from .passes import (
     RemoveIdentityPass,
     RemoveNoOpReshapePass,
@@ -19,6 +22,7 @@ from .passes import (
     BufferAllocationPass,
     RemoveDropoutPass,
 )
+from .region_strategies import optimize_region_with_passes, validate_pass_applicability
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +37,40 @@ DEFAULT_PASSES: List[OptimizationPass] = [
 ]
 
 
-@dataclass
-class OptimizationResult:
-    """Result of IR optimization, including optional code generation hints."""
+def optimize_model_regions(
+    model_ir: ModelIR, passes: Optional[List[OptimizationPass]] = None
+) -> Dict[str, OptimizationResult]:
+    """
+    Run region-aware optimizations on all regions in the model.
 
-    ir: NetworkIR
-    buffer_allocations: Optional[Dict[str, str]] = None  # tensor_name -> buffer_name
+    Each region is optimized with only the passes it declares support for.
 
-    def has_buffer_allocations(self) -> bool:
-        """Check if buffer allocations are available."""
-        return self.buffer_allocations is not None
+    Args:
+        model_ir: The regionized model.
+        passes: Optional list of custom passes. Uses DEFAULT_PASSES if not provided.
+
+    Returns:
+        Dictionary mapping region_id to OptimizationResult.
+    """
+    if passes is None:
+        passes = DEFAULT_PASSES
+
+    logger.info(f"Optimizing {len(model_ir.regions)} region(s)")
+
+    # Validate pass applicability for diagnostics
+    applicability = validate_pass_applicability(model_ir, passes)
+    for region_id, applicable_pass_names in applicability.items():
+        logger.debug(f"  {region_id}: {applicable_pass_names}")
+
+    results = {}
+
+    for region in model_ir.regions:
+        logger.info(f"Optimizing region {region.region_id} ({region.kind.value})")
+
+        result = optimize_region_with_passes(region, passes)
+        results[region.region_id] = result
+
+    return results
 
 
 class IROptimizer:

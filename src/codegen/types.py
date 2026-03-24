@@ -219,7 +219,22 @@ class BatchNormLayer(BaseLayer):
 
 @dataclass(frozen=True)
 class NetworkIR:
-    """Intermediate graph-based representation of a neural network"""
+    """
+    Intermediate representation of a neural network graph.
+
+    Canonical representation used throughout the pipeline:
+    - After ONNX parsing (unoptimized full graph)
+    - After optimization (refined graph)
+    - As subgraphs within regions (region-local graphs)
+
+    Attributes:
+        layers: Dictionary mapping layer_name -> layer object
+        execution_order: List of layer names in topological order
+        tensor_producers: Mapping of tensor_name -> producing_layer_name
+        tensor_consumers: Mapping of tensor_name -> [consuming_layer_names]
+        input_tensors: Tuple of network input tensor names
+        output_tensors: Tuple of network output tensor names
+    """
 
     # layer_name -> layer
     layers: Dict[str, BaseLayer]
@@ -275,24 +290,12 @@ class NetworkIR:
 
 
 @dataclass(frozen=True)
-class GraphIR:
-    """Global graph form of the model (neutral, not backend-specific)."""
-
-    layers: Dict[str, BaseLayer]
-    execution_order: List[str]
-    tensor_producers: Dict[str, str] = field(default_factory=dict)
-    tensor_consumers: Dict[str, List[str]] = field(default_factory=dict)
-    input_tensors: Tuple[str, ...] = ()
-    output_tensors: Tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class RegionIR:
     """Base region contract for planning and optimization."""
 
     region_id: str
     kind: RegionKind
-    graph: GraphIR
+    graph: NetworkIR
 
 
 @dataclass(frozen=True)
@@ -341,27 +344,3 @@ class ModelIR:
         if not self.regions:
             raise ValueError("ModelIR has no regions")
         return self.regions[0]
-
-
-def network_ir_to_graph_ir(network_ir: NetworkIR) -> GraphIR:
-    """Adapter for legacy pipeline compatibility."""
-    return GraphIR(
-        layers=network_ir.layers,
-        execution_order=network_ir.execution_order,
-        tensor_producers=network_ir.tensor_producers,
-        tensor_consumers=network_ir.tensor_consumers,
-        input_tensors=network_ir.input_tensors,
-        output_tensors=network_ir.output_tensors,
-    )
-
-
-def graph_ir_to_network_ir(graph_ir: GraphIR) -> NetworkIR:
-    """Adapter for existing optimizer/codegen components using NetworkIR."""
-    return NetworkIR(
-        layers=graph_ir.layers,
-        execution_order=graph_ir.execution_order,
-        tensor_producers=graph_ir.tensor_producers,
-        tensor_consumers=graph_ir.tensor_consumers,
-        input_tensors=graph_ir.input_tensors,
-        output_tensors=graph_ir.output_tensors,
-    )

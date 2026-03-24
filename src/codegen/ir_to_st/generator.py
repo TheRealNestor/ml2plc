@@ -2,11 +2,17 @@
 IR to Structured Text Code Generation Module
 
 This module is responsible for generating Structured Text (ST) code from the intermediate representation (IR) of a neural network.
+
+Architecture:
+  - generate_function_block(): Main entry for single-region (legacy) models
+  - generate_model_function_block(): Main entry for multi-region ModelIR
+    - Uses lowerers.py for region-kind-specific ST generation
 """
 
 from ..types import *
 from .st_code import *
 from .type_conversion import *
+from ..ir_optimizer import OptimizationResult
 
 import logging
 
@@ -1272,6 +1278,74 @@ def generate_function_block(
     return code
 
 
+def generate_model_function_block(
+    model: ModelIR,
+    optimization_results: Dict[str, OptimizationResult],
+    fb_name: str = "NeuralNetwork",
+) -> STCode:
+    """
+    Generate complete function block code for a multi-region ModelIR.
+
+    Uses region-kind-aware lowerers to generate ST for each region.
+    Delegates region-specific code generation to lowerers.py to keep this
+    function focused on high-level orchestration and cross-region concerns.
+
+    Args:
+        model: Regionized model with potentially multiple regions
+        optimization_results: Dict mapping region_id to OptimizationResult
+        fb_name: Name for the generated function block
+
+    Returns:
+        Complete ST code for the function block
+    """
+    from .lowerers import lower_region_to_st
+
+    logger.info(
+        f"Generating function block '{fb_name}' for model with {len(model.regions)} regions"
+    )
+
+    code = STCode.empty()
+    code += generate_header(fb_name)
+
+    # TODO: Generate comprehensive global IO for ModelIR inputs/outputs
+    # For now, we add a comment placeholder
+    code += STCode.from_lines("    (* Model Inputs/Outputs and State Variables *)")
+
+    code += STCode.from_lines("VAR")
+    # TODO: Merge variable declarations from all regions
+    code += STCode.from_lines("    (* Internal variables for all regions *)")
+    code += STCode.from_lines("END_VAR")
+
+    code += STCode.from_lines("(* Forward pass execution *)")
+
+    for region in model.regions:
+        code += STCode.blank_line()
+        code += STCode.from_lines(
+            f"(* Region: {region.region_id} [{region.kind.name}] *)"
+        )
+
+        if region.region_id not in optimization_results:
+            code += STCode.from_lines(
+                f"    (* Error: No optimization result for {region.region_id} *)"
+            )
+            continue
+
+        optimization_result = optimization_results[region.region_id]
+
+        # Use region-kind-specific lowerer
+        try:
+            region_code = lower_region_to_st(region, optimization_result)
+            code += region_code
+        except Exception as e:
+            logger.error(
+                f"Failed to lower region {region.region_id} ({region.kind.name}): {e}"
+            )
+            code += STCode.from_lines(f"    (* Error lowering region: {e} *)")
+
+    code += generate_footer()
+    return code
+
+
 def translate_ir_to_st(
     ir: NetworkIR, fb_name: str = "NeuralNetwork", buffer_allocations=None
 ) -> str:
@@ -1279,4 +1353,15 @@ def translate_ir_to_st(
     builder = STCodeBuilder()
     builder += generate_function_block(ir, fb_name, buffer_allocations)
     # TODO: might need to add openplc config / straton config generation later
+    return str(builder.build())
+
+
+def translate_model_to_st(
+    model: ModelIR,
+    optimization_results: Dict[str, OptimizationResult],
+    fb_name: str = "NeuralNetwork",
+) -> str:
+    """Translate the given ModelIR to Structured Text code."""
+    builder = STCodeBuilder()
+    builder += generate_model_function_block(model, optimization_results, fb_name)
     return str(builder.build())

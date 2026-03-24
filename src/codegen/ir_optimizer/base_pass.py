@@ -1,11 +1,15 @@
 """
 Base class for IR optimization passes.
+
+Passes can declare which region kinds they support via supports_region_kinds().
+This prevents accidental execution on incompatible region types (e.g., DAG-specific
+passes should not run on recurrent regions).
 """
 
 import logging
 from abc import ABC, abstractmethod
 from typing import List, Set, Dict
-from ..types import NetworkIR, BaseLayer
+from ..types import NetworkIR, RegionKind, BaseLayer
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,19 @@ class OptimizationPass(ABC):
         """Return the name of this optimization pass."""
         pass
 
+    def supports_region_kinds(self) -> List[RegionKind]:
+        """
+        Declare which region kinds this pass can safely optimize.
+
+        By default, passes only support ACYCLIC regions (traditional DAG optimization).
+        Subclasses should override to declare support for additional kinds.
+
+        Returns:
+            List of RegionKind values that this pass supports.
+            Default: [RegionKind.ACYCLIC]
+        """
+        return [RegionKind.ACYCLIC]
+
     @abstractmethod
     def optimize(self, ir: NetworkIR) -> None:
         """
@@ -29,6 +46,8 @@ class OptimizationPass(ABC):
 
         This should populate self.removed_layers and self.tensor_mapping.
         Don't modify the IR directly - just mark what should be removed.
+
+        Note: This is only called after checking supports_region_kinds().
         """
         pass
 
@@ -55,7 +74,7 @@ class OptimizationPass(ABC):
     def remap_tensor(self, old_tensor: str, new_tensor: str):
         """
         Remap a tensor to point to a different source.
-        
+
         Args:
             old_tensor: Original tensor name
             new_tensor: New tensor to use instead
@@ -65,10 +84,10 @@ class OptimizationPass(ABC):
     def bypass_layer(self, layer: BaseLayer):
         """
         Bypass a layer by remapping all its outputs to its first input.
-        
+
         Common pattern for removing pass-through layers like
         Identity, no-op Reshape, etc.
-        
+
         Args:
             layer: Layer to bypass
         """
@@ -81,11 +100,11 @@ class OptimizationPass(ABC):
 
     def bypass_layer_chain(self, layers: List[BaseLayer]):
         """
-        Bypass a chain of layers by remapping the last layer's outputs 
+        Bypass a chain of layers by remapping the last layer's outputs
         to the first layer's inputs.
-        
+
         Useful for removing patterns like Quant → Dequant pairs.
-        
+
         Args:
             layers: List of consecutive layers to bypass (in order)
         """
@@ -103,7 +122,6 @@ class OptimizationPass(ABC):
         # Mark all layers in chain for removal
         for layer in layers:
             self.mark_for_removal(layer)
-
 
     def replace_layer(
         self, old_layer: BaseLayer, new_layer: BaseLayer, ir: "NetworkIR"
