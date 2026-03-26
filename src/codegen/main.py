@@ -5,7 +5,6 @@ The compilation pipeline is split into explicit, composable stages:
   analyze_model()      → ONNXModel
   build_model_ir()     → ModelIR
   optimize_regions()   → Dict[region_id -> OptimizationResult]
-  plan_execution()     → ExecutionPlan
   generate_st()        → ST code string
 
 Each stage is pure (input→output with minimal side effects) and can be tested independently.
@@ -21,10 +20,9 @@ from codegen.onnx_model import ONNXModel
 from codegen.onnx_to_ir import onnx_to_ir, regionize_network_ir
 from codegen.ir_optimizer import optimize_model_regions, OptimizationResult
 from codegen.memory_check.memory_analyzer import check_memory
-from codegen.ir_to_st import translate_ir_to_st, translate_model_to_st
+from codegen.ir_to_st import translate_model_to_st
 from codegen.types import ModelIR, RegionKind
 from codegen.backends import default_st_backend_capabilities
-from codegen.planner import create_execution_plan
 
 logger = logging.getLogger(__name__)
 
@@ -122,43 +120,7 @@ def optimize_regions(model_ir: ModelIR) -> Dict[str, OptimizationResult]:
 
 
 # ============================================================================
-# Stage 4: Plan Execution
-# ============================================================================
-
-
-def plan_execution(model_ir: ModelIR, validate: bool = True):
-    """
-    Validate backend capabilities and plan region execution.
-
-    Stage 4 of the pipeline. Creates an execution plan or validates feasibility.
-
-    Args:
-        model_ir: Regionized model
-        validate: If True, validate that all regions are supported
-
-    Returns:
-        ExecutionPlan (when fully implemented) or None for now
-
-    Raises:
-        RuntimeError: If validate=True and unsupported regions are detected
-    """
-    logger.info("Stage 4: Planning execution")
-    capabilities = default_st_backend_capabilities()
-
-    if validate:
-        for region in model_ir.regions:
-            if region.kind == RegionKind.UNSUPPORTED:
-                raise RuntimeError(f"Unsupported region type: {region.kind}")
-
-    logger.info(
-        f"  Backend capabilities validated for {len(model_ir.regions)} region(s)"
-    )
-    # TODO: Return structured ExecutionPlan once planning is formalized
-    return None
-
-
-# ============================================================================
-# Stage 5: Generate Structured Text
+# Stage 4: Generate Structured Text
 # ============================================================================
 
 
@@ -171,7 +133,7 @@ def generate_st(
     """
     Generate Structured Text code from optimized ModelIR.
 
-    Stage 5 of the pipeline. Uses region-aware lowering to produce ST.
+    Stage 4 of the pipeline. Uses region-aware lowering to produce ST.
 
     Args:
         model_ir: Regionized model
@@ -182,32 +144,12 @@ def generate_st(
     Returns:
         Generated Structured Text code as string
     """
-    logger.info("Stage 5: Generating Structured Text")
+    logger.info("Stage 4: Generating Structured Text")
 
-    # Choose code generation path based on model structure
-    use_legacy_path = (
-        len(model_ir.regions) == 1 and model_ir.regions[0].kind == RegionKind.ACYCLIC
+    logger.info(f"ST generation for {len(model_ir.regions)} region(s)")
+    st_code = translate_model_to_st(
+        model_ir, optimization_results=optimization_results, fb_name=fb_name
     )
-
-    if use_legacy_path:
-        # Simple single-region acyclic model: use legacy single-IR path
-        logger.info("  Using legacy single-region ST generation")
-        target_region_id = model_ir.regions[0].region_id
-        result = optimization_results[target_region_id]
-
-        st_code = translate_ir_to_st(
-            result.ir,
-            fb_name=fb_name,
-            buffer_allocations=result.buffer_allocations,
-        )
-    else:
-        # Multi-region or non-acyclic: use region-aware path
-        logger.info(
-            f"  Using multi-region ST generation for {len(model_ir.regions)} region(s)"
-        )
-        st_code = translate_model_to_st(
-            model_ir, optimization_results=optimization_results, fb_name=fb_name
-        )
 
     if output_path:
         logger.info(f"  Writing ST code to {output_path}")
@@ -262,10 +204,7 @@ def compile_onnx_to_st(
         for region in model_ir.regions:
             optimization_results[region.region_id] = OptimizationResult(ir=region.graph)
 
-    # Stage 4: Plan
-    plan_execution(model_ir, validate=True)
-
-    # Step 5.5: Check memory consumption (TODO: integrate into planning)
+    # Step 3.5: Check memory consumption (TODO: integrate into planning)
     if any(r.kind == RegionKind.ACYCLIC for r in model_ir.regions):
         first_acyclic = next(
             r.region_id for r in model_ir.regions if r.kind == RegionKind.ACYCLIC
@@ -274,7 +213,7 @@ def compile_onnx_to_st(
             logger.debug("Checking memory for first acyclic region")
             check_memory(optimization_results[first_acyclic].ir)
 
-    # Stage 5: Generate
+    # Stage 4: Generate
     fb_name = input_path.stem
     st_code = generate_st(
         model_ir, optimization_results, output_path=output_path, fb_name=fb_name

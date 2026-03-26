@@ -9,7 +9,7 @@ import logging
 from typing import List, Optional, Dict
 from collections import defaultdict
 
-from ..onnx_to_ir.converter import topological_sort
+from ..graph_algorithms import topological_sort, has_cycle, condensation_execution_order
 from ..types import NetworkIR, ModelIR, RegionKind
 from .base_pass import OptimizationPass
 from .result import OptimizationResult
@@ -221,10 +221,15 @@ class IROptimizer:
             new_layers
         )
 
-        # 5. Rebuild execution order
-        new_execution_order = topological_sort(
-            new_layers, new_tensor_producers, self.ir.input_tensors
-        )
+        # 5. Rebuild execution order (SCC-aware for cyclic graphs)
+        if has_cycle(new_layers, new_tensor_producers, self.ir.input_tensors):
+            new_execution_order = condensation_execution_order(
+                new_layers, new_tensor_producers, self.ir.input_tensors
+            )
+        else:
+            new_execution_order = topological_sort(
+                new_layers, new_tensor_producers, self.ir.input_tensors
+            )
 
         # 6. Renumber layer IDs sequentially
         new_layers = self._renumber_layer_ids(new_layers, new_execution_order)

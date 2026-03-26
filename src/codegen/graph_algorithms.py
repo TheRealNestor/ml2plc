@@ -184,3 +184,80 @@ def topological_order_components(component_edges: Dict[int, Set[int]]) -> List[i
         )
         return sorted(component_edges.keys())
     return order
+
+
+def condensation_execution_order(
+    layers: Dict[str, BaseLayer],
+    tensor_producers: Dict[str, str],
+    input_tensors: tuple,
+) -> List[str]:
+    """
+    Compute a deterministic execution order that supports cyclic graphs.
+
+    Strategy:
+      1) Build layer dependency graph from tensor flow.
+      2) Collapse SCCs into condensation DAG.
+      3) Topologically order SCCs.
+      4) Emit members of each SCC in stable lexical order.
+
+    For purely acyclic graphs this behaves similarly to topological_sort, but for
+    cyclic graphs it returns a best-effort linearization by SCC block order rather
+    than raising an exception.
+    """
+    adjacency: Dict[str, Set[str]] = {name: set() for name in layers.keys()}
+
+    for layer_name, layer in layers.items():
+        for input_tensor in layer.inputs:
+            if input_tensor in input_tensors:
+                continue
+            producer = tensor_producers.get(input_tensor)
+            if producer and producer != layer_name and producer in layers:
+                adjacency[producer].add(layer_name)
+
+    if not adjacency:
+        return []
+
+    sccs = tarjan_scc(adjacency)
+    node_to_component: Dict[str, int] = {}
+    for cid, component in enumerate(sccs):
+        for node in component:
+            node_to_component[node] = cid
+
+    component_edges: Dict[int, Set[int]] = {cid: set() for cid in range(len(sccs))}
+    for src, neighbors in adjacency.items():
+        src_cid = node_to_component[src]
+        for dst in neighbors:
+            dst_cid = node_to_component[dst]
+            if src_cid != dst_cid:
+                component_edges[src_cid].add(dst_cid)
+
+    ordered_components = topological_order_components(component_edges)
+    ordered_layers: List[str] = []
+    for cid in ordered_components:
+        ordered_layers.extend(sorted(sccs[cid]))
+
+    return ordered_layers
+
+
+def has_cycle(
+    layers: Dict[str, BaseLayer],
+    tensor_producers: Dict[str, str],
+    input_tensors: tuple,
+) -> bool:
+    """Return True if the layer dependency graph contains at least one cycle."""
+    adjacency: Dict[str, Set[str]] = {name: set() for name in layers.keys()}
+    for layer_name, layer in layers.items():
+        for input_tensor in layer.inputs:
+            if input_tensor in input_tensors:
+                continue
+            producer = tensor_producers.get(input_tensor)
+            if producer and producer != layer_name and producer in layers:
+                adjacency[producer].add(layer_name)
+
+    for component in tarjan_scc(adjacency):
+        if len(component) > 1:
+            return True
+        only = component[0]
+        if only in adjacency.get(only, set()):
+            return True
+    return False
