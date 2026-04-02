@@ -244,20 +244,33 @@ def has_cycle(
     tensor_producers: Dict[str, str],
     input_tensors: tuple,
 ) -> bool:
-    """Return True if the layer dependency graph contains at least one cycle."""
+    """
+    Return True if the layer dependency graph contains at least one cycle.
+
+    Detects:
+    - Multi-node cycles (A→B→C→A)
+    - Self-loops (A→A)
+    """
     adjacency: Dict[str, Set[str]] = {name: set() for name in layers.keys()}
+
     for layer_name, layer in layers.items():
         for input_tensor in layer.inputs:
             if input_tensor in input_tensors:
                 continue
             producer = tensor_producers.get(input_tensor)
-            if producer and producer != layer_name and producer in layers:
-                adjacency[producer].add(layer_name)
+            if not producer or producer not in layers:
+                continue
 
+            # Self-loop: layer depends on its own output
+            if producer == layer_name:
+                return True
+
+            # Add edge from producer to consumer
+            adjacency[producer].add(layer_name)
+
+    # Check for multi-node cycles via SCC detection
     for component in tarjan_scc(adjacency):
         if len(component) > 1:
             return True
-        only = component[0]
-        if only in adjacency.get(only, set()):
-            return True
+
     return False
