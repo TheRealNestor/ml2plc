@@ -210,35 +210,167 @@ def lower_loop_region_to_st(
     Loop regions represent explicit control flow constructs from the ONNX model
     (Loop, Scan operators). They have explicit loop count and carry variables.
 
-    Loop inputs: loop count, carry variables
-    Loop outputs: final carry values, scan outputs
+    ONNX Loop Operator:
+      Inputs:  [trip_count, condition, carry_0, carry_1, ...]
+      Body:    Iterative computation with state carry-over
+      Outputs: [carry_0_final, carry_1_final, ..., scan_outputs...]
+
+    Strategy:
+      1. Initialize carry variables from loop_inputs
+      2. FOR loop: 0 to trip_count - 1
+      3. Execute body (forward pass)
+      4. Collect final carries and scan outputs
 
     Args:
-        region: Loop region to lower
+        region: Loop region to lower (LoopRegionIR)
         optimization_result: Optimized IR for this region
 
     Returns:
         Generated ST code for this region (with loop control)
 
     Note:
-        Current implementation is a placeholder. Full support requires:
-        - Loop count extraction
-        - Carry variable management
-        - Loop body generation
-        - Scan output collection
+        Current implementation assumes:
+        - Single trip_count input (first loop input)
+        - Remaining inputs are carry variables
+        - Forward pass handles internal computation
+
+        Future work:
+        - Condition-based loops (WHILE instead of FOR)
+        - Dynamic loop count from tensor
+        - Scan output specialization
+        - Loop body optimization/unrolling
     """
-    logger.debug(f"Lowering loop region {region.region_id}")
-    logger.warning(f"Loop region {region.region_id} lowering not fully implemented")
+    logger.debug(
+        f"Lowering loop region {region.region_id} "
+        f"with loop_inputs={region.loop_inputs}, loop_outputs={region.loop_outputs}"
+    )
 
-    code = STCode.from_lines(f"(* Loop region {region.region_id} - placeholder *)")
-    code += STCode.from_lines("(* TODO: Implement loop control flow *)")
+    ir = optimization_result.ir
+    buffer_allocations = optimization_result.buffer_allocations
 
-    # TODO: Implement:
-    # 1. Loop count extraction
-    # 2. Carry variable initialization
-    # 3. FOR/WHILE loop generation
-    # 4. Body execution
-    # 5. Carry update and output collection
+    code = STCode.empty()
+
+    # Comment header for region
+    code += STCode.from_lines(f"(* Loop Region {region.region_id} *)")
+    code += STCode.blank_line()
+
+    # Extract loop metadata
+    loop_metadata = _extract_loop_metadata(region, ir, buffer_allocations)
+
+    # Generate carry variable initialization if needed
+    if loop_metadata["carry_vars"]:
+        code += _generate_loop_initialization(loop_metadata)
+        code += STCode.blank_line()
+
+    # Generate main loop structure
+    code += _generate_loop_body(region, ir, buffer_allocations, loop_metadata)
+    code += STCode.blank_line()
+
+    return code
+
+
+def _extract_loop_metadata(
+    region: LoopRegionIR,
+    ir: NetworkIR,
+    buffer_allocations: Dict[str, str],
+) -> Dict:
+    """
+    Extract and structure loop metadata for code generation.
+
+    Parses loop_inputs and loop_outputs to identify:
+    - trip_count: loop iteration count
+    - carry_vars: state variables that persist across iterations
+    - scan_outputs: accumulated outputs from each iteration
+
+    Returns:
+        Dictionary with loop execution parameters:
+        {
+            "trip_count_var": str,      # Variable name for loop count
+            "carry_vars": [(in, out),], # (carry_input, carry_output) pairs
+            "scan_outputs": [str, ...], # Accumulated output names
+        }
+    """
+    metadata = {
+        "trip_count_var": "trip_count",  # Default; could be extracted from first input
+        "carry_vars": [],
+        "scan_outputs": [],
+    }
+
+    # For MVP: assume first loop_input is trip_count
+    if region.loop_inputs:
+        trip_count_tensor = region.loop_inputs[0]
+        metadata["trip_count_var"] = _resolve_variable_name(
+            trip_count_tensor, buffer_allocations
+        )
+
+        # Remaining inputs are carry variables
+        # Assume they pair with first N outputs
+        for idx, carry_in in enumerate(region.loop_inputs[1:]):
+            if idx < len(region.loop_outputs):
+                carry_out = region.loop_outputs[idx]
+                metadata["carry_vars"].append((carry_in, carry_out))
+
+        # Remaining outputs are scan outputs
+        num_carries = len(metadata["carry_vars"])
+        if len(region.loop_outputs) > num_carries:
+            metadata["scan_outputs"] = list(region.loop_outputs[num_carries:])
+
+    return metadata
+
+
+def _generate_loop_initialization(loop_metadata: Dict) -> STCode:
+    """
+    Generate carry variable initialization code.
+
+    For ONNX Loop, carry variables must be initialized from inputs
+    before the loop begins.
+
+    Generates:
+        carry_var_0 := input_carry_var_0;
+        carry_var_1 := input_carry_var_1;
+        ...
+    """
+    code = STCode.from_lines("(* Loop carry initialization *)")
+
+    for carry_in, carry_out in loop_metadata["carry_vars"]:
+        # Simple assignment: output := input
+        # In real usage, might map through buffer allocations
+        code += STCode.from_lines(f"{carry_out} := {carry_in};")
+
+    return code
+
+
+def _generate_loop_body(
+    region: LoopRegionIR,
+    ir: NetworkIR,
+    buffer_allocations: Dict[str, str],
+    loop_metadata: Dict,
+) -> STCode:
+    """
+    Generate the main loop structure with body execution.
+
+    Generates:
+        FOR iteration := 0 TO (trip_count - 1) DO
+            <loop body execution>
+        END_FOR;
+
+    The loop body is the forward pass of the loop region's computation graph.
+    """
+    from .generator import generate_forward_pass
+
+    trip_count_var = loop_metadata["trip_count_var"]
+
+    code = STCode.from_lines(f"(* Loop: {len(loop_metadata['carry_vars'])} carries *)")
+
+    # FOR loop from 0 to trip_count - 1
+    code += STCode.from_lines(f"FOR iteration := 0 TO ({trip_count_var} - 1) DO")
+
+    # Generate loop body (forward pass over the loop region graph)
+    body_code = generate_forward_pass(ir, buffer_allocations)
+    for line in body_code.lines:
+        code += STCode.from_lines("\t" + line)
+
+    code += STCode.from_lines("END_FOR;")
 
     return code
 
