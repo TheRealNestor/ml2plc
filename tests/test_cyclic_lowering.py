@@ -83,6 +83,7 @@ def _create_recurrent_region(
         tensor_consumers=tensor_consumers,
         input_tensors=input_tensors,
         output_tensors=output_tensors,
+        state_tensors={},  # No state tensors in test helper
     )
 
     return RecurrentRegionIR(

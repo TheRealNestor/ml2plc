@@ -234,6 +234,8 @@ class NetworkIR:
         tensor_consumers: Mapping of tensor_name -> [consuming_layer_names]
         input_tensors: Tuple of network input tensor names
         output_tensors: Tuple of network output tensor names
+        state_tensors: Mapping of state_tensor_name -> semantic role (e.g., "state")
+                       Detected from RNN operators (LSTM, GRU, RNN, Scan, Loop)
     """
 
     # layer_name -> layer
@@ -250,6 +252,10 @@ class NetworkIR:
 
     input_tensors: Tuple[str, ...] = ()
     output_tensors: Tuple[str, ...] = ()
+
+    # Semantic state tensor information: tensor_name -> "state"
+    # Populated by the ONNX converter when detecting RNN-family operators
+    state_tensors: Dict[str, str] = field(default_factory=dict)
 
     def get_layer(self, name: str) -> BaseLayer:
         """Get layer by name"""

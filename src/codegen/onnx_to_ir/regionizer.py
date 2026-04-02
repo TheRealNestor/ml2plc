@@ -5,6 +5,7 @@ Partitions a NetworkIR into typed regions (acyclic, recurrent, loop) based on
 strongly connected component (SCC) analysis.
 """
 
+import logging
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 from ..types import (
@@ -16,7 +17,15 @@ from ..types import (
     RegionKind,
 )
 from ..graph_algorithms import tarjan_scc, topological_order_components
+from ..ir_utils import (
+    build_tensor_maps,
+    filter_tensor_maps_for_nodes,
+    extract_component_input_tensors,
+    extract_component_output_tensors,
+    extract_component_state_tensors,
+)
 
+logger = logging.getLogger(__name__)
 
 _CONTROL_FLOW_OPS = {"Loop", "Scan", "If"}
 
@@ -43,49 +52,41 @@ def _subgraph_for_component(
     graph: NetworkIR,
     component_nodes: Set[str],
 ) -> NetworkIR:
-    """Create a region-local graph for a component."""
+    """
+    Create a region-local graph for a component.
+
+    Extracts a subgraph containing only nodes and tensors relevant to the
+    component, preserving graph structure and state information.
+    """
+    # Extract layers belonging to this component
     layers = {
         name: graph.layers[name]
         for name in graph.execution_order
         if name in component_nodes
     }
 
-    tensor_producers = {
-        tensor: producer
-        for tensor, producer in graph.tensor_producers.items()
-        if producer in component_nodes
-    }
-
-    tensor_consumers = {
-        tensor: [c for c in consumers if c in component_nodes]
-        for tensor, consumers in graph.tensor_consumers.items()
-        if any(c in component_nodes for c in consumers)
-    }
-
-    # Input tensors: either from global network inputs OR not produced within component
-    # This includes state inputs that loop back from outputs
-    input_tensors_set = set()
-    for t in graph.input_tensors:
-        if any(c in component_nodes for c in graph.tensor_consumers.get(t, [])):
-            input_tensors_set.add(t)
-
-    # Also include tensors consumed by component but not produced by component
-    # (these are external inputs, including state back-edges)
-    for layer_name in component_nodes:
-        layer = graph.layers[layer_name]
-        for in_tensor in layer.inputs:
-            if in_tensor not in tensor_producers:
-                # Not produced within component → external input
-                input_tensors_set.add(in_tensor)
-
-    input_tensors = tuple(sorted(input_tensors_set))
-
-    output_tensors = tuple(
-        t
-        for t in graph.output_tensors
-        if graph.tensor_producers.get(t) in component_nodes
+    # Extract internal tensor flow (using utility)
+    tensor_producers, tensor_consumers = filter_tensor_maps_for_nodes(
+        graph.tensor_producers,
+        graph.tensor_consumers,
+        component_nodes,
     )
 
+    # Compute I/O tensors (using utilities)
+    input_tensors_set = extract_component_input_tensors(
+        graph, component_nodes, tensor_producers
+    )
+    input_tensors = tuple(sorted(input_tensors_set))
+    output_tensors = extract_component_output_tensors(graph, component_nodes)
+
+    # Extract state tensor information (ground truth from converter)
+    state_tensors = {
+        tensor: role
+        for tensor, role in graph.state_tensors.items()
+        if tensor in tensor_producers or tensor in input_tensors_set
+    }
+
+    # Preserve execution order within component
     execution_order = [
         name for name in graph.execution_order if name in component_nodes
     ]
@@ -97,6 +98,7 @@ def _subgraph_for_component(
         tensor_consumers=tensor_consumers,
         input_tensors=input_tensors,
         output_tensors=output_tensors,
+        state_tensors=state_tensors,
     )
 
 
@@ -105,17 +107,31 @@ def _classify_region_kind(
     adjacency: Dict[str, Set[str]],
     graph: NetworkIR,
 ) -> RegionKind:
-    """Classify a component as acyclic/recurrent/loop."""
-    if any(graph.layers[n].op_type in _CONTROL_FLOW_OPS for n in component_nodes):
+    """
+    Classify a component as one of: Loop, Recurrent, or Acyclic.
+
+    Classification logic (priority order):
+    1. If contains ONNX Loop/Scan/If operators → LOOP region
+    2. If multiple nodes or self-loop → RECURRENT region
+    3. Otherwise → ACYCLIC region
+    """
+    # Check for explicit control flow operators (highest priority)
+    has_control_flow = any(
+        graph.layers[n].op_type in _CONTROL_FLOW_OPS for n in component_nodes
+    )
+    if has_control_flow:
         return RegionKind.LOOP
 
+    # Check for multiple nodes (indicating feedback within component)
     if len(component_nodes) > 1:
         return RegionKind.RECURRENT
 
-    only = next(iter(component_nodes))
-    if only in adjacency.get(only, set()):
+    # Check for self-loop on single node
+    single_node = next(iter(component_nodes))
+    if single_node in adjacency.get(single_node, set()):
         return RegionKind.RECURRENT
 
+    # No cycles, no control flow → purely acyclic
     return RegionKind.ACYCLIC
 
 
@@ -126,18 +142,44 @@ def _infer_state_tensors(
     """
     Infer state input/output tensors for a recurrent region.
 
+    Strategy: Use detected state tensors (from converter) as ground truth where
+    available, but fall back to topology analysis for cases where state detection
+    wasn't possible (e.g., older ONNX versions without operator annotations).
+
     State tensors are outputs that:
-    1. Are produced by nodes in the component
-    2. Are consumed by nodes in the component
-    3. Create back-edges (appear as inputs to their own producers)
+    1. Are marked as "state" in the converter (preferred approach)
+    2. Are produced by nodes in the component
+    3. Are consumed by nodes in the component
+    4. Create back-edges (appear as inputs to their own producers)
 
     Returns:
         (state_inputs, state_outputs) tensor name tuples
     """
     state_inputs: List[str] = []
     state_outputs: List[str] = []
+    # Strategy 1: Use explicitly detected state tensors (from converter)
+    # This is the primary mechanism and is reliable when available
+    annotated_state_tensors = list(
+        extract_component_state_tensors(graph, component_nodes)
+    )
 
-    # For each node in component, check if any outputs create back-edges
+    if annotated_state_tensors:
+        # Use annotated state information
+        state_outputs.extend(annotated_state_tensors)
+        state_inputs.extend(annotated_state_tensors)
+        logger.debug(
+            f"Region {component_nodes}: using {len(annotated_state_tensors)} "
+            f"annotated state tensors: {annotated_state_tensors}"
+        )
+        return (tuple(state_inputs), tuple(state_outputs))
+
+    # Strategy 2: Fall back to topology-based inference for back-edges
+    # This handles cases where state detection wasn't possible
+    logger.debug(
+        f"Region {component_nodes}: no annotated state tensors; "
+        f"falling back to topology analysis"
+    )
+
     for node_name in component_nodes:
         layer = graph.layers[node_name]
 
@@ -195,18 +237,57 @@ def _infer_loop_tensors(
     return (loop_inputs, loop_outputs)
 
 
+def _rebuild_merged_graph_structure(
+    layers: Dict[str, object],
+    execution_order: List[str],
+    state_tensors_from_regions: Dict[str, str],
+) -> NetworkIR:
+    """
+    Rebuild graph structure for merged acyclic regions.
+
+    When merging regions, we need to recompute tensor producers/consumers
+    since the merged region has different boundaries than the originals.
+    Delegates to centralized tensor map builder for consistency.
+    """
+    tensor_producers, tensor_consumers = build_tensor_maps(layers)
+
+    # Compute I/O tensors: inputs are those produced nowhere, outputs are those consumed nowhere
+    input_tensors = tuple(
+        t for t in tensor_producers.keys() if t not in tensor_consumers
+    )
+    output_tensors = tuple(
+        t for t in tensor_consumers.keys() if t not in tensor_producers
+    )
+
+    return NetworkIR(
+        layers=layers,
+        execution_order=execution_order,
+        tensor_producers=tensor_producers,
+        tensor_consumers=tensor_consumers,
+        input_tensors=input_tensors,
+        output_tensors=output_tensors,
+        state_tensors=state_tensors_from_regions,
+    )
+
+
 def _merge_consecutive_acyclic_regions(regions: List) -> List:
     """
     Merge consecutive acyclic regions into single regions.
 
     Optimization: Reduces trivial region boundaries in pure feed-forward networks.
-    Preserves recurrent and loop regions as boundaries.
+    Preserves recurrent and loop regions as natural boundaries.
+
+    Algorithm:
+    - Iterate through regions
+    - Accumulate layers from consecutive ACYCLIC regions
+    - When encountering a non-acyclic region, flush accumulated acyclic regions
+    - Rebuild tensor structure for merged acyclic region
 
     Args:
-        regions: List of region objects (may be AcyclicRegionIR, RecurrentRegionIR, LoopRegionIR)
+        regions: List of region objects (AcyclicRegionIR, RecurrentRegionIR, LoopRegionIR)
 
     Returns:
-        List of merged regions
+        List of merged regions (fewer acyclic regions, same non-acyclic regions)
     """
     if not regions:
         return regions
@@ -214,46 +295,22 @@ def _merge_consecutive_acyclic_regions(regions: List) -> List:
     merged = []
     current_acyclic_layers = {}
     current_acyclic_order = []
+    accumulated_state_tensors = {}
 
     for region in regions:
         if region.kind == RegionKind.ACYCLIC:
-            # Accumulate acyclic layers
+            # Accumulate layers and state info from this acyclic region
             current_acyclic_layers.update(region.graph.layers)
             current_acyclic_order.extend(region.graph.execution_order)
-        else:
-            # Non-acyclic region: flush any accumulated acyclic regions
-            if current_acyclic_layers:
-                # Create merged acyclic region
-                merged_graph = NetworkIR(
-                    layers=current_acyclic_layers,
-                    execution_order=current_acyclic_order,
-                    tensor_producers=region.graph.tensor_producers.copy(),  # Will be updated
-                    tensor_consumers=region.graph.tensor_consumers.copy(),  # Will be updated
-                    input_tensors=(),  # Will be computed
-                    output_tensors=(),  # Will be computed
-                )
-                # Rebuild tensor maps for merged region
-                tensor_producers = {}
-                tensor_consumers = {}
-                for layer in current_acyclic_layers.values():
-                    for out_t in layer.outputs:
-                        tensor_producers[out_t] = layer.name
-                    for in_t in layer.inputs:
-                        if in_t not in tensor_consumers:
-                            tensor_consumers[in_t] = []
-                        tensor_consumers[in_t].append(layer.name)
+            accumulated_state_tensors.update(region.graph.state_tensors)
 
-                merged_graph = NetworkIR(
-                    layers=current_acyclic_layers,
-                    execution_order=current_acyclic_order,
-                    tensor_producers=tensor_producers,
-                    tensor_consumers=tensor_consumers,
-                    input_tensors=tuple(
-                        t for t in tensor_producers.keys() if t not in tensor_consumers
-                    ),
-                    output_tensors=tuple(
-                        t for t in tensor_consumers.keys() if t not in tensor_producers
-                    ),
+        else:
+            # Non-acyclic region encountered: flush accumulated acyclic regions
+            if current_acyclic_layers:
+                merged_graph = _rebuild_merged_graph_structure(
+                    current_acyclic_layers,
+                    current_acyclic_order,
+                    accumulated_state_tensors,
                 )
                 merged.append(
                     AcyclicRegionIR(
@@ -262,35 +319,21 @@ def _merge_consecutive_acyclic_regions(regions: List) -> List:
                         graph=merged_graph,
                     )
                 )
+
+                # Reset accumulators for next batch of acyclic regions
                 current_acyclic_layers = {}
                 current_acyclic_order = []
+                accumulated_state_tensors = {}
 
-            # Add the non-acyclic region
+            # Add the non-acyclic region as-is
             merged.append(region)
 
-    # Flush any remaining acyclic regions
+    # Flush any remaining acyclic regions at the end
     if current_acyclic_layers:
-        tensor_producers = {}
-        tensor_consumers = {}
-        for layer in current_acyclic_layers.values():
-            for out_t in layer.outputs:
-                tensor_producers[out_t] = layer.name
-            for in_t in layer.inputs:
-                if in_t not in tensor_consumers:
-                    tensor_consumers[in_t] = []
-                tensor_consumers[in_t].append(layer.name)
-
-        merged_graph = NetworkIR(
-            layers=current_acyclic_layers,
-            execution_order=current_acyclic_order,
-            tensor_producers=tensor_producers,
-            tensor_consumers=tensor_consumers,
-            input_tensors=tuple(
-                t for t in tensor_producers.keys() if t not in tensor_consumers
-            ),
-            output_tensors=tuple(
-                t for t in tensor_consumers.keys() if t not in tensor_producers
-            ),
+        merged_graph = _rebuild_merged_graph_structure(
+            current_acyclic_layers,
+            current_acyclic_order,
+            accumulated_state_tensors,
         )
         merged.append(
             AcyclicRegionIR(
@@ -312,6 +355,7 @@ def regionize_network_ir(network_ir) -> ModelIR:
         tensor_consumers=network_ir.tensor_consumers,
         input_tensors=network_ir.input_tensors,
         output_tensors=network_ir.output_tensors,
+        state_tensors=network_ir.state_tensors,
     )
 
     if not graph.layers:

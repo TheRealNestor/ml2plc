@@ -10,6 +10,7 @@ from typing import List, Optional, Dict
 from collections import defaultdict
 
 from ..graph_algorithms import topological_sort, has_cycle, condensation_execution_order
+from ..ir_utils import build_tensor_maps
 from ..types import NetworkIR, ModelIR, RegionKind
 from .base_pass import OptimizationPass
 from .result import OptimizationResult
@@ -173,19 +174,12 @@ class IROptimizer:
         """
         Rebuild tensor producer/consumer maps.
 
+        Delegates to centralized graph structure builder.
+
         Returns:
             (tensor_producers, tensor_consumers) tuple
         """
-        tensor_producers = {}
-        tensor_consumers = defaultdict(list)
-
-        for layer in layers.values():
-            for inp in layer.inputs:
-                tensor_consumers[inp].append(layer.name)
-            for out in layer.outputs:
-                tensor_producers[out] = layer.name
-
-        return tensor_producers, dict(tensor_consumers)
+        return build_tensor_maps(layers)
 
     def _renumber_layer_ids(self, layers: dict, execution_order: list) -> dict:
         """Renumber layer IDs to be sequential based on execution order."""
@@ -241,4 +235,5 @@ class IROptimizer:
             tensor_consumers=new_tensor_consumers,
             input_tensors=self.ir.input_tensors,
             output_tensors=tuple(new_output_tensors),
+            state_tensors=self.ir.state_tensors,  # Preserve state tensor information
         )

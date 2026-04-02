@@ -71,6 +71,7 @@ def _network_ir(layers_dict: dict, input_tensors=(), output_tensors=()) -> Netwo
         tensor_consumers=tensor_consumers,
         input_tensors=tuple(input_tensors_list),
         output_tensors=tuple(output_tensors),
+        state_tensors={},  # No state tensors in test helper
     )
 
 
