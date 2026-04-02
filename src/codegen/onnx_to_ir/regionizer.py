@@ -62,11 +62,24 @@ def _subgraph_for_component(
         if any(c in component_nodes for c in consumers)
     }
 
-    input_tensors = tuple(
-        t
-        for t in graph.input_tensors
-        if any(c in component_nodes for c in graph.tensor_consumers.get(t, []))
-    )
+    # Input tensors: either from global network inputs OR not produced within component
+    # This includes state inputs that loop back from outputs
+    input_tensors_set = set()
+    for t in graph.input_tensors:
+        if any(c in component_nodes for c in graph.tensor_consumers.get(t, [])):
+            input_tensors_set.add(t)
+
+    # Also include tensors consumed by component but not produced by component
+    # (these are external inputs, including state back-edges)
+    for layer_name in component_nodes:
+        layer = graph.layers[layer_name]
+        for in_tensor in layer.inputs:
+            if in_tensor not in tensor_producers:
+                # Not produced within component → external input
+                input_tensors_set.add(in_tensor)
+
+    input_tensors = tuple(sorted(input_tensors_set))
+
     output_tensors = tuple(
         t
         for t in graph.output_tensors

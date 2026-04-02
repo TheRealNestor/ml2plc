@@ -158,7 +158,6 @@ def test_self_loop_is_recurrent():
     3. Or pattern matching in ONNX (e.g., recognizing RNN/LSTM operators)
     """
     # For now, skip this test as it requires explicit state annotations
-    # which will be added in Priority 3 (cyclic backend skeleton)
     pytest.skip("Requires explicit state annotations (future work)")
 
 
@@ -178,7 +177,6 @@ def test_state_inference_simple_rnn():
     3. Heuristic patterns (e.g., tensor names like *_prev, *_init, h_0, etc.)
     """
     # For now, skip this test as it requires better state inference
-    # which will be added in Priority 3 (cyclic backend skeleton) and Priority 5 (RNN ops)
     pytest.skip(
         "Requires RNN operator detection or explicit state annotations (future work)"
     )
