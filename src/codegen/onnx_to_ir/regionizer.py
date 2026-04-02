@@ -16,36 +16,19 @@ from ..types import (
     LoopRegionIR,
     RegionKind,
 )
-from ..graph_algorithms import tarjan_scc, topological_order_components
+from ..graph_algorithms import (
+    tarjan_scc,
+    topological_order_components,
+    build_layer_graph,
+)
 from ..ir_utils import (
-    build_tensor_maps,
-    filter_tensor_maps_for_nodes,
-    extract_component_input_tensors,
-    extract_component_output_tensors,
-    extract_component_state_tensors,
+    TensorMapBuilder,
+    build_tensor_maps,  # Legacy, kept for compatibility
 )
 
 logger = logging.getLogger(__name__)
 
 _CONTROL_FLOW_OPS = {"Loop", "Scan", "If"}
-
-
-def _build_layer_graph(
-    graph: NetworkIR,
-) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
-    """Build producer->consumer and reverse adjacency over layer names."""
-    adjacency: Dict[str, Set[str]] = {name: set() for name in graph.layers}
-    reverse_adjacency: Dict[str, Set[str]] = {name: set() for name in graph.layers}
-
-    for producer in graph.layers:
-        layer = graph.layers[producer]
-        for out_tensor in layer.outputs:
-            for consumer in graph.tensor_consumers.get(out_tensor, []):
-                if consumer in graph.layers and consumer != producer:
-                    adjacency[producer].add(consumer)
-                    reverse_adjacency[consumer].add(producer)
-
-    return adjacency, reverse_adjacency
 
 
 def _subgraph_for_component(
@@ -65,19 +48,15 @@ def _subgraph_for_component(
         if name in component_nodes
     }
 
-    # Extract internal tensor flow (using utility)
-    tensor_producers, tensor_consumers = filter_tensor_maps_for_nodes(
-        graph.tensor_producers,
-        graph.tensor_consumers,
-        component_nodes,
-    )
+    # Build tensor maps for full graph, then filter to component
+    full_builder = TensorMapBuilder.build(graph.layers)
+    component_builder = full_builder.extract_for_nodes(component_nodes)
+    tensor_producers, tensor_consumers = component_builder.as_tuple()
 
-    # Compute I/O tensors (using utilities)
-    input_tensors_set = extract_component_input_tensors(
-        graph, component_nodes, tensor_producers
-    )
+    # Compute I/O tensors using builder
+    input_tensors_set = component_builder.extract_input_tensors(graph, component_nodes)
     input_tensors = tuple(sorted(input_tensors_set))
-    output_tensors = extract_component_output_tensors(graph, component_nodes)
+    output_tensors = component_builder.extract_output_tensors(graph, component_nodes)
 
     # Extract state tensor information (ground truth from converter)
     state_tensors = {
@@ -157,10 +136,15 @@ def _infer_state_tensors(
     """
     state_inputs: List[str] = []
     state_outputs: List[str] = []
+
+    # Build builder for component to query state tensors
+    full_builder = TensorMapBuilder.build(graph.layers)
+    component_builder = full_builder.extract_for_nodes(component_nodes)
+
     # Strategy 1: Use explicitly detected state tensors (from converter)
     # This is the primary mechanism and is reliable when available
     annotated_state_tensors = list(
-        extract_component_state_tensors(graph, component_nodes)
+        component_builder.extract_state_tensors(graph, component_nodes)
     )
 
     if annotated_state_tensors:
@@ -371,7 +355,9 @@ def regionize_network_ir(network_ir) -> ModelIR:
             },
         )
 
-    adjacency, _ = _build_layer_graph(graph)
+    adjacency, _ = build_layer_graph(
+        graph.layers, graph.tensor_producers, graph.tensor_consumers
+    )
     sccs = tarjan_scc(adjacency)
 
     node_to_component: Dict[str, int] = {}

@@ -10,9 +10,7 @@ from collections import defaultdict
 from ..types import NetworkIR, BaseLayer
 from ..onnx_model import ONNXModel
 from ..graph_algorithms import (
-    topological_sort,
     condensation_execution_order,
-    has_cycle,
 )
 from .tensor_resolution import TensorResolver, ResolvedTensor
 from .shape_inference import infer_layer_shapes
@@ -252,16 +250,11 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
         else:
             logger.warning(f"Unsupported layer type: {op_type}")
 
-    # Sort layers (acyclic) or order SCC blocks (cyclic)
-    if has_cycle(layers, tensor_producers, input_tensors):
-        logger.info(
-            "Detected cyclic dependencies; using SCC-condensation execution ordering"
-        )
-        execution_order = condensation_execution_order(
-            layers, tensor_producers, input_tensors
-        )
-    else:
-        execution_order = topological_sort(layers, tensor_producers, input_tensors)
+    # Execution ordering using SCC-condensation
+    # This automatically handles both cyclic and acyclic graphs gracefully
+    execution_order = condensation_execution_order(
+        layers, tensor_producers, input_tensors
+    )
 
     # Detect state tensors from RNN-family operators
     state_tensors = _detect_state_tensors(analyzer, layers)

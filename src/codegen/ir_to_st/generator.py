@@ -19,6 +19,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ===========================================================================
+# Configuration
+# ===========================================================================
+
+# Activations that can be inlined within matrix multiplication
+# (vs. requiring a separate loop pass)
+INLINE_ACTIVATIONS = {
+    ActivationType.NONE,
+    ActivationType.RELU,
+}
+
+# ===========================================================================
 # Utility Functions
 # ===========================================================================
 
@@ -89,32 +100,6 @@ def get_layer_output_var(
         return buffer_allocations[output_tensor]
 
     return f"layer_{layer.layer_id}_output"
-
-
-# Configuration: which activations to inline (vs separate loop)
-INLINE_ACTIVATIONS = {
-    ActivationType.NONE,
-    ActivationType.RELU,
-    # ActivationType.SIGMOID,
-    # ActivationType.TANH,
-}
-
-
-def apply_activation_inline(activation: ActivationType, expr: str) -> str:
-    """Apply activation inline if possible, otherwise return expression unchanged."""
-    if activation == ActivationType.RELU:
-        return f"MAX({expr}, 0.0)"
-    elif activation == ActivationType.SIGMOID:
-        return f"1.0 / (1.0 + EXP(-({expr})))"
-    elif activation == ActivationType.TANH:
-        return f"((EXP({expr}) - EXP(-({expr}))) / (EXP({expr}) + EXP(-({expr}))))"
-    else:  # NONE, SOFTMAX, ...
-        return expr
-
-
-def needs_separate_activation(activation: ActivationType) -> bool:
-    """Check if activation needs separate loop."""
-    return activation not in INLINE_ACTIVATIONS
 
 
 def generate_weight_access(
@@ -622,13 +607,23 @@ def generate_linear_layer_code(
 
         # Apply bias and activation inline
         final_expr = build_final_linear_layer_expression(layer, layer.bias is not None)
-        activated_expr = apply_activation_inline(activation, final_expr)
+
+        # Inline activation if possible
+        if activation == ActivationType.RELU:
+            activated_expr = f"MAX({final_expr}, 0.0)"
+        elif activation == ActivationType.SIGMOID:
+            activated_expr = f"1.0 / (1.0 + EXP(-({final_expr})))"
+        elif activation == ActivationType.TANH:
+            activated_expr = f"((EXP({final_expr}) - EXP(-({final_expr}))) / (EXP({final_expr}) + EXP(-({final_expr}))))"
+        else:  # NONE, SOFTMAX, or other
+            activated_expr = final_expr
+
         builder.add_line(f"{output_var}[j] := {activated_expr};")
 
     builder.add_line("END_FOR;")
 
-    # Separate activation pass if needed
-    if needs_separate_activation(activation):
+    # Separate activation pass if needed (for activations that can't be inlined)
+    if activation not in INLINE_ACTIVATIONS:
         builder.add_line("")
         builder.add_code(
             generate_activation_code(
@@ -1200,53 +1195,33 @@ def generate_batchnorm_code(
 # ============================================================================
 
 
-# Mapping from layer type to code generator
-def _single_input_wrapper(generator_func):
-    """Wraps a generator function to handle single input layers."""
-    return lambda layer, inputs, output: generator_func(layer, inputs[0], output)
-
-
-LAYER_CODE_GENERATORS = {
-    MatMulLayer: _single_input_wrapper(generate_linear_layer_code),
-    GemmLayer: _single_input_wrapper(generate_linear_layer_code),
-    FusedGemmLayer: _single_input_wrapper(generate_linear_layer_code),
-    FusedLinearLayer: _single_input_wrapper(generate_linear_layer_code),
-    AddLayer: generate_add_code,
-    ReshapeLayer: _single_input_wrapper(generate_reshape_code),
-    ActivationLayer: _single_input_wrapper(generate_activation_layer_code),
-    QuantizeLinearLayer: _single_input_wrapper(generate_quantize_linear_code),
-    DequantizeLinearLayer: _single_input_wrapper(generate_dequantize_linear_code),
-    DropoutLayer: _single_input_wrapper(generate_dropout_code),
-    Conv2DLayer: _single_input_wrapper(generate_conv2d_code),
-    Pool2DLayer: _single_input_wrapper(generate_pool2d_code),
-    FlattenLayer: _single_input_wrapper(generate_flatten_code),
-    TransposeLayer: _single_input_wrapper(generate_transpose_code),
-    BatchNormLayer: _single_input_wrapper(generate_batchnorm_code),
-    SqueezeLayer: _single_input_wrapper(generate_squeeze_code),
-}
-
-
 def generate_forward_pass(
     network: NetworkIR, buffer_allocations: Optional[Dict[str, str]] = None
 ) -> STCode:
-    """Generate the forward pass computation code for all layers."""
+    """
+    Generate the forward pass computation code for all layers.
+
+    Uses the centralized layer code generator registry from layer_generators.py
+    to maintain a single source of truth for all layer-to-ST mappings.
+    """
+    from .layer_generators import get_global_registry
+
+    registry = get_global_registry()
     code = STCode.empty()
+
     for layer_name in network.execution_order:
         layer = network.layers[layer_name]
 
         input_vars = get_layer_input_vars(layer, network, buffer_allocations)
         output_var = get_layer_output_var(layer, network, buffer_allocations)
 
-        # Generate code for this layer
-        layer_type = type(layer)
-        if layer_type in LAYER_CODE_GENERATORS:
-            layer_code = LAYER_CODE_GENERATORS[layer_type](
-                layer, input_vars, output_var
-            )
+        # Generate code for this layer using registry
+        try:
+            layer_code = registry.generate(layer, input_vars, output_var)
             code += layer_code
             code += STCode.blank_line()
-        else:
-            logger.warning(f"No code generator for layer type {layer_type.__name__}")
+        except ValueError as e:
+            logger.warning(str(e))
 
     return code
 

@@ -44,6 +44,9 @@ class BaseLayer:
     input_type: Optional[str] = None
     output_type: Optional[str] = None
 
+    # State role for RNN/LSTM/GRU layers (e.g., "state_input", "state_output", None)
+    state_role: Optional[str] = None
+
 
 @dataclass(frozen=True, kw_only=True)
 class ActivationLayer(BaseLayer):

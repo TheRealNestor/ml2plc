@@ -22,24 +22,7 @@ from codegen.ir_to_st.lowerers import lower_recurrent_region_to_st, lower_region
 from codegen.ir_to_st.st_code import STCode
 import numpy as np
 from unittest.mock import MagicMock
-
-
-def _create_simple_matmul_layer(
-    name: str, layer_id: int, inputs=(), outputs=()
-) -> MatMulLayer:
-    """Helper to create a simple MatMul layer."""
-    weights = np.random.randn(10, 10).astype(np.float32)
-    return MatMulLayer(
-        layer_id=layer_id,
-        name=name,
-        op_type="MatMul",
-        input_size=len(inputs),
-        output_size=len(outputs),
-        inputs=inputs,
-        outputs=outputs,
-        weights=weights,
-        bias=None,
-    )
+from fixtures import create_simple_matmul_layer
 
 
 def _create_recurrent_region(
@@ -102,7 +85,7 @@ def _create_recurrent_region(
 
 def test_lower_simple_recurrent_region():
     """Simple recurrent region with one layer generates valid ST."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "rnn",
         layer_id=0,
         inputs=("x", "h_prev"),
@@ -135,7 +118,7 @@ def test_lower_simple_recurrent_region():
 
 def test_recurrent_region_generates_state_initialization():
     """State initialization code should be generated."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "rnn",
         layer_id=0,
         inputs=("x", "h_prev"),
@@ -160,13 +143,13 @@ def test_recurrent_region_generates_state_initialization():
 
 def test_recurrent_region_with_multiple_state_tensors():
     """Multiple state tensors should all be handled."""
-    layer1 = _create_simple_matmul_layer(
+    layer1 = create_simple_matmul_layer(
         "rnn_a",
         layer_id=0,
         inputs=("x", "h_prev", "c_prev"),
         outputs=("h",),
     )
-    layer2 = _create_simple_matmul_layer(
+    layer2 = create_simple_matmul_layer(
         "rnn_b",
         layer_id=1,
         inputs=("h",),
@@ -191,7 +174,7 @@ def test_recurrent_region_with_multiple_state_tensors():
 
 def test_recurrent_region_fixed_timestep_loop():
     """Should generate fixed 1-timestep loop (MVP)."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "rnn",
         layer_id=0,
         inputs=("x", "h_prev"),
@@ -216,7 +199,7 @@ def test_recurrent_region_fixed_timestep_loop():
 
 def test_recurrent_region_empty_state():
     """Region with no state tensors should still be valid."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "rnn",
         layer_id=0,
         inputs=("x",),
@@ -247,14 +230,14 @@ def test_recurrent_region_empty_state():
 def test_recurrent_lowering_integration():
     """Integration test: realistic 2-layer recurrent structure."""
     # Simulate: embed → rnn_step where both rnn_step loops back
-    embed_layer = _create_simple_matmul_layer(
+    embed_layer = create_simple_matmul_layer(
         "embed",
         layer_id=0,
         inputs=("x",),
         outputs=("emb",),
     )
 
-    rnn_layer = _create_simple_matmul_layer(
+    rnn_layer = create_simple_matmul_layer(
         "rnn",
         layer_id=1,
         inputs=("emb", "h_prev"),

@@ -20,24 +20,7 @@ from codegen.ir_optimizer import OptimizationResult
 from codegen.ir_to_st.lowerers import lower_loop_region_to_st
 from codegen.ir_to_st.st_code import STCode
 import numpy as np
-
-
-def _create_simple_matmul_layer(
-    name: str, layer_id: int, inputs=(), outputs=()
-) -> MatMulLayer:
-    """Helper to create a simple MatMul layer."""
-    weights = np.random.randn(10, 10).astype(np.float32)
-    return MatMulLayer(
-        layer_id=layer_id,
-        name=name,
-        op_type="MatMul",
-        input_size=len(inputs),
-        output_size=len(outputs),
-        inputs=inputs,
-        outputs=outputs,
-        weights=weights,
-        bias=None,
-    )
+from fixtures import create_simple_matmul_layer
 
 
 def _create_loop_region(
@@ -103,7 +86,7 @@ def _create_loop_region(
 
 def test_lower_simple_loop_region():
     """Simple loop region with one layer generates valid ST."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "body",
         layer_id=0,
         inputs=("x", "carry"),
@@ -131,13 +114,12 @@ def test_lower_simple_loop_region():
 
     # Should contain FOR loop
     assert "FOR" in code_str
-    assert "iteration" in code_str or "iteration" in code_str.lower()
     assert "END_FOR" in code_str
 
 
 def test_loop_region_generates_carry_initialization():
     """Carry variable initialization should be generated."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "body",
         layer_id=0,
         inputs=("x", "h_prev"),
@@ -162,13 +144,13 @@ def test_loop_region_generates_carry_initialization():
 
 def test_loop_region_with_multiple_carries():
     """Multiple carry variables should all be handled."""
-    layer1 = _create_simple_matmul_layer(
+    layer1 = create_simple_matmul_layer(
         "step1",
         layer_id=0,
         inputs=("x", "h_prev", "c_prev"),
         outputs=("h",),
     )
-    layer2 = _create_simple_matmul_layer(
+    layer2 = create_simple_matmul_layer(
         "step2",
         layer_id=1,
         inputs=("h",),
@@ -195,7 +177,7 @@ def test_loop_region_with_multiple_carries():
 
 def test_loop_region_with_scan_outputs():
     """Loop with scan outputs (accumulated per iteration)."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "body",
         layer_id=0,
         inputs=("x", "state"),
@@ -220,7 +202,7 @@ def test_loop_region_with_scan_outputs():
 
 def test_loop_region_loop_structure():
     """Should generate FOR loop with proper bounds."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "body",
         layer_id=0,
         inputs=("x", "carry"),
@@ -240,15 +222,12 @@ def test_loop_region_loop_structure():
     code_str = "\n".join(code.lines)
 
     # Should have FOR loop from 0 to trip_count - 1
-    assert (
-        "FOR iteration := 0 TO (trip_count - 1) DO" in code_str
-        or "FOR iteration := 0 TO" in code_str
-    )
+    assert "FOR step := 0 TO (trip_count - 1) DO" in code_str
 
 
 def test_loop_region_empty_carries():
     """Loop region with no carries (read-only loop)."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "body",
         layer_id=0,
         inputs=("x",),
@@ -279,14 +258,14 @@ def test_loop_region_empty_carries():
 def test_loop_lowering_integration():
     """Integration test: realistic loop structure."""
     # Simulate: embedding in loop body, state carried across iterations
-    embed_layer = _create_simple_matmul_layer(
+    embed_layer = create_simple_matmul_layer(
         "embed",
         layer_id=0,
         inputs=("token", "state"),
         outputs=("embedded",),
     )
 
-    rnn_layer = _create_simple_matmul_layer(
+    rnn_layer = create_simple_matmul_layer(
         "rnn",
         layer_id=1,
         inputs=("embedded",),
@@ -311,7 +290,7 @@ def test_loop_lowering_integration():
 
     # Should produce valid ST structure
     assert "Loop Region" in code_str
-    assert "FOR iteration" in code_str
+    assert "FOR step" in code_str
     assert "END_FOR" in code_str
 
 
@@ -322,7 +301,7 @@ def test_loop_lowering_integration():
 
 def test_loop_region_single_carry_single_output():
     """Simplest case: one carry in, one carry out."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "body",
         layer_id=0,
         inputs=("carry",),
@@ -347,7 +326,7 @@ def test_loop_region_single_carry_single_output():
 
 def test_loop_region_with_no_loop_inputs():
     """Edge case: loop with no loop_inputs (malformed, but should not crash)."""
-    layer = _create_simple_matmul_layer(
+    layer = create_simple_matmul_layer(
         "body",
         layer_id=0,
         inputs=("x",),
