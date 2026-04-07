@@ -1,0 +1,2 @@
+- Optimization: All 0 bias, do we really need to store them? Maybe we can just store the non-zero ones and assume the rest are zero?
+- Is the generated ST correct? 
