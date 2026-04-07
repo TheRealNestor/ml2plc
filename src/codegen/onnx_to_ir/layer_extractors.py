@@ -649,6 +649,198 @@ def extract_squeeze_layer(
     )
 
 
+def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTMLayer":
+    """
+    Extract LSTM (Long Short-Term Memory) layer.
+
+    Per ONNX LSTM spec (opset 7+):
+    - Inputs:  [X, W, R, B, sequence_lens, initial_h, initial_c, P]
+    - Outputs: [Y, Y_h, Y_c]
+    - Where: W (input weights), R (recurrent weights), B (bias), P (peephole)
+
+    For inference, we extract:
+    - W: Input weight matrix (1, 4*hidden_size, input_size) for forward mode
+    - R: Recurrent weight matrix (1, 4*hidden_size, hidden_size)
+    - B: Combined bias (optional, default zeros)
+    - P: Peephole weights (optional)
+    """
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+
+    # Extract hidden_size from attributes
+    hidden_size = attrs.get("hidden_size")
+    if hidden_size is None:
+        raise ValueError(
+            f"LSTM layer '{layer['name']}': hidden_size attribute required"
+        )
+
+    # Input tensor properties
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    # Extract weights from inputs
+    # Input 0: X (sequence data)
+    # Input 1: W (input weights)
+    # Input 2: R (recurrent weights)
+    # Input 3: B (bias, optional)
+    # Input 4: sequence_lens (optional)
+    # Input 5: initial_h (optional)
+    # Input 6: initial_c (optional)
+    # Input 7: P (peephole, optional)
+
+    if len(inputs) < 3:
+        raise ValueError(
+            f"LSTM layer '{layer['name']}': requires at least 3 inputs (X, W, R), "
+            f"got {len(inputs)}"
+        )
+
+    # Extract W (input weights)
+    W_tensor = inputs[1]
+    if not W_tensor.is_weight:
+        raise ValueError(
+            f"LSTM layer '{layer['name']}': input 1 (W) must be a weight tensor"
+        )
+    W = W_tensor.value
+    if W is None:
+        W = analyzer.weights.get(W_tensor.name)
+    if W is None:
+        raise ValueError(f"LSTM layer '{layer['name']}': weight W not found")
+
+    # Extract R (recurrent weights)
+    R_tensor = inputs[2]
+    if not R_tensor.is_weight:
+        raise ValueError(
+            f"LSTM layer '{layer['name']}': input 2 (R) must be a weight tensor"
+        )
+    R = R_tensor.value
+    if R is None:
+        R = analyzer.weights.get(R_tensor.name)
+    if R is None:
+        raise ValueError(f"LSTM layer '{layer['name']}': weight R not found")
+
+    # Extract B (bias, optional)
+    B = None
+    if len(inputs) > 3 and inputs[3].is_weight and inputs[3].value is not None:
+        B = inputs[3].value
+
+    # Extract P (peephole weights, optional)
+    P = None
+    if len(inputs) > 7 and inputs[7].is_weight and inputs[7].value is not None:
+        P = inputs[7].value
+
+    # Extract activations
+    activations = tuple(attrs.get("activations", ["Sigmoid", "Tanh", "Tanh"]))
+    direction = attrs.get("direction", "forward")
+    clip = attrs.get("clip")
+
+    return LSTMLayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(t.name for t in inputs),
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        hidden_size=hidden_size,
+        W=W,
+        R=R,
+        B=B,
+        P=P,
+        activations=activations,
+        direction=direction,
+        clip=clip,
+    )
+
+
+def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULayer":
+    """
+    Extract GRU (Gated Recurrent Unit) layer.
+
+    Per ONNX GRU spec (opset 7+):
+    - Inputs:  [X, W, R, B, sequence_lens, initial_h]
+    - Outputs: [Y, Y_h]
+    - Where: W (input weights), R (recurrent weights), B (bias)
+
+    Similar to LSTM but simpler (no cell state, 3 gates instead of 4).
+    """
+    inputs = layer["resolved_inputs"]
+    attrs = layer.get("attributes", {})
+
+    # Extract hidden_size from attributes
+    hidden_size = attrs.get("hidden_size")
+    if hidden_size is None:
+        raise ValueError(f"GRU layer '{layer['name']}': hidden_size attribute required")
+
+    # Input tensor properties
+    input_shape, output_shape = infer_layer_shapes(layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    if len(inputs) < 3:
+        raise ValueError(
+            f"GRU layer '{layer['name']}': requires at least 3 inputs (X, W, R), "
+            f"got {len(inputs)}"
+        )
+
+    # Extract W (input weights)
+    W_tensor = inputs[1]
+    if not W_tensor.is_weight:
+        raise ValueError(
+            f"GRU layer '{layer['name']}': input 1 (W) must be a weight tensor"
+        )
+    W = W_tensor.value
+    if W is None:
+        W = analyzer.weights.get(W_tensor.name)
+    if W is None:
+        raise ValueError(f"GRU layer '{layer['name']}': weight W not found")
+
+    # Extract R (recurrent weights)
+    R_tensor = inputs[2]
+    if not R_tensor.is_weight:
+        raise ValueError(
+            f"GRU layer '{layer['name']}': input 2 (R) must be a weight tensor"
+        )
+    R = R_tensor.value
+    if R is None:
+        R = analyzer.weights.get(R_tensor.name)
+    if R is None:
+        raise ValueError(f"GRU layer '{layer['name']}': weight R not found")
+
+    # Extract B (bias, optional)
+    B = None
+    if len(inputs) > 3 and inputs[3].is_weight and inputs[3].value is not None:
+        B = inputs[3].value
+
+    # Extract activations
+    activations = tuple(attrs.get("activations", ["Sigmoid", "Tanh"]))
+    direction = attrs.get("direction", "forward")
+    clip = attrs.get("clip")
+
+    return GRULayer(
+        layer_id=layer_id,
+        name=layer["name"],
+        op_type=layer["op_type"],
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(t.name for t in inputs),
+        outputs=tuple(t.name for t in layer["resolved_outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=layer["resolved_outputs"][0].dtype,
+        hidden_size=hidden_size,
+        W=W,
+        R=R,
+        B=B,
+        activations=activations,
+        direction=direction,
+        clip=clip,
+    )
+
+
 # Registry of layer extractors
 LAYER_EXTRACTORS = {
     "MatMul": extract_matmul_layer,
@@ -671,4 +863,6 @@ LAYER_EXTRACTORS = {
     "Transpose": extract_transpose_layer,
     "BatchNormalization": extract_batchnorm_layer,
     "Squeeze": extract_squeeze_layer,
+    "LSTM": extract_lstm_layer,
+    "GRU": extract_gru_layer,
 }

@@ -235,12 +235,14 @@ def _rebuild_merged_graph_structure(
     """
     tensor_producers, tensor_consumers = build_tensor_maps(layers)
 
-    # Compute I/O tensors: inputs are those produced nowhere, outputs are those consumed nowhere
+    # Compute I/O tensors from tensor boundary sets.
+    # Inputs: consumed in this graph but not produced by any layer in this graph.
+    # Outputs: produced by this graph but not consumed by any layer in this graph.
     input_tensors = tuple(
-        t for t in tensor_producers.keys() if t not in tensor_consumers
+        t for t in tensor_consumers.keys() if t not in tensor_producers
     )
     output_tensors = tuple(
-        t for t in tensor_consumers.keys() if t not in tensor_producers
+        t for t in tensor_producers.keys() if t not in tensor_consumers
     )
 
     return NetworkIR(

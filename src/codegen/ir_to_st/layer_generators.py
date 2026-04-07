@@ -31,6 +31,8 @@ from ..types import (
     TransposeLayer,
     BatchNormLayer,
     SqueezeLayer,
+    LSTMLayer,
+    GRULayer,
 )
 from .st_code import STCode
 
@@ -135,6 +137,15 @@ class LayerCodeGeneratorRegistry:
         """
 
         def wrapper(layer, input_vars, output_var):
+            if not input_vars:
+                layer_name = getattr(layer, "name", type(layer).__name__)
+                layer_id = getattr(layer, "layer_id", "?")
+                declared_inputs = getattr(layer, "inputs", [])
+                raise ValueError(
+                    f"Layer {layer_id} ({layer_name}) has no resolved input variables "
+                    f"for ST generation. Declared inputs: {declared_inputs}"
+                )
+
             return generator_func(layer, input_vars[0], output_var)
 
         return wrapper
@@ -227,5 +238,7 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
     registry.register(
         SqueezeLayer, generator.generate_squeeze_code, wrap_single_input=True
     )
+    registry.register(LSTMLayer, generator.generate_lstm_code, wrap_single_input=True)
+    registry.register(GRULayer, generator.generate_gru_code, wrap_single_input=True)
 
     logger.info(f"Initialized default generators: {registry}")

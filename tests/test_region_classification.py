@@ -93,6 +93,8 @@ def test_simple_linear_chain_is_acyclic():
     assert len(model.regions) == 1
     assert model.regions[0].kind == RegionKind.ACYCLIC
     assert isinstance(model.regions[0], AcyclicRegionIR)
+    assert model.regions[0].graph.input_tensors == ("x",)
+    assert model.regions[0].graph.output_tensors == ("c",)
 
 
 def test_fan_in_fan_out_is_acyclic():

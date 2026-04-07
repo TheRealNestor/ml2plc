@@ -220,6 +220,67 @@ class BatchNormLayer(BaseLayer):
     combined_bias: np.ndarray  # shape (C,)  — precomputed β − μ·combined_scale
 
 
+@dataclass(frozen=True, kw_only=True)
+class LSTMLayer(BaseLayer):
+    """
+    Represents an ONNX LSTM layer (Long Short-Term Memory).
+
+    LSTM performs recurrent computation with gates and cell state:
+    - Input gate (i), Forget gate (f), Cell gate (g), Output gate (o)
+    - Hidden state (h) and Cell state (c) carry-over between timesteps
+
+    Per ONNX spec (opset 7+), the LSTM operator has:
+    - Inputs: [X, W, R, B, sequence_lens, initial_h, initial_c, P]
+    - Outputs: [Y, Y_h, Y_c]
+    - Attributes: activation_alpha, activation_beta, activations, clip, direction, hidden_size
+
+    Attributes:
+        hidden_size: Number of hidden units (h dimension)
+        W: Input weight matrix (num_directions, 4*hidden_size, input_size)
+        R: Recurrent weight matrix (num_directions, 4*hidden_size, hidden_size)
+        B: Bias vectors (num_directions, 8*hidden_size) [W_bias + R_bias]
+        P: Peephole weights (num_directions, 3*hidden_size) [optional]
+        activations: List of activation function types (default: ["Sigmoid", "Tanh", "Tanh"])
+        direction: "forward", "reverse", or "bidirectional"
+        clip: Optional clipping threshold for cell state
+    """
+
+    hidden_size: int
+    W: np.ndarray  # Input weight matrix
+    R: np.ndarray  # Recurrent weight matrix
+    B: Optional[np.ndarray] = None  # Bias (optional)
+    P: Optional[np.ndarray] = None  # Peephole weights (optional)
+    activations: Tuple[str, ...] = ("Sigmoid", "Tanh", "Tanh")  # (i, f, c) gates
+    direction: str = "forward"
+    clip: Optional[float] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class GRULayer(BaseLayer):
+    """
+    Represents an ONNX GRU layer (Gated Recurrent Unit).
+
+    GRU is a simplified RNN variant with reset and update gates.
+
+    Attributes:
+        hidden_size: Number of hidden units
+        W: Input weight matrix (num_directions, 3*hidden_size, input_size)
+        R: Recurrent weight matrix (num_directions, 3*hidden_size, hidden_size)
+        B: Bias vectors (num_directions, 6*hidden_size) [optional]
+        activations: List of activation function types (default: ["Sigmoid", "Tanh"])
+        direction: "forward", "reverse", or "bidirectional"
+        clip: Optional clipping threshold
+    """
+
+    hidden_size: int
+    W: np.ndarray
+    R: np.ndarray
+    B: Optional[np.ndarray] = None
+    activations: Tuple[str, ...] = ("Sigmoid", "Tanh")
+    direction: str = "forward"
+    clip: Optional[float] = None
+
+
 @dataclass(frozen=True)
 class NetworkIR:
     """

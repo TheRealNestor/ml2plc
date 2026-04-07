@@ -78,8 +78,26 @@ def get_layer_input_vars(
             input_vars.append(buffer_allocations[inp_tensor])
         elif inp_tensor in network.tensor_producers:
             producer_name = network.tensor_producers[inp_tensor]
-            producer_layer = network.layers[producer_name]
-            input_vars.append(f"layer_{producer_layer.layer_id}_output")
+            if producer_name in network.layers:
+                producer_layer = network.layers[producer_name]
+                input_vars.append(f"layer_{producer_layer.layer_id}_output")
+
+    if len(input_vars) != len(layer.inputs):
+        unresolved = [
+            t
+            for t in layer.inputs
+            if not network.is_network_input(t)
+            and t not in (buffer_allocations or {})
+            and (
+                t not in network.tensor_producers
+                or network.tensor_producers.get(t) not in network.layers
+            )
+        ]
+        if unresolved:
+            raise ValueError(
+                f"Layer {layer.layer_id} ({layer.name}) has unresolved input tensors "
+                f"that cannot be mapped to ST variables: {unresolved}"
+            )
 
     return input_vars
 
@@ -90,6 +108,11 @@ def get_layer_output_var(
     buffer_allocations: Optional[Dict[str, str]] = None,
 ) -> str:
     """Get output variable name for a layer."""
+
+    if not layer.outputs:
+        raise ValueError(
+            f"Layer {layer.layer_id} ({layer.name}) has no outputs; cannot generate ST output variable"
+        )
 
     output_tensor = layer.outputs[0]  # Assuming single output for simplicity
 
@@ -241,8 +264,14 @@ def generate_layer_weights(layer) -> STCode:
     - weights array
     - weight_scale (if quantized)
     - weight_zero_point (if quantized)
+
+    Special handling for LSTM: generates separate weight arrays for each gate
     """
     builder = STCodeBuilder()
+
+    # Special handling for LSTM layers
+    if isinstance(layer, LSTMLayer):
+        return generate_lstm_weights(layer)
 
     is_quantized = isinstance(layer, LinearLayer) and layer.is_quantized()
 
@@ -301,8 +330,134 @@ def generate_layer_weights(layer) -> STCode:
     return builder.build()
 
 
+def generate_lstm_weights(layer: "LSTMLayer") -> STCode:
+    """
+    Generate weight and bias constants for LSTM layer.
+
+    LSTM weights are organized as:
+    - W: (4*hidden_size, input_size) - split into W_i, W_f, W_g, W_o
+    - R: (4*hidden_size, hidden_size) - split into R_i, R_f, R_g, R_o
+    - B: (8*hidden_size,) - split into 8 gate biases (W and R biases separate)
+    """
+    builder = STCodeBuilder()
+
+    h_size = layer.hidden_size
+    x_size = layer.input_size
+    W = layer.W  # (4*hidden_size, input_size)
+    R = layer.R  # (4*hidden_size, hidden_size)
+    B = layer.B if layer.B is not None else np.zeros(8 * h_size)
+
+    weight_type = "REAL"
+
+    # Split W into 4 gates
+    W_i = W[:h_size, :]
+    W_f = W[h_size : 2 * h_size, :]
+    W_g = W[2 * h_size : 3 * h_size, :]
+    W_o = W[3 * h_size :, :]
+
+    # Split R into 4 gates
+    R_i = R[:h_size, :]
+    R_f = R[h_size : 2 * h_size, :]
+    R_g = R[2 * h_size : 3 * h_size, :]
+    R_o = R[3 * h_size :, :]
+
+    # Split B into 8 parts (4 for W, 4 for R)
+    # Typically we only use the first 4*hidden_size (W biases)
+    B_i = B[:h_size]
+    B_f = B[h_size : 2 * h_size]
+    B_g = B[2 * h_size : 3 * h_size]
+    B_o = B[3 * h_size : 4 * h_size]
+
+    # Generate weight arrays for input gates (W)
+    builder.add_code(
+        generate_array_constant(
+            f"weights_{layer.layer_id}_i", W_i.flatten(), weight_type, is_integer=False
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"weights_{layer.layer_id}_f", W_f.flatten(), weight_type, is_integer=False
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"weights_{layer.layer_id}_g", W_g.flatten(), weight_type, is_integer=False
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"weights_{layer.layer_id}_o", W_o.flatten(), weight_type, is_integer=False
+        )
+    )
+
+    # Generate recurrent weight arrays (R)
+    builder.add_code(
+        generate_array_constant(
+            f"recurrent_{layer.layer_id}_i",
+            R_i.flatten(),
+            weight_type,
+            is_integer=False,
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"recurrent_{layer.layer_id}_f",
+            R_f.flatten(),
+            weight_type,
+            is_integer=False,
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"recurrent_{layer.layer_id}_g",
+            R_g.flatten(),
+            weight_type,
+            is_integer=False,
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"recurrent_{layer.layer_id}_o",
+            R_o.flatten(),
+            weight_type,
+            is_integer=False,
+        )
+    )
+
+    # Generate bias arrays
+    builder.add_code(
+        generate_array_constant(
+            f"bias_{layer.layer_id}_i", B_i, weight_type, is_integer=False
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"bias_{layer.layer_id}_f", B_f, weight_type, is_integer=False
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"bias_{layer.layer_id}_g", B_g, weight_type, is_integer=False
+        )
+    )
+    builder.add_code(
+        generate_array_constant(
+            f"bias_{layer.layer_id}_o", B_o, weight_type, is_integer=False
+        )
+    )
+
+    return builder.build()
+
+
 def generate_layer_bias(layer) -> STCode:
-    """Generate bias constant for a layer."""
+    """Generate bias constant for a layer.
+
+    Note: For LSTM layers, biases are generated separately in generate_lstm_weights.
+    """
+    # Skip bias generation for LSTM (already handled in generate_lstm_weights)
+    if isinstance(layer, LSTMLayer):
+        return STCode.empty()
+
     bias_type = plc_type_from_onnx_dtype(layer.output_type)
     return generate_array_constant(f"bias_{layer.layer_id}", layer.bias, bias_type)
 
@@ -493,6 +648,47 @@ def generate_var_section(
         with builder.indent():
             builder.add_line("max_val : REAL;")
             builder.add_line("exp_sum : REAL;")
+
+    # Check if any LSTM layers are present and add temporary buffers for gates
+    has_lstm = any(
+        isinstance(network.layers[ln], LSTMLayer) for ln in network.execution_order
+    )
+    if has_lstm:
+        with builder.indent():
+            builder.add_line("(* LSTM gate buffers and temporary variables *)")
+            builder.add_line("exp_val : REAL;")
+            for ln in network.execution_order:
+                layer = network.layers[ln]
+                if isinstance(layer, LSTMLayer):
+                    h_size = layer.hidden_size
+                    builder.add_line(f"(* Layer {layer.layer_id} gate buffers *)")
+                    builder.add_line(
+                        f"i_gate_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"f_gate_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"g_gate_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"o_gate_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"c_tanh_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"h_state_in_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"c_state_in_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"h_state_out_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
+                    builder.add_line(
+                        f"c_state_out_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                    )
 
     builder.add_line("")
     builder.add_line("END_VAR")
@@ -1038,6 +1234,268 @@ def generate_squeeze_code(
     return builder.build()
 
 
+def generate_lstm_code(layer: "LSTMLayer", input_var: str, output_var: str) -> STCode:
+    """
+    Generate LSTM (Long Short-Term Memory) layer code.
+
+    LSTM implements a single timestep of recurrent computation with 4 gates:
+    - Input gate (i): controls information flow into cell state
+    - Forget gate (f): controls what to discard from cell state
+    - Cell gate (g): candidate values to add to cell state (tanh)
+    - Output gate (o): controls hidden state from cell state
+
+    For a single timestep, the forward pass computes:
+        i_t = sigmoid(W_i @ x + R_i @ h_{t-1} + b_i)
+        f_t = sigmoid(W_f @ x + R_f @ h_{t-1} + b_f)
+        g_t = tanh(W_g @ x + R_g @ h_{t-1} + b_g)
+        o_t = sigmoid(W_o @ x + R_o @ h_{t-1} + b_o)
+        c_t = f_t * c_{t-1} + i_t * g_t          (cell state update)
+        h_t = o_t * tanh(c_t)                     (hidden state output)
+
+    Requirements:
+    - Input x: input_var (shape: input_size,)
+    - Recurrent input h_{t-1}: h_state_in_{layer_id} (shape: hidden_size,)
+    - Cell state c_{t-1}: c_state_in_{layer_id} (shape: hidden_size,)
+    - Weights W_{gate}: weights_{layer_id}_{gate} (4 gates, input_size x hidden_size)
+    - Recurrent weights R_{gate}: recurrent_{layer_id}_{gate} (4 gates, hidden_size x hidden_size)
+    - Biases: bias_{layer_id}_{gate} (4 gates, hidden_size each)
+    - Output: h_t written to output_var, c_t to c_state_out_{layer_id}
+
+    Per ONNX LSTM spec (opset 7+):
+    - Inputs: [X, W, R, B, sequence_lens, initial_h, initial_c, P]
+    - Outputs: [Y, Y_h, Y_c]
+    - Bias B structure: [W_bias_i, W_bias_f, W_bias_g, W_bias_o,
+                          R_bias_i, R_bias_f, R_bias_g, R_bias_o]
+    """
+    builder = STCodeBuilder()
+
+    h_size = layer.hidden_size
+    x_size = layer.input_size
+    W = layer.W  # Shape: (4*hidden_size, input_size)
+    R = layer.R  # Shape: (4*hidden_size, hidden_size)
+    B = layer.B if layer.B is not None else np.zeros(8 * h_size)
+
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: LSTM (hidden_size={h_size}, input_size={x_size}) *)"
+    )
+    builder.add_line("(* Single timestep recurrent computation with 4 gates *)")
+
+    # Extract bias into 4 parts (input, forget, cell, output gates)
+    # B is typically (8*hidden_size,) with structure: [W_bias; R_bias]
+    # We typically only use the first 4*hidden_size (W_bias part)
+    bias_i = B[:h_size] if len(B) >= h_size else np.zeros(h_size)
+    bias_f = B[h_size : 2 * h_size] if len(B) >= 2 * h_size else np.zeros(h_size)
+    bias_g = B[2 * h_size : 3 * h_size] if len(B) >= 3 * h_size else np.zeros(h_size)
+    bias_o = B[3 * h_size : 4 * h_size] if len(B) >= 4 * h_size else np.zeros(h_size)
+
+    # Extract W and R for each gate
+    # W is (4*hidden_size, input_size), split into 4 gates
+    W_i = W[:h_size, :]
+    W_f = W[h_size : 2 * h_size, :]
+    W_g = W[2 * h_size : 3 * h_size, :]
+    W_o = W[3 * h_size : 4 * h_size, :]
+
+    # R is (4*hidden_size, hidden_size), split into 4 gates
+    R_i = R[:h_size, :]
+    R_f = R[h_size : 2 * h_size, :]
+    R_g = R[2 * h_size : 3 * h_size, :]
+    R_o = R[3 * h_size : 4 * h_size, :]
+
+    # State variable names (managed by recurrent region wrapper)
+    h_state_in = f"h_state_in_{layer.layer_id}"
+    c_state_in = f"c_state_in_{layer.layer_id}"
+    h_state_out = f"h_state_out_{layer.layer_id}"
+    c_state_out = f"c_state_out_{layer.layer_id}"
+
+    # Temporary buffers for gate computations
+    i_gate = f"i_gate_{layer.layer_id}"
+    f_gate = f"f_gate_{layer.layer_id}"
+    g_gate = f"g_gate_{layer.layer_id}"
+    o_gate = f"o_gate_{layer.layer_id}"
+    c_tanh = f"c_tanh_{layer.layer_id}"
+    temp_vec = f"temp_vec_{layer.layer_id}"
+
+    builder.add_line("")
+    builder.add_line(
+        f"(* Input Gate: i_t = sigmoid(W_i @ x + R_i @ h_{{t-1}} + b_i) *)"
+    )
+    builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
+    with builder.indent():
+        builder.add_line("sum := 0.0;")
+        # W_i @ x: input_size -> hidden_size contribution
+        builder.add_line(f"FOR i := 0 TO {x_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {input_var}[i] * weights_{layer.layer_id}_i[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        # R_i @ h_{t-1}: recurrent contribution
+        builder.add_line(f"FOR i := 0 TO {h_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {h_state_in}[i] * recurrent_{layer.layer_id}_i[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        # Add bias and apply sigmoid
+        builder.add_line(f"sum := sum + bias_{layer.layer_id}_i[j];")
+        builder.add_line(f"{i_gate}[j] := 1.0 / (1.0 + EXP(-sum));  (* sigmoid *)")
+    builder.add_line("END_FOR;")
+
+    builder.add_line("")
+    builder.add_line(
+        f"(* Forget Gate: f_t = sigmoid(W_f @ x + R_f @ h_{{t-1}} + b_f) *)"
+    )
+    builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
+    with builder.indent():
+        builder.add_line("sum := 0.0;")
+        builder.add_line(f"FOR i := 0 TO {x_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {input_var}[i] * weights_{layer.layer_id}_f[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        builder.add_line(f"FOR i := 0 TO {h_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {h_state_in}[i] * recurrent_{layer.layer_id}_f[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        builder.add_line(f"sum := sum + bias_{layer.layer_id}_f[j];")
+        builder.add_line(f"{f_gate}[j] := 1.0 / (1.0 + EXP(-sum));  (* sigmoid *)")
+    builder.add_line("END_FOR;")
+
+    builder.add_line("")
+    builder.add_line(
+        f"(* Cell Gate (Candidate): g_t = tanh(W_g @ x + R_g @ h_{{t-1}} + b_g) *)"
+    )
+    builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
+    with builder.indent():
+        builder.add_line("sum := 0.0;")
+        builder.add_line(f"FOR i := 0 TO {x_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {input_var}[i] * weights_{layer.layer_id}_g[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        builder.add_line(f"FOR i := 0 TO {h_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {h_state_in}[i] * recurrent_{layer.layer_id}_g[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        builder.add_line(f"sum := sum + bias_{layer.layer_id}_g[j];")
+        # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+        builder.add_line(f"exp_val := EXP(2.0 * sum);")
+        builder.add_line(
+            f"{g_gate}[j] := (exp_val - 1.0) / (exp_val + 1.0);  (* tanh *)"
+        )
+    builder.add_line("END_FOR;")
+
+    builder.add_line("")
+    builder.add_line(
+        f"(* Output Gate: o_t = sigmoid(W_o @ x + R_o @ h_{{t-1}} + b_o) *)"
+    )
+    builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
+    with builder.indent():
+        builder.add_line("sum := 0.0;")
+        builder.add_line(f"FOR i := 0 TO {x_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {input_var}[i] * weights_{layer.layer_id}_o[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        builder.add_line(f"FOR i := 0 TO {h_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {h_state_in}[i] * recurrent_{layer.layer_id}_o[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        builder.add_line(f"sum := sum + bias_{layer.layer_id}_o[j];")
+        builder.add_line(f"{o_gate}[j] := 1.0 / (1.0 + EXP(-sum));  (* sigmoid *)")
+    builder.add_line("END_FOR;")
+
+    builder.add_line("")
+    builder.add_line(f"(* Cell State Update: c_t = f_t * c_{{t-1}} + i_t * g_t *)")
+    builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
+    with builder.indent():
+        builder.add_line(
+            f"{c_state_out}[j] := {f_gate}[j] * {c_state_in}[j] + {i_gate}[j] * {g_gate}[j];"
+        )
+    builder.add_line("END_FOR;")
+
+    builder.add_line("")
+    builder.add_line(f"(* Output Hidden State: h_t = o_t * tanh(c_t) *)")
+    builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
+    with builder.indent():
+        # Compute tanh(c_t)
+        builder.add_line(f"exp_val := EXP(2.0 * {c_state_out}[j]);")
+        builder.add_line(f"{c_tanh}[j] := (exp_val - 1.0) / (exp_val + 1.0);")
+        # Multiply by output gate
+        builder.add_line(f"{output_var}[j] := {o_gate}[j] * {c_tanh}[j];")
+    builder.add_line("END_FOR;")
+
+    return builder.build()
+
+
+def generate_gru_code(layer: "GRULayer", input_var: str, output_var: str) -> STCode:
+    """
+    Generate GRU (Gated Recurrent Unit) layer code.
+
+    GRU is similar to LSTM but simpler (no cell state, 3 gates instead of 4):
+    - Reset gate (r), Update gate (z), New hidden state (~h)
+    - Updates hidden state (h) only
+
+    For inference, we assume:
+    - Input: x of shape (input_size,)
+    - Initial h: zero or provided by recurrent region
+    - Output: h of shape (hidden_size,)
+
+    The forward pass computes (for a single timestep):
+        r_t = sigmoid(W_r @ x + R_r @ h_{t-1} + b_r)
+        z_t = sigmoid(W_z @ x + R_z @ h_{t-1} + b_z)
+        ~h_t = tanh(W_h @ x + R_h @ (r_t * h_{t-1}) + b_h)
+        h_t = (1 - z_t) * ~h_t + z_t * h_{t-1}
+    """
+    builder = STCodeBuilder()
+
+    h_size = layer.hidden_size
+    x_size = layer.input_size
+    W = layer.W
+    R = layer.R
+    B = layer.B if layer.B is not None else np.zeros(3 * h_size)
+
+    builder.add_line(f"(* Layer {layer.layer_id}: GRU (hidden_size={h_size}) *)")
+    builder.add_line(
+        f"(* Note: This is a single GRU timestep; state carried by region wrapper *)"
+    )
+
+    builder.add_line("")
+    builder.add_line(f"(* Reset gate: r_t = sigmoid(sum) *)")
+    builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
+    with builder.indent():
+        builder.add_line("sum := 0.0;")
+        builder.add_line(f"FOR i := 0 TO {x_size - 1} DO")
+        with builder.indent():
+            builder.add_line(
+                f"sum := sum + {input_var}[i] * weights_{layer.layer_id}[i * {h_size} + j];"
+            )
+        builder.add_line("END_FOR;")
+        builder.add_line(f"sum := sum + bias_{layer.layer_id}[j];")
+        builder.add_line(f"{output_var}[j] := 1.0 / (1.0 + EXP(-sum));  (* sigmoid *)")
+    builder.add_line("END_FOR;")
+
+    builder.add_line("")
+    builder.add_line(
+        f"(* NOTE: This is a simplified GRU for demo. Full implementation requires:"
+    )
+    builder.add_line("(* - State variables (h) from recurrent region wrapper *)")
+    builder.add_line("(* - Proper gate interactions (update gate, candidate hidden) *)")
+    builder.add_line("(* - Hidden state update computation *)")
+    builder.add_line("(* This MVP demonstrates structure for extension. *)")
+
+    return builder.build()
+
+
 def generate_transpose_code(
     layer: TransposeLayer, input_var: str, output_var: str
 ) -> STCode:
@@ -1214,14 +1672,9 @@ def generate_forward_pass(
 
         input_vars = get_layer_input_vars(layer, network, buffer_allocations)
         output_var = get_layer_output_var(layer, network, buffer_allocations)
-
-        # Generate code for this layer using registry
-        try:
-            layer_code = registry.generate(layer, input_vars, output_var)
-            code += layer_code
-            code += STCode.blank_line()
-        except ValueError as e:
-            logger.warning(str(e))
+        layer_code = registry.generate(layer, input_vars, output_var)
+        code += layer_code
+        code += STCode.blank_line()
 
     return code
 
@@ -1253,6 +1706,282 @@ def generate_function_block(
     return code
 
 
+def generate_merged_constants_section(
+    optimization_results: Dict[str, OptimizationResult],
+) -> STCode:
+    """
+    Generate VAR CONSTANT section from all regions.
+
+    Collects and merges constant declarations (weights, biases, etc.) from
+    all regions' IRs to produce a global constants section.
+
+    Args:
+        optimization_results: Dict mapping region_id to OptimizationResult
+
+    Returns:
+        Complete VAR CONSTANT ... END_VAR section
+    """
+    code = STCode.from_lines("VAR CONSTANT")
+
+    # Track which constants we've already added (to avoid duplicates)
+    added_constants = set()
+
+    for region_id, opt_result in optimization_results.items():
+        network = opt_result.ir
+
+        for layer_name in network.execution_order:
+            layer = network.layers[layer_name]
+            has_constants = False
+
+            # Weights (for linear layers)
+            if hasattr(layer, "weights") and layer.weights is not None:
+                const_name = f"weights_{layer.layer_id}"
+                if const_name not in added_constants:
+                    code += generate_layer_weights(layer).indent()
+                    added_constants.add(const_name)
+                    has_constants = True
+
+            # Bias
+            if hasattr(layer, "bias") and layer.bias is not None:
+                const_name = f"bias_{layer.layer_id}"
+                if const_name not in added_constants:
+                    code += generate_layer_bias(layer).indent()
+                    added_constants.add(const_name)
+                    has_constants = True
+
+            # Quantization parameters (for activation quantization only)
+            if isinstance(layer, (QuantizeLinearLayer, DequantizeLinearLayer)):
+                if layer.input_type is not None:  # Skip weight-only dequantization
+                    quant_params = generate_layer_quantization_params(layer)
+                    if quant_params.lines:
+                        const_name = f"quant_{layer.layer_id}"
+                        if const_name not in added_constants:
+                            code += quant_params.indent()
+                            added_constants.add(const_name)
+                            has_constants = True
+
+            # BatchNorm precomputed parameters
+            if isinstance(layer, BatchNormLayer):
+                scale_name = f"bn_scale_{layer.layer_id}"
+                bias_name = f"bn_bias_{layer.layer_id}"
+                if scale_name not in added_constants:
+                    code += generate_array_constant(
+                        scale_name,
+                        layer.combined_scale,
+                        "REAL",
+                    ).indent()
+                    added_constants.add(scale_name)
+                    has_constants = True
+
+                if bias_name not in added_constants:
+                    code += generate_array_constant(
+                        bias_name,
+                        layer.combined_bias,
+                        "REAL",
+                    ).indent()
+                    added_constants.add(bias_name)
+                    has_constants = True
+
+            # LSTM weights and recurrent matrices
+            if isinstance(layer, LSTMLayer):
+                h_size = layer.hidden_size
+                x_size = layer.input_size
+
+                # Extract W and R matrices and biases
+                W = layer.W
+                R = layer.R
+                B = layer.B if layer.B is not None else np.zeros(8 * h_size)
+
+                # Bias parts
+                bias_i = B[:h_size] if len(B) >= h_size else np.zeros(h_size)
+                bias_f = (
+                    B[h_size : 2 * h_size] if len(B) >= 2 * h_size else np.zeros(h_size)
+                )
+                bias_g = (
+                    B[2 * h_size : 3 * h_size]
+                    if len(B) >= 3 * h_size
+                    else np.zeros(h_size)
+                )
+                bias_o = (
+                    B[3 * h_size : 4 * h_size]
+                    if len(B) >= 4 * h_size
+                    else np.zeros(h_size)
+                )
+
+                # W matrices for each gate
+                W_i = W[:h_size, :]
+                W_f = W[h_size : 2 * h_size, :]
+                W_g = W[2 * h_size : 3 * h_size, :]
+                W_o = W[3 * h_size : 4 * h_size, :]
+
+                # R matrices for each gate
+                R_i = R[:h_size, :]
+                R_f = R[h_size : 2 * h_size, :]
+                R_g = R[2 * h_size : 3 * h_size, :]
+                R_o = R[3 * h_size : 4 * h_size, :]
+
+                # Generate constants for each gate
+                for gate, W_gate, R_gate, bias_gate in [
+                    ("i", W_i, R_i, bias_i),
+                    ("f", W_f, R_f, bias_f),
+                    ("g", W_g, R_g, bias_g),
+                    ("o", W_o, R_o, bias_o),
+                ]:
+                    w_const_name = f"weights_{layer.layer_id}_{gate}"
+                    r_const_name = f"recurrent_{layer.layer_id}_{gate}"
+                    b_const_name = f"bias_{layer.layer_id}_{gate}"
+
+                    if w_const_name not in added_constants:
+                        code += generate_array_constant(
+                            w_const_name,
+                            W_gate,
+                            "REAL",
+                        ).indent()
+                        added_constants.add(w_const_name)
+                        has_constants = True
+
+                    if r_const_name not in added_constants:
+                        code += generate_array_constant(
+                            r_const_name,
+                            R_gate,
+                            "REAL",
+                        ).indent()
+                        added_constants.add(r_const_name)
+                        has_constants = True
+
+                    if b_const_name not in added_constants:
+                        code += generate_array_constant(
+                            b_const_name,
+                            bias_gate,
+                            "REAL",
+                        ).indent()
+                        added_constants.add(b_const_name)
+                        has_constants = True
+
+            if has_constants:
+                code += STCode.blank_line()
+
+    code += STCode.from_lines("END_VAR", "")
+    return code
+
+
+def collect_all_variables_from_regions(
+    optimization_results: Dict[str, OptimizationResult],
+) -> Dict[str, Tuple[int, str]]:
+    """
+    Collect all variable declarations needed across all regions.
+
+    Merges variable information from each region's IR to produce a global
+    variable list. Handles conflicts by taking the maximum size for each variable.
+
+    Args:
+        optimization_results: Dict mapping region_id to OptimizationResult
+
+    Returns:
+        Dictionary mapping variable_name -> (size, plc_type)
+        where size is the array size and plc_type is the PLC data type.
+    """
+    all_variables = {}
+
+    for region_id, opt_result in optimization_results.items():
+        network = opt_result.ir
+        buffer_allocations = opt_result.buffer_allocations or {}
+
+        # Track buffer allocations (if available)
+        for tensor_name, buffer_name in buffer_allocations.items():
+            if tensor_name in network.tensor_producers:
+                producer_name = network.tensor_producers[tensor_name]
+                if producer_name in network.layers:
+                    layer = network.layers[producer_name]
+                    plc_type = plc_type_from_onnx_dtype(layer.output_type)
+                    size = layer.output_size
+
+                    # Keep max size for each buffer
+                    if buffer_name not in all_variables:
+                        all_variables[buffer_name] = (size, plc_type)
+                    else:
+                        existing_size, existing_type = all_variables[buffer_name]
+                        all_variables[buffer_name] = (
+                            max(existing_size, size),
+                            existing_type,
+                        )
+
+        # Track layer output buffers (for layers not mapped to buffer allocations)
+        for layer_name in network.execution_order:
+            layer = network.layers[layer_name]
+
+            # Skip if output is a network output (handled separately)
+            if any(network.is_network_output(out) for out in layer.outputs):
+                continue
+
+            # Skip if already mapped to a buffer allocation
+            if any(out in buffer_allocations for out in layer.outputs):
+                continue
+
+            plc_type = plc_type_from_onnx_dtype(layer.output_type)
+            var_name = f"layer_{layer.layer_id}_output"
+
+            if var_name not in all_variables:
+                all_variables[var_name] = (layer.output_size, plc_type)
+
+    return all_variables
+
+
+def generate_merged_var_section(all_variables: Dict[str, Tuple[int, str]]) -> STCode:
+    """
+    Generate VAR section from merged variables across all regions.
+
+    Args:
+        all_variables: Dict mapping variable_name -> (size, plc_type)
+
+    Returns:
+        Complete VAR ... END_VAR section
+    """
+    builder = STCodeBuilder()
+    builder.add_line("VAR")
+
+    if all_variables:
+        builder.add_line("    (* Merged variables from all regions *)")
+
+        with builder.indent():
+            for var_name, (size, dtype) in sorted(all_variables.items()):
+                builder.add_line(f"{var_name} : ARRAY[0..{size - 1}] OF {dtype};")
+
+        builder.add_line("")
+
+    # Temporary computation variables
+    with builder.indent():
+        builder.add_line("(* Temporary computation variables *)")
+        builder.add_line("i : DINT;")
+        builder.add_line("j : DINT;")
+        builder.add_line("sum : REAL;")
+
+    # Extra computation helpers that might be needed
+    with builder.indent():
+        builder.add_line("(* Computation helpers *)")
+        builder.add_line("max_val : REAL;")
+        builder.add_line("exp_val : REAL;")
+        builder.add_line("exp_sum : REAL;")
+        builder.add_line("c_tanh : REAL;")
+
+    # Spatial loop variables (for potential Conv/Pool layers)
+    with builder.indent():
+        builder.add_line("(* Spatial loop variables *)")
+        builder.add_line("oc : DINT;")
+        builder.add_line("oh : DINT;")
+        builder.add_line("ow : DINT;")
+        builder.add_line("ic : DINT;")
+        builder.add_line("kh : DINT;")
+        builder.add_line("kw : DINT;")
+        builder.add_line("ih : DINT;")
+        builder.add_line("iw : DINT;")
+
+    builder.add_line("END_VAR")
+    builder.add_line("")
+
+    return builder.build()
+
+
 def generate_model_function_block(
     model: ModelIR,
     optimization_results: Dict[str, OptimizationResult],
@@ -1282,14 +2011,37 @@ def generate_model_function_block(
     code = STCode.empty()
     code += generate_header(fb_name)
 
-    # TODO: Generate comprehensive global IO for ModelIR inputs/outputs
-    # For now, we add a comment placeholder
-    code += STCode.from_lines("    (* Model Inputs/Outputs and State Variables *)")
+    # Generate input/output variables from first and last regions
+    # (assuming linear pipeline of regions)
+    if model.regions:
+        first_region_id = model.regions[0].region_id
+        last_region_id = model.regions[-1].region_id
 
-    code += STCode.from_lines("VAR")
-    # TODO: Merge variable declarations from all regions
-    code += STCode.from_lines("    (* Internal variables for all regions *)")
-    code += STCode.from_lines("END_VAR")
+        first_ir = optimization_results[first_region_id].ir
+        last_ir = optimization_results[last_region_id].ir
+
+        # Try to generate proper I/O declarations
+        if first_ir.input_tensors and last_ir.output_tensors:
+            code += STCode.from_lines("    (* Model Inputs/Outputs *)")
+            code += generate_input_output_vars(first_ir)  # Reuse existing function
+        else:
+            code += STCode.from_lines("    (* Model Inputs/Outputs *)")
+            code += STCode.from_lines("VAR_INPUT")
+            code += STCode.from_lines("    input_data : ARRAY[0..1023] OF REAL;")
+            code += STCode.from_lines("END_VAR")
+            code += STCode.from_lines("")
+            code += STCode.from_lines("VAR_OUTPUT")
+            code += STCode.from_lines("    output_data : ARRAY[0..255] OF REAL;")
+            code += STCode.from_lines("END_VAR")
+            code += STCode.from_lines("")
+
+    # Generate merged constants section from all regions
+    merged_constants = generate_merged_constants_section(optimization_results)
+    code += merged_constants
+
+    # Collect and merge all variables from all regions
+    all_variables = collect_all_variables_from_regions(optimization_results)
+    code += generate_merged_var_section(all_variables)
 
     code += STCode.from_lines("(* Forward pass execution *)")
 
@@ -1300,22 +2052,15 @@ def generate_model_function_block(
         )
 
         if region.region_id not in optimization_results:
-            code += STCode.from_lines(
-                f"    (* Error: No optimization result for {region.region_id} *)"
+            raise KeyError(
+                f"No optimization result for region {region.region_id} ({region.kind.name})"
             )
-            continue
 
         optimization_result = optimization_results[region.region_id]
 
-        # Use region-kind-specific lowerer
-        try:
-            region_code = lower_region_to_st(region, optimization_result)
-            code += region_code
-        except Exception as e:
-            logger.error(
-                f"Failed to lower region {region.region_id} ({region.kind.name}): {e}"
-            )
-            code += STCode.from_lines(f"    (* Error lowering region: {e} *)")
+        # Use region-kind-specific lowerer (fail-fast: exceptions propagate)
+        region_code = lower_region_to_st(region, optimization_result)
+        code += region_code
 
     code += generate_footer()
     return code

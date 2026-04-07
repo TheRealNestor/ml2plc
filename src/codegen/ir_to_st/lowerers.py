@@ -143,6 +143,39 @@ class RegionLowerer(ABC):
         else:
             return "Unknown"
 
+    def lower(self) -> STCode:
+        """
+        Template method: orchestrates lowering by combining hooks.
+
+        Note: Acyclic regions override this to avoid unnecessary FOR loop.
+        """
+        code = STCode.empty()
+
+        # Region header
+        code += STCode.from_lines(
+            f"(* {self.region_type()} Region {self.region.region_id} *)"
+        )
+        code += STCode.blank_line()
+
+        # Pre-loop section
+        pre_code = self.pre_loop_code()
+        if pre_code.lines:
+            code += pre_code
+            code += STCode.blank_line()
+
+        # Loop structure
+        init_val, end_val = self.loop_bounds()
+        code += STCode.from_lines(f"FOR step := {init_val} TO {end_val} DO")
+
+        body_code = self.loop_body_code()
+        for line in body_code.lines:
+            code += STCode.from_lines("\t" + line)
+
+        code += STCode.from_lines("END_FOR;")
+        code += STCode.blank_line()
+
+        return code
+
 
 class AcyclicLowerer(RegionLowerer):
     """Lowerer for acyclic (DAG) regions."""
@@ -160,6 +193,29 @@ class AcyclicLowerer(RegionLowerer):
         from .generator import generate_forward_pass
 
         return generate_forward_pass(self.ir, self.buffer_allocations)
+
+    def lower(self) -> STCode:
+        """
+        Lower an acyclic region WITHOUT a FOR loop.
+
+        Acyclic regions are pure data-flow, so we can omit the FOR loop
+        and just generate the forward pass directly. This is simpler and
+        more readable than wrapping in FOR 0 TO 0.
+        """
+        code = STCode.empty()
+
+        # Region header
+        code += STCode.from_lines(
+            f"(* {self.region_type()} Region {self.region.region_id} *)"
+        )
+        code += STCode.blank_line()
+
+        # Generate forward pass directly (no loop)
+        body_code = self.loop_body_code()
+        code += body_code
+        code += STCode.blank_line()
+
+        return code
 
 
 class RecurrentLowerer(RegionLowerer):
