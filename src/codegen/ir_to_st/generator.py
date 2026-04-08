@@ -1601,6 +1601,23 @@ def generate_concat_code(
     return builder.build()
 
 
+def generate_shape_code(layer: ShapeLayer, input_var: str, output_var: str) -> STCode:
+    """
+    Generate Shape layer — extracts shape dimensions as int64.
+
+    This should normally be constant-folded during compilation.
+    If present, emit a comment indicating this layer exists.
+    """
+    builder = STCodeBuilder()
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: Shape extraction - SHOULD BE CONSTANT-FOLDED *)"
+    )
+    builder.add_line(
+        f"(* Output shape: {layer.output_shape}, input shape: {layer.input_shape} *)"
+    )
+    return builder.build()
+
+
 def generate_unsqueeze_code(
     layer: "UnsqueezeLayer", input_var: str, output_var: str
 ) -> STCode:
@@ -2034,6 +2051,11 @@ def collect_all_variables_from_regions(
                 producer_name = network.tensor_producers[tensor_name]
                 if producer_name in network.layers:
                     layer = network.layers[producer_name]
+                    if layer.output_type is None:
+                        raise ValueError(
+                            f"Layer '{layer.name}' (id={layer.layer_id}, op_type={layer.op_type}) "
+                            f"has output_type=None. This indicates incomplete type resolution during IR conversion."
+                        )
                     plc_type = plc_type_from_onnx_dtype(layer.output_type)
                     size = layer.output_size
 
@@ -2059,6 +2081,11 @@ def collect_all_variables_from_regions(
             if any(out in buffer_allocations for out in layer.outputs):
                 continue
 
+            if layer.output_type is None:
+                raise ValueError(
+                    f"Layer '{layer.name}' (id={layer.layer_id}, op_type={layer.op_type}) "
+                    f"has output_type=None. This indicates incomplete type resolution during IR conversion."
+                )
             plc_type = plc_type_from_onnx_dtype(layer.output_type)
             var_name = f"layer_{layer.layer_id}_output"
 

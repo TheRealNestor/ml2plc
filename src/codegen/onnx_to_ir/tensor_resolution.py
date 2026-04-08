@@ -147,9 +147,21 @@ class TensorResolver:
                         f"Tensor {tensor_name} has no shape info, will be inferred"
                     )
 
-        dtype = tensor_info.get("onnx_type") or (
-            None if is_weight else computation_dtype
-        )
+        # Dtype resolution:
+        # - For weights: can be None (weights don't need type info)
+        # - For non-weights (activations/outputs): MUST have a dtype
+        dtype = tensor_info.get("onnx_type")
+
+        if is_weight:
+            # Weights can have None dtype
+            pass
+        else:
+            # Non-weights MUST have a dtype
+            if dtype is None:
+                dtype = computation_dtype
+                logger.debug(
+                    f"Tensor '{tensor_name}': dtype was None, using computation_dtype={computation_dtype}"
+                )
 
         size = int(np.prod(static_shape)) if static_shape else 0
 
@@ -165,6 +177,9 @@ class TensorResolver:
     def resolve_layer_tensors(self, layer_dict: Dict) -> Dict:
         """
         Resolve all tensors for a layer.
+
+        Note: Empty output names (representing optional ONNX outputs like LSTM's
+        Y_h, Y_c) are still resolved to ResolvedTensors but may have limited info.
 
         Returns:
             Layer dict enriched with 'resolved_inputs' and 'resolved_outputs'

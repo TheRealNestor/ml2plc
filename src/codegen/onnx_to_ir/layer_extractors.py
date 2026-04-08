@@ -1140,6 +1140,17 @@ def _extract_expand_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Expa
     # Only the data tensor is a runtime input
     runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
 
+    # Ensure we have a valid output dtype
+    output_dtype = data_input.dtype if data_input else None
+    if output_dtype is None and resolved_out:
+        output_dtype = resolved_out[0].dtype
+    if output_dtype is None:
+        logger.warning(
+            f"Expand layer '{enriched_layer.get('name')}': output dtype is None, "
+            f"using input dtype or TensorProto.FLOAT as fallback"
+        )
+        output_dtype = "TensorProto.FLOAT"
+
     return ExpandLayer(
         layer_id=layer_id,
         name=enriched_layer.get("name") or f"expand_{layer_id}",
@@ -1157,7 +1168,7 @@ def _extract_expand_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Expa
             else None
         ),
         input_type=data_input.dtype if data_input else None,
-        output_type=data_input.dtype if data_input else None,
+        output_type=output_dtype,
         target_shape=target_shape,
     )
 
@@ -1208,7 +1219,7 @@ def _extract_gather_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Gath
     )
 
 
-def _extract_shape_layer(enriched_layer: Dict, layer_id: int, analyzer) -> BaseLayer:
+def _extract_shape_layer(enriched_layer: Dict, layer_id: int, analyzer) -> "ShapeLayer":
     """
     Extract Shape layer.
 
@@ -1224,7 +1235,7 @@ def _extract_shape_layer(enriched_layer: Dict, layer_id: int, analyzer) -> BaseL
     # The output is a 1-D tensor of the shape values
     output_size = len(input_shape)
 
-    return BaseLayer(
+    return ShapeLayer(
         layer_id=layer_id,
         name=enriched_layer.get("name") or f"shape_{layer_id}",
         op_type="Shape",

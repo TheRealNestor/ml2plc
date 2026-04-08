@@ -82,7 +82,17 @@ class ONNXModel:
         }
 
     def _build_tensor_info(self):
-        """Build tensor_info using ONNX shape inference."""
+        """Build tensor_info using ONNX shape inference.
+
+        Extracts dtype and shape for all tensors in the graph:
+        1. Graph inputs (excluding initializers)
+        2. Graph outputs
+        3. Intermediate tensors (from value_info)
+        4. All node outputs (comprehensive fallback to ensure complete coverage)
+
+        This ensures all intermediate tensors have type information, even if
+        shape_inference doesn't populate value_info for them.
+        """
         if self.model is None:
             raise RuntimeError("Model not loaded.")
 
@@ -95,18 +105,60 @@ class ONNXModel:
         tensor_info = {}
         initializer_names = {init.name for init in inferred.graph.initializer}
 
-        # Inputs (excluding initializers)
+        # Step 1: Inputs (excluding initializers)
         for v in inferred.graph.input:
             if v.name not in initializer_names:
                 tensor_info[v.name] = self.parse_value_info(v)
 
-        # Outputs
+        # Step 2: Outputs
         for v in inferred.graph.output:
             tensor_info[v.name] = self.parse_value_info(v)
 
-        # Intermediate tensors
+        # Step 3: Intermediate tensors from value_info
         for v in inferred.graph.value_info:
             tensor_info[v.name] = self.parse_value_info(v)
+
+        # Step 4: Comprehensive node output extraction
+        # This ensures all intermediate tensors are recorded, even if not in value_info.
+        # For each unmapped output, infer dtype from:
+        #   a) The node's input types (priority)
+        #   b) The ONNX network input dtype (fallback)
+        network_input_dtype = None
+        for inp in inferred.graph.input:
+            if inp.name not in initializer_names:
+                parsed = self.parse_value_info(inp)
+                if dtype := parsed.get("onnx_type"):
+                    network_input_dtype = dtype
+                    break  # Use first non-initializer input dtype
+
+        for node in inferred.graph.node:
+            for output_name in node.output:
+                # Skip if already processed
+                if output_name in tensor_info:
+                    continue
+
+                # Try to infer dtype from node inputs
+                inferred_dtype = None
+                for input_name in node.input:
+                    if input_name and input_name in tensor_info:
+                        dtype_candidate = tensor_info[input_name].get("onnx_type")
+                        if dtype_candidate:
+                            inferred_dtype = dtype_candidate
+                            break
+
+                # Fall back to network input dtype
+                if inferred_dtype is None and network_input_dtype:
+                    inferred_dtype = network_input_dtype
+
+                if inferred_dtype:
+                    tensor_info[output_name] = {
+                        "onnx_type": inferred_dtype,
+                        "shape": (),  # Shape will be inferred later if needed
+                    }
+                    logger.debug(
+                        f"Inferred tensor type for {output_name}: {inferred_dtype} "
+                        f"(from node '{node.op_type}')"
+                    )
 
         self.tensor_info = tensor_info
         logger.info(f"Extracted tensor info for {len(self.tensor_info)} tensors.")

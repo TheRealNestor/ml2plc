@@ -95,6 +95,13 @@ class UnsqueezeLayer(BaseLayer):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ShapeLayer(BaseLayer):
+    """Shape layer — extracts shape information from a tensor (int64 output)."""
+
+    pass  # No special attributes needed
+
+
+@dataclass(frozen=True, kw_only=True)
 class ExpandLayer(BaseLayer):
     """Expand layer — broadcasts tensor to a larger shape at runtime."""
 

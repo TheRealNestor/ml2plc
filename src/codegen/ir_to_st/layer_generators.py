@@ -246,6 +246,12 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
         ),
     )
     registry.register(
+        ShapeLayer,
+        lambda layer, inputs, output: generator.generate_shape_code(
+            layer, inputs[0], output
+        ),
+    )
+    registry.register(
         ExpandLayer,
         lambda layer, inputs, output: generator.generate_expand_code(
             layer, inputs[0], output
