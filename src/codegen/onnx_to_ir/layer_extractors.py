@@ -5,7 +5,7 @@ Convert enriched layer dicts to IR layer objects.
 
 import numpy as np
 import logging
-from typing import Dict
+from typing import Dict, List
 from ..types import *
 from .shape_inference import (
     infer_layer_shapes,
@@ -14,6 +14,8 @@ from .shape_inference import (
 )
 from .weight_utils import extract_quantized_weight, validate_weight_quantization
 from ..onnx_model import ONNXModel
+import onnx
+from onnx import TensorProto
 
 logger = logging.getLogger(__name__)
 
@@ -629,6 +631,23 @@ def extract_squeeze_layer(
     input_size = int(np.prod(input_shape)) if input_shape else 0
     output_size = int(np.prod(output_shape)) if output_shape else 0
 
+    # Squeeze is a reshape — total element count must be preserved.
+    # If they differ, it's a shape inference issue; use the consistent value.
+    # TODO: If this is always an inference issue, it may be better to simply throw an exception! Fail fast!
+    if input_size != output_size:
+        raise ValueError(
+            f"Squeeze '{layer['name']}': input_size ({input_size}) != output_size ({output_size}), "
+            f"input_shape={input_shape}, output_shape={output_shape}. "
+            f"Squeeze cannot change element count — this indicates a shape inference bug."
+        )
+
+    if input_size == 0:
+        raise ValueError(
+            f"Squeeze '{layer['name']}': computed input_size is 0, "
+            f"input_shape={input_shape}, output_shape={output_shape}. "
+            f"This indicates a shape inference failure."
+        )
+
     # Adjust axes for batch-dim-stripped shapes
     if axes and any(a > 0 for a in axes):
         axes = tuple(a - 1 for a in axes if a != 0)
@@ -658,11 +677,12 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
     - Outputs: [Y, Y_h, Y_c]
     - Where: W (input weights), R (recurrent weights), B (bias), P (peephole)
 
-    For inference, we extract:
-    - W: Input weight matrix (1, 4*hidden_size, input_size) for forward mode
-    - R: Recurrent weight matrix (1, 4*hidden_size, hidden_size)
-    - B: Combined bias (optional, default zeros)
-    - P: Peephole weights (optional)
+    ONNX weight shapes (for forward-only direction):
+    - W: (num_directions, 4*hidden_size, input_size)
+    - R: (num_directions, 4*hidden_size, hidden_size)
+    - B: (num_directions, 8*hidden_size)
+
+    We strip the num_directions dimension and combine Wb + Rb biases.
     """
     inputs = layer["resolved_inputs"]
     attrs = layer.get("attributes", {})
@@ -728,6 +748,92 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
     if len(inputs) > 7 and inputs[7].is_weight and inputs[7].value is not None:
         P = inputs[7].value
 
+    # ── Strip num_directions dimension ──────────────────────────────────────
+    # ONNX W: (num_directions, 4*hidden_size, input_size) → (4*hidden_size, input_size)
+    if W.ndim == 3:
+        logger.debug(
+            f"LSTM '{layer['name']}': stripping num_directions from W "
+            f"{W.shape} -> {W[0].shape}"
+        )
+        W = W[0]
+
+    # ONNX R: (num_directions, 4*hidden_size, hidden_size) → (4*hidden_size, hidden_size)
+    if R.ndim == 3:
+        logger.debug(
+            f"LSTM '{layer['name']}': stripping num_directions from R "
+            f"{R.shape} -> {R[0].shape}"
+        )
+        R = R[0]
+
+    # ONNX B: (num_directions, 8*hidden_size) → (8*hidden_size,)
+    if B is not None and B.ndim == 2:
+        logger.debug(
+            f"LSTM '{layer['name']}': stripping num_directions from B "
+            f"{B.shape} -> {B[0].shape}"
+        )
+        B = B[0]
+
+    # ── Combine Wb and Rb biases ────────────────────────────────────────────
+    # ONNX B layout: [Wb_i, Wb_o, Wb_f, Wb_g, Rb_i, Rb_o, Rb_f, Rb_g]
+    # Each sub-vector has length hidden_size.
+    # For ST code generation we want a single bias per gate: b_gate = Wb_gate + Rb_gate
+    # Result: (4*hidden_size,) with layout [b_i, b_o, b_f, b_g]
+    if B is not None:
+        if B.shape[0] == 8 * hidden_size:
+            Wb = B[: 4 * hidden_size]
+            Rb = B[4 * hidden_size :]
+            B = Wb + Rb  # Element-wise addition
+            logger.debug(
+                f"LSTM '{layer['name']}': combined Wb+Rb biases -> shape {B.shape}"
+            )
+        elif B.shape[0] == 4 * hidden_size:
+            logger.debug(
+                f"LSTM '{layer['name']}': B already has 4*hidden_size elements"
+            )
+        else:
+            logger.warning(
+                f"LSTM '{layer['name']}': unexpected B shape {B.shape}, "
+                f"expected ({8 * hidden_size},) or ({4 * hidden_size},)"
+            )
+
+    # ── Validate shapes ─────────────────────────────────────────────────────
+    # Derive actual input_size from W (more reliable than shape inference for features)
+    actual_input_size = W.shape[1]
+
+    if W.shape != (4 * hidden_size, actual_input_size):
+        raise ValueError(
+            f"LSTM '{layer['name']}': W shape mismatch — "
+            f"expected ({4 * hidden_size}, {actual_input_size}), got {W.shape}"
+        )
+    if R.shape != (4 * hidden_size, hidden_size):
+        raise ValueError(
+            f"LSTM '{layer['name']}': R shape mismatch — "
+            f"expected ({4 * hidden_size}, {hidden_size}), got {R.shape}"
+        )
+
+    # ── Extract sequence_length from input shape ────────────────────────────
+    # After batch-dim stripping, input_shape is typically (seq_length, input_size)
+    # or just (seq_length,) if input_size == 1.
+    if input_shape and len(input_shape) >= 2:
+        sequence_length = input_shape[0]
+    elif input_shape and len(input_shape) == 1:
+        # Flat input: seq_length = total_size / input_size
+        sequence_length = (
+            input_shape[0] // actual_input_size if actual_input_size > 0 else 1
+        )
+    else:
+        logger.warning(
+            f"LSTM '{layer['name']}': could not determine sequence_length "
+            f"from input_shape {input_shape}, defaulting to 1"
+        )
+        sequence_length = 1
+
+    logger.info(
+        f"LSTM '{layer['name']}': seq_len={sequence_length}, "
+        f"input_size={actual_input_size}, hidden_size={hidden_size}, "
+        f"W={W.shape}, R={R.shape}, B={'None' if B is None else B.shape}"
+    )
+
     # Extract activations
     activations = tuple(attrs.get("activations", ["Sigmoid", "Tanh", "Tanh"]))
     direction = attrs.get("direction", "forward")
@@ -737,7 +843,7 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
         layer_id=layer_id,
         name=layer["name"],
         op_type=layer["op_type"],
-        input_size=input_size,
+        input_size=actual_input_size,
         output_size=output_size,
         inputs=tuple(t.name for t in inputs),
         outputs=tuple(t.name for t in layer["resolved_outputs"]),
@@ -746,6 +852,7 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
         input_type=inputs[0].dtype,
         output_type=layer["resolved_outputs"][0].dtype,
         hidden_size=hidden_size,
+        sequence_length=sequence_length,
         W=W,
         R=R,
         B=B,
@@ -841,28 +948,338 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
     )
 
 
-# Registry of layer extractors
+# ============================================================================
+# Data-movement / shape-manipulation extractors
+# ============================================================================
+
+
+def _extract_cast_layer(enriched_layer: Dict, layer_id: int, analyzer) -> CastLayer:
+    """Extract Cast layer — element-wise type conversion."""
+    attrs = enriched_layer.get("attributes", {})
+    to_type = attrs.get("to", TensorProto.FLOAT)
+    np_dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE.get(to_type, np.float32)
+    target_type_str = str(np_dtype)
+
+    resolved_in = enriched_layer["resolved_inputs"]
+    resolved_out = enriched_layer["resolved_outputs"]
+
+    input_size = resolved_in[0].size if resolved_in else 1
+    output_size = resolved_out[0].size if resolved_out else input_size
+
+    input_dtype = resolved_in[0].dtype if resolved_in else None
+    output_dtype = target_type_str
+
+    return CastLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"cast_{layer_id}",
+        op_type="Cast",
+        input_size=input_size,
+        output_size=output_size,
+        inputs=tuple(enriched_layer["inputs"]),
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=(
+            tuple(resolved_in[0].shape)
+            if resolved_in and resolved_in[0].shape
+            else None
+        ),
+        output_shape=(
+            tuple(resolved_out[0].shape)
+            if resolved_out and resolved_out[0].shape
+            else None
+        ),
+        input_type=input_dtype,
+        output_type=output_dtype,
+        target_type=target_type_str,
+    )
+
+
+def _extract_slice_layer(enriched_layer: Dict, layer_id: int, analyzer) -> SliceLayer:
+    """Extract Slice layer — sub-tensor extraction along axes."""
+    resolved_in = enriched_layer["resolved_inputs"]
+    resolved_out = enriched_layer["resolved_outputs"]
+
+    # Slice has up to 5 inputs: data, starts, ends, axes, steps
+    # starts/ends/axes/steps are typically constants already resolved
+    def _get_const_list(idx: int, default):
+        if idx < len(resolved_in) and resolved_in[idx].value is not None:
+            return resolved_in[idx].value.flatten().tolist()
+        return default
+
+    starts = _get_const_list(1, [0])
+    ends = _get_const_list(2, [2**31])
+    axes = _get_const_list(3, list(range(len(starts))))
+    steps = _get_const_list(4, [1] * len(starts))
+
+    data_input = resolved_in[0] if resolved_in else None
+    input_size = data_input.size if data_input else 1
+    output_size = resolved_out[0].size if resolved_out else input_size
+
+    # Only the data tensor is a runtime input; the rest are parameters
+    runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
+
+    return SliceLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"slice_{layer_id}",
+        op_type="Slice",
+        input_size=input_size,
+        output_size=output_size,
+        inputs=runtime_inputs,
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=(
+            tuple(data_input.shape) if data_input and data_input.shape else None
+        ),
+        output_shape=(
+            tuple(resolved_out[0].shape)
+            if resolved_out and resolved_out[0].shape
+            else None
+        ),
+        input_type=data_input.dtype if data_input else None,
+        output_type=resolved_out[0].dtype if resolved_out else None,
+        starts=[int(s) for s in starts],
+        ends=[int(e) for e in ends],
+        axes=[int(a) for a in axes],
+        steps=[int(s) for s in steps],
+    )
+
+
+def _extract_concat_layer(enriched_layer: Dict, layer_id: int, analyzer) -> ConcatLayer:
+    """Extract Concat layer — concatenation along an axis."""
+    attrs = enriched_layer.get("attributes", {})
+    axis = attrs.get("axis", 0)
+
+    resolved_in = enriched_layer["resolved_inputs"]
+    resolved_out = enriched_layer["resolved_outputs"]
+
+    input_sizes = [ri.size for ri in resolved_in]
+    total_size = sum(input_sizes)
+    output_size = resolved_out[0].size if resolved_out else total_size
+
+    return ConcatLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"concat_{layer_id}",
+        op_type="Concat",
+        input_size=input_sizes[0] if input_sizes else 0,
+        output_size=output_size,
+        inputs=tuple(enriched_layer["inputs"]),
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=(
+            tuple(resolved_in[0].shape)
+            if resolved_in and resolved_in[0].shape
+            else None
+        ),
+        output_shape=(
+            tuple(resolved_out[0].shape)
+            if resolved_out and resolved_out[0].shape
+            else None
+        ),
+        input_type=resolved_in[0].dtype if resolved_in else None,
+        output_type=resolved_out[0].dtype if resolved_out else None,
+        axis=axis,
+        input_sizes=input_sizes,
+    )
+
+
+def _extract_unsqueeze_layer(
+    enriched_layer: Dict, layer_id: int, analyzer
+) -> UnsqueezeLayer:
+    """Extract Unsqueeze layer — insert size-1 dimensions (identity on flat data)."""
+    resolved_in = enriched_layer["resolved_inputs"]
+    resolved_out = enriched_layer["resolved_outputs"]
+
+    # Axes from second input (opset 13+) or from attribute (opset < 13)
+    if len(resolved_in) > 1 and resolved_in[1].value is not None:
+        axes = resolved_in[1].value.flatten().tolist()
+    else:
+        attrs = enriched_layer.get("attributes", {})
+        axes = attrs.get("axes", [])
+
+    data_input = resolved_in[0] if resolved_in else None
+    input_size = data_input.size if data_input else 1
+
+    # Only the data tensor is a runtime input
+    runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
+
+    return UnsqueezeLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"unsqueeze_{layer_id}",
+        op_type="Unsqueeze",
+        input_size=input_size,
+        output_size=input_size,  # same element count
+        inputs=runtime_inputs,
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=(
+            tuple(data_input.shape) if data_input and data_input.shape else None
+        ),
+        output_shape=(
+            tuple(resolved_out[0].shape)
+            if resolved_out and resolved_out[0].shape
+            else None
+        ),
+        input_type=data_input.dtype if data_input else None,
+        output_type=data_input.dtype if data_input else None,
+        unsqueeze_axes=[int(a) for a in axes],
+    )
+
+
+def _extract_expand_layer(enriched_layer: Dict, layer_id: int, analyzer) -> ExpandLayer:
+    """Extract Expand layer — broadcast tensor to a larger shape."""
+    resolved_in = enriched_layer["resolved_inputs"]
+    resolved_out = enriched_layer["resolved_outputs"]
+
+    # Target shape from second input (always a constant)
+    if len(resolved_in) > 1 and resolved_in[1].value is not None:
+        target_shape = tuple(int(s) for s in resolved_in[1].value.flatten().tolist())
+        output_size = int(np.prod(target_shape)) if target_shape else 1
+    else:
+        target_shape = ()
+        output_size = resolved_out[0].size if resolved_out else 1
+
+    data_input = resolved_in[0] if resolved_in else None
+    input_size = data_input.size if data_input else 1
+
+    # Only the data tensor is a runtime input
+    runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
+
+    return ExpandLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"expand_{layer_id}",
+        op_type="Expand",
+        input_size=input_size,
+        output_size=output_size,
+        inputs=runtime_inputs,
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=(
+            tuple(data_input.shape) if data_input and data_input.shape else None
+        ),
+        output_shape=(
+            tuple(resolved_out[0].shape)
+            if resolved_out and resolved_out[0].shape
+            else None
+        ),
+        input_type=data_input.dtype if data_input else None,
+        output_type=data_input.dtype if data_input else None,
+        target_shape=target_shape,
+    )
+
+
+def _extract_gather_layer(enriched_layer: Dict, layer_id: int, analyzer) -> GatherLayer:
+    """Extract Gather layer — index into a tensor along an axis."""
+    attrs = enriched_layer.get("attributes", {})
+    axis = attrs.get("axis", 0)
+
+    resolved_in = enriched_layer["resolved_inputs"]
+    resolved_out = enriched_layer["resolved_outputs"]
+
+    # Indices from second input (often a constant)
+    indices = None
+    if len(resolved_in) > 1 and resolved_in[1].value is not None:
+        indices = resolved_in[1].value
+
+    data_input = resolved_in[0] if resolved_in else None
+    input_size = data_input.size if data_input else 1
+    output_size = resolved_out[0].size if resolved_out else 1
+
+    # Only the data tensor is a runtime input if indices are constant
+    if indices is not None:
+        runtime_inputs = (enriched_layer["inputs"][0],)
+    else:
+        runtime_inputs = tuple(enriched_layer["inputs"][:2])
+
+    return GatherLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"gather_{layer_id}",
+        op_type="Gather",
+        input_size=input_size,
+        output_size=output_size,
+        inputs=runtime_inputs,
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=(
+            tuple(data_input.shape) if data_input and data_input.shape else None
+        ),
+        output_shape=(
+            tuple(resolved_out[0].shape)
+            if resolved_out and resolved_out[0].shape
+            else None
+        ),
+        input_type=data_input.dtype if data_input else None,
+        output_type=data_input.dtype if data_input else None,
+        gather_axis=axis,
+        indices=indices,
+    )
+
+
+def _extract_shape_layer(enriched_layer: Dict, layer_id: int, analyzer) -> BaseLayer:
+    """
+    Extract Shape layer.
+
+    Shape should almost always be constant-folded. If we reach here, the input
+    has a known static shape from shape inference, so we emit a no-op layer.
+    """
+    resolved_in = enriched_layer["resolved_inputs"]
+    resolved_out = enriched_layer["resolved_outputs"]
+
+    input_shape = (
+        tuple(resolved_in[0].shape) if resolved_in and resolved_in[0].shape else ()
+    )
+    # The output is a 1-D tensor of the shape values
+    output_size = len(input_shape)
+
+    return BaseLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"shape_{layer_id}",
+        op_type="Shape",
+        input_size=resolved_in[0].size if resolved_in else 0,
+        output_size=output_size,
+        inputs=tuple(enriched_layer["inputs"]),
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=input_shape,
+        output_shape=(output_size,),
+        input_type=resolved_in[0].dtype if resolved_in else None,
+        output_type="int64",
+    )
+
+
+# ============================================================================
+# Layer Extractor Registry
+# ============================================================================
+
 LAYER_EXTRACTORS = {
+    # Core compute layers
     "MatMul": extract_matmul_layer,
     "Add": extract_add_layer,
     "Gemm": extract_gemm_layer,
     "FusedGemm": extract_fused_gemm_layer,
+    # Activation layers
     "Relu": extract_activation_layer,
     "Sigmoid": extract_activation_layer,
     "Tanh": extract_activation_layer,
     "Softmax": extract_activation_layer,
+    # Shape/layout layers
     "Reshape": extract_reshape_layer,
+    "Flatten": extract_flatten_layer,
+    "Transpose": extract_transpose_layer,
+    "Squeeze": extract_squeeze_layer,
+    # Quantization layers
     "QuantizeLinear": extract_quantize_linear_layer,
     "DequantizeLinear": extract_dequantize_linear_layer,
+    # Regularization layers
     "Dropout": extract_dropout_layer,
+    # Convolution / Pooling layers
     "Conv": extract_conv2d_layer,
     "MaxPool": extract_maxpool_layer,
     "AveragePool": extract_avgpool_layer,
     "GlobalAveragePool": extract_global_avgpool_layer,
-    "Flatten": extract_flatten_layer,
-    "Transpose": extract_transpose_layer,
+    # Normalization layers
     "BatchNormalization": extract_batchnorm_layer,
-    "Squeeze": extract_squeeze_layer,
+    # RNN layers
     "LSTM": extract_lstm_layer,
     "GRU": extract_gru_layer,
+    # Shape-manipulation layers (runtime fallbacks for ops not constant-folded)
+    "Shape": _extract_shape_layer,
+    "Cast": _extract_cast_layer,
+    "Slice": _extract_slice_layer,
+    "Concat": _extract_concat_layer,
+    "Unsqueeze": _extract_unsqueeze_layer,
+    "Expand": _extract_expand_layer,
+    "Gather": _extract_gather_layer,
 }

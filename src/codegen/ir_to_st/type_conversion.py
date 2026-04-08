@@ -40,7 +40,13 @@ PLC_TYPES: Dict[str, PLCTypeInfo] = {
 }
 
 # Create reverse lookup dictionaries
-_ONNX_TO_PLC = {info.onnx_name.lower(): name for name, info in PLC_TYPES.items()}
+_ONNX_TO_PLC: Dict[str, str] = {}
+for name, info in PLC_TYPES.items():
+    full_key = info.onnx_name.lower()  # "tensorproto.int32"
+    bare_key = info.onnx_name.split(".")[-1].lower()  # "int32"
+    _ONNX_TO_PLC[full_key] = name
+    _ONNX_TO_PLC[bare_key] = name
+
 _NUMPY_TO_PLC = {
     info.numpy_dtype: name
     for name, info in PLC_TYPES.items()
@@ -80,8 +86,8 @@ def get_type_size_bytes(dtype_str: str) -> int:
         plc_name = _ONNX_TO_PLC[dtype_lower]
         return PLC_TYPES[plc_name].size_bytes
 
-    # Default fallback
-    return 4  # REAL
+    # If neither we can use a default size or throw an exception (probably safer option)
+    return 4
 
 
 def numpy_to_plc_cast_func(np_dtype: np.dtype, target_plc_type: str) -> str:

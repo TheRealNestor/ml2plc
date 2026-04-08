@@ -13,27 +13,7 @@ Architecture:
 from typing import Dict, Callable, Optional
 import logging
 
-from ..types import (
-    BaseLayer,
-    MatMulLayer,
-    GemmLayer,
-    FusedGemmLayer,
-    FusedLinearLayer,
-    AddLayer,
-    ReshapeLayer,
-    ActivationLayer,
-    QuantizeLinearLayer,
-    DequantizeLinearLayer,
-    DropoutLayer,
-    Conv2DLayer,
-    Pool2DLayer,
-    FlattenLayer,
-    TransposeLayer,
-    BatchNormLayer,
-    SqueezeLayer,
-    LSTMLayer,
-    GRULayer,
-)
+from ..types import *
 from .st_code import STCode
 
 logger = logging.getLogger(__name__)
@@ -240,5 +220,42 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
     )
     registry.register(LSTMLayer, generator.generate_lstm_code, wrap_single_input=True)
     registry.register(GRULayer, generator.generate_gru_code, wrap_single_input=True)
+
+    registry.register(
+        CastLayer,
+        lambda layer, inputs, output: generator.generate_cast_code(
+            layer, inputs[0], output
+        ),
+    )
+    registry.register(
+        SliceLayer,
+        lambda layer, inputs, output: generator.generate_slice_code(
+            layer, inputs[0], output
+        ),
+    )
+    registry.register(
+        ConcatLayer,
+        lambda layer, inputs, output: generator.generate_concat_code(
+            layer, inputs, output
+        ),
+    )
+    registry.register(
+        UnsqueezeLayer,
+        lambda layer, inputs, output: generator.generate_unsqueeze_code(
+            layer, inputs[0], output
+        ),
+    )
+    registry.register(
+        ExpandLayer,
+        lambda layer, inputs, output: generator.generate_expand_code(
+            layer, inputs[0], output
+        ),
+    )
+    registry.register(
+        GatherLayer,
+        lambda layer, inputs, output: generator.generate_gather_code(
+            layer, inputs[0], output
+        ),
+    )
 
     logger.info(f"Initialized default generators: {registry}")

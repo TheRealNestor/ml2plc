@@ -443,12 +443,46 @@ def infer_layer_shapes(
             axes = tuple(a - 1 for a in axes if a != 0)
         output_shape = infer_squeeze_output_shape(input_shape, axes)
 
+    if op_type == "Cast":
+        # Same shape as input
+        return _passthrough_shape(layer_dict)
+    if op_type == "Slice":
+        # Use resolved output shape if available
+        return _use_resolved_output_shape(layer_dict)
+    if op_type == "Concat":
+        return _use_resolved_output_shape(layer_dict)
+
+    if op_type in ("Unsqueeze", "Expand", "Gather", "Shape"):
+        return _use_resolved_output_shape(layer_dict)
+
     else:
         logger.warning(f"No shape inference for op_type '{op_type}', using input shape")
         output_shape = input_shape
 
     logger.debug(f"{op_type}: Inferred {input_shape} -> {output_shape}")
     return input_shape, output_shape
+
+
+def _passthrough_shape(enriched_layer: Dict):
+    """Output shape = input shape."""
+    resolved_in = enriched_layer.get("resolved_inputs", [])
+    if resolved_in and resolved_in[0].shape:
+        shape = tuple(resolved_in[0].shape)
+        return shape, shape
+    return None, None
+
+
+def _use_resolved_output_shape(enriched_layer: Dict):
+    """Use the shape from resolved_outputs (from ONNX shape inference)."""
+    resolved_in = enriched_layer.get("resolved_inputs", [])
+    resolved_out = enriched_layer.get("resolved_outputs", [])
+    in_shape = (
+        tuple(resolved_in[0].shape) if resolved_in and resolved_in[0].shape else None
+    )
+    out_shape = (
+        tuple(resolved_out[0].shape) if resolved_out and resolved_out[0].shape else None
+    )
+    return in_shape, out_shape
 
 
 def get_feature_sizes(

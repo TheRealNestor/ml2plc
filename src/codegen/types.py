@@ -63,6 +63,53 @@ class DropoutLayer(BaseLayer):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CastLayer(BaseLayer):
+    """Cast layer — converts tensor element types at runtime."""
+
+    target_type: str = "float32"
+
+
+@dataclass(frozen=True, kw_only=True)
+class SliceLayer(BaseLayer):
+    """Slice layer — extracts a sub-tensor along given axes at runtime."""
+
+    starts: List[int] = field(default_factory=list)
+    ends: List[int] = field(default_factory=list)
+    axes: List[int] = field(default_factory=list)
+    steps: List[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ConcatLayer(BaseLayer):
+    """Concat layer — concatenates multiple tensors along an axis at runtime."""
+
+    axis: int = 0
+    input_sizes: List[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnsqueezeLayer(BaseLayer):
+    """Unsqueeze layer — inserts size-1 dimensions (identity on flat data)."""
+
+    unsqueeze_axes: List[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ExpandLayer(BaseLayer):
+    """Expand layer — broadcasts tensor to a larger shape at runtime."""
+
+    target_shape: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, kw_only=True)
+class GatherLayer(BaseLayer):
+    """Gather layer — indexes into a tensor along an axis."""
+
+    gather_axis: int = 0
+    indices: Optional[np.ndarray] = None
+
+
+@dataclass(frozen=True, kw_only=True)
 class LinearLayer(BaseLayer):
     """Base class for layers with weights and biases"""
 
@@ -246,6 +293,7 @@ class LSTMLayer(BaseLayer):
     """
 
     hidden_size: int
+    sequence_length: int
     W: np.ndarray  # Input weight matrix
     R: np.ndarray  # Recurrent weight matrix
     B: Optional[np.ndarray] = None  # Bias (optional)

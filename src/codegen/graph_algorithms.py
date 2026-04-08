@@ -12,6 +12,7 @@ from typing import Dict, List, Set, Tuple
 from collections import deque, defaultdict
 
 from codegen.types import BaseLayer
+from onnx import GraphProto
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,58 @@ def topological_sort(
         raise ValueError(f"Cycle detected in layer graph: {missing}")
 
     return sorted_order
+
+
+def topo_sort_onnx_nodes(graph: GraphProto) -> List:
+    """
+    Return ONNX graph nodes in topological order.
+
+    The ONNX spec recommends topological ordering but does not guarantee it
+    for all exporters. This sort ensures the constant-folding pass can
+    propagate values through chains of shape-manipulation nodes
+    (e.g. Shape -> Cast -> Slice -> Concat) in a single linear pass.
+
+    Nodes that cannot be ordered (broken graph or unresolvable dynamic inputs)
+    are appended at the end with a warning rather than raising, so the caller
+    can decide how to handle them.
+
+    Args:
+        graph: ONNX GraphProto (main graph or subgraph)
+
+    Returns:
+        List of NodeProto in topological order
+    """
+    # Everything available before any node runs
+    available: Set[str] = set()
+    available.update(init.name for init in graph.initializer)
+    available.update(inp.name for inp in graph.input)
+
+    sorted_nodes: List = []
+    remaining = list(graph.node)
+
+    while remaining:
+        progress = False
+        next_remaining = []
+        for node in remaining:
+            # Ready when every non-empty input name is already produced
+            if all(not inp or inp in available for inp in node.input):
+                sorted_nodes.append(node)
+                available.update(out for out in node.output if out)
+                progress = True
+            else:
+                next_remaining.append(node)
+        remaining = next_remaining
+
+        if not progress:
+            logger.warning(
+                f"topo_sort_onnx_nodes: {len(remaining)} node(s) could not be ordered "
+                f"(possible dynamic inputs or malformed graph): "
+                f"{[n.name or n.op_type for n in remaining]}"
+            )
+            sorted_nodes.extend(remaining)
+            break
+
+    return sorted_nodes
 
 
 def build_layer_graph(
