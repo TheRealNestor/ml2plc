@@ -13,6 +13,28 @@ from ..types import *
 from .st_code import *
 from .type_conversion import *
 from ..ir_optimizer import OptimizationResult
+from .utils.constant_helpers import (
+    generate_array_constant,
+    generate_scalar_constant,
+    is_uniform_array,
+    generate_weights_constants,
+    generate_lstm_weights_constants,
+    generate_bias_constant,
+    generate_quantization_params,
+    generate_batchnorm_constants,
+)
+from .utils.activation_helpers import (
+    generate_activation_inline,
+    generate_activation_loop,
+)
+from .utils.copy_helpers import (
+    generate_simple_copy,
+    generate_offset_copy,
+    generate_strided_copy,
+    generate_scalar_broadcast,
+    generate_modulo_broadcast,
+    generate_selective_copy,
+)
 
 import logging
 
@@ -178,12 +200,12 @@ def build_final_linear_layer_expression(layer: LinearLayer, has_bias: bool) -> s
 
 def generate_header(fb_name: str) -> STCode:
     """Generate function block header."""
-    return STCode.from_lines(f"FUNCTION_BLOCK {fb_name}", "")
+    return st_function_block_header(fb_name)
 
 
 def generate_footer() -> STCode:
     """Generate function block footer."""
-    return STCode.from_lines("END_FUNCTION_BLOCK", "")
+    return st_function_block_footer()
 
 
 def generate_input_output_vars(network: NetworkIR) -> STCode:
@@ -234,300 +256,61 @@ def generate_input_output_vars(network: NetworkIR) -> STCode:
 # ============================================================================
 # Constants Section
 # ============================================================================
-
-
-def generate_array_constant(
-    name: str, values: np.ndarray, plc_type: str, is_integer: bool = False
-) -> STCode:
-    """
-    Generate a constant array declaration.
-
-    Args:
-        name: Variable name
-        values: NumPy array of values
-        plc_type: PLC type string
-        is_integer: If True, format as integers; otherwise as floats
-    """
-    flat_values = values.flatten()
-
-    if flat_values.size == 0:
-        logger.warning(
-            f"generate_array_constant: '{name}' has 0 elements — likely indicates a bug"
-        )
-        # Return a comment instead of an invalid ARRAY[0..-1] declaration
-        return STCode.from_lines(
-            f"(* WARNING: {name} has 0 elements — weight extraction error *)"
-        )
-
-    if is_integer:
-        value_str = ", ".join(str(int(val)) for val in flat_values)
-    else:
-        value_str = ", ".join(f"{val:.6f}" for val in flat_values)
-
-    return STCode.from_lines(
-        f"{name} : ARRAY[0..{values.size - 1}] OF {plc_type} := [{value_str}];"
-    )
-
-
-def generate_scalar_constant(
-    name: str, value: float | int, plc_type: str, is_integer: bool = False
-) -> STCode:
-    """Generate a scalar constant declaration."""
-    if is_integer:
-        value_str = str(int(value))
-    else:
-        value_str = str(float(value))
-
-    return STCode.from_lines(f"{name} : {plc_type} := {value_str};")
+# Note: generate_array_constant, generate_scalar_constant, is_uniform_array
+# are now imported from utils.constant_helpers
 
 
 def generate_layer_weights(layer) -> STCode:
     """
-    Generate weight constants for a layer (handles both float and quantized).
+    Generate weight constants for a layer.
+
+    Delegates to utility functions for LSTM and general layer handling.
+    Handles both float and quantized weights.
 
     Returns all weight-related constants:
     - weights array
     - weight_scale (if quantized)
     - weight_zero_point (if quantized)
-
-    Special handling for LSTM: generates separate weight arrays for each gate
     """
-    builder = STCodeBuilder()
-
-    # Special handling for LSTM layers
+    # Special handling for LSTM layers (delegated to utility)
     if isinstance(layer, LSTMLayer):
-        return generate_lstm_weights(layer)
+        return generate_lstm_weights_constants(layer)
 
+    # General layer handling (delegated to utility)
     is_quantized = isinstance(layer, LinearLayer) and layer.is_quantized()
-
-    if is_quantized:
-        weight_type = numpy_to_plc_type(layer.weights.dtype)
-        weights_code = generate_array_constant(
-            f"weights_{layer.layer_id}", layer.weights, weight_type, is_integer=True
-        )
-    else:
-        weight_type = plc_type_from_onnx_dtype(layer.input_type)
-        weights_code = generate_array_constant(
-            f"weights_{layer.layer_id}", layer.weights, weight_type, is_integer=False
-        )
-
-    builder.add_code(weights_code)
-
-    # Generate quantization parameters if present
-    if is_quantized:
-        # Scale - use scalar if uniform
-        if is_uniform_array(layer.weight_scale):
-            builder.add_code(
-                generate_scalar_constant(
-                    f"weight_scale_{layer.layer_id}",
-                    float(layer.weight_scale.flat[0]),
-                    "REAL",
-                )
-            )
-        else:
-            builder.add_code(
-                generate_array_constant(
-                    f"weight_scale_{layer.layer_id}", layer.weight_scale, "REAL"
-                )
-            )
-
-        # Zero point - use scalar if uniform
-        zp_type = numpy_to_plc_type(layer.weights.dtype)
-        if is_uniform_array(layer.weight_zero_point):
-            builder.add_code(
-                generate_scalar_constant(
-                    f"weight_zero_point_{layer.layer_id}",
-                    int(layer.weight_zero_point.flat[0]),
-                    zp_type,
-                    is_integer=True,
-                )
-            )
-        else:
-            builder.add_code(
-                generate_array_constant(
-                    f"weight_zero_point_{layer.layer_id}",
-                    layer.weight_zero_point,
-                    zp_type,
-                    is_integer=True,
-                )
-            )
-
-    return builder.build()
+    return generate_weights_constants(layer, is_integer=is_quantized)
 
 
 def generate_lstm_weights(layer: "LSTMLayer") -> STCode:
     """
-    Generate weight and bias constants for LSTM layer.
+    DEPRECATED: Use generate_lstm_weights_constants from utils.constant_helpers
 
-    ONNX gate order is: i (input), o (output), f (forget), g (cell/candidate)
-    We reorder to: i, f, g, o for the ST code generation to match standard
-    LSTM notation.
-
-    LSTM weights are organized as:
-    - W: (4*hidden_size, input_size) — ONNX order [i, o, f, g]
-    - R: (4*hidden_size, hidden_size) — ONNX order [i, o, f, g]
-    - B: (4*hidden_size,) after combining Wb+Rb — ONNX order [i, o, f, g]
+    This wrapper is kept for backward compatibility during refactoring.
     """
-    builder = STCodeBuilder()
-
-    h_size = layer.hidden_size
-    x_size = layer.input_size
-    W = layer.W  # (4*hidden_size, input_size)
-    R = layer.R  # (4*hidden_size, hidden_size)
-    B = layer.B if layer.B is not None else np.zeros(4 * h_size)
-
-    weight_type = "REAL"
-
-    # ONNX gate order: i, o, f, g (cell candidate)
-    # Split W into 4 gates using ONNX ordering
-    W_i = W[0 * h_size : 1 * h_size, :]
-    W_o = W[1 * h_size : 2 * h_size, :]
-    W_f = W[2 * h_size : 3 * h_size, :]
-    W_g = W[3 * h_size : 4 * h_size, :]
-
-    # Split R into 4 gates using ONNX ordering
-    R_i = R[0 * h_size : 1 * h_size, :]
-    R_o = R[1 * h_size : 2 * h_size, :]
-    R_f = R[2 * h_size : 3 * h_size, :]
-    R_g = R[3 * h_size : 4 * h_size, :]
-
-    # Split B into 4 gates using ONNX ordering
-    B_i = B[0 * h_size : 1 * h_size]
-    B_o = B[1 * h_size : 2 * h_size]
-    B_f = B[2 * h_size : 3 * h_size]
-    B_g = B[3 * h_size : 4 * h_size]
-
-    # Log shapes for debugging
-    logger.debug(
-        f"LSTM layer {layer.layer_id} weight shapes: "
-        f"W_i={W_i.shape}, W_o={W_o.shape}, W_f={W_f.shape}, W_g={W_g.shape}, "
-        f"R_i={R_i.shape}, R_o={R_o.shape}, R_f={R_f.shape}, R_g={R_g.shape}"
-    )
-
-    # Generate input weight arrays (W) — reordered to i, f, g, o
-    builder.add_code(
-        generate_array_constant(
-            f"weights_{layer.layer_id}_i", W_i.flatten(), weight_type, is_integer=False
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"weights_{layer.layer_id}_f", W_f.flatten(), weight_type, is_integer=False
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"weights_{layer.layer_id}_g", W_g.flatten(), weight_type, is_integer=False
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"weights_{layer.layer_id}_o", W_o.flatten(), weight_type, is_integer=False
-        )
-    )
-
-    # Generate recurrent weight arrays (R) — reordered to i, f, g, o
-    builder.add_code(
-        generate_array_constant(
-            f"recurrent_{layer.layer_id}_i",
-            R_i.flatten(),
-            weight_type,
-            is_integer=False,
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"recurrent_{layer.layer_id}_f",
-            R_f.flatten(),
-            weight_type,
-            is_integer=False,
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"recurrent_{layer.layer_id}_g",
-            R_g.flatten(),
-            weight_type,
-            is_integer=False,
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"recurrent_{layer.layer_id}_o",
-            R_o.flatten(),
-            weight_type,
-            is_integer=False,
-        )
-    )
-
-    # Generate bias arrays — reordered to i, f, g, o
-    builder.add_code(
-        generate_array_constant(
-            f"bias_{layer.layer_id}_i", B_i, weight_type, is_integer=False
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"bias_{layer.layer_id}_f", B_f, weight_type, is_integer=False
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"bias_{layer.layer_id}_g", B_g, weight_type, is_integer=False
-        )
-    )
-    builder.add_code(
-        generate_array_constant(
-            f"bias_{layer.layer_id}_o", B_o, weight_type, is_integer=False
-        )
-    )
-
-    return builder.build()
+    return generate_lstm_weights_constants(layer)
 
 
 def generate_layer_bias(layer) -> STCode:
     """Generate bias constant for a layer.
 
-    Note: For LSTM layers, biases are generated separately in generate_lstm_weights.
+    Note: For LSTM layers, biases are generated separately in generate_lstm_weights_constants.
     """
-    # Skip bias generation for LSTM (already handled in generate_lstm_weights)
+    # Skip bias generation for LSTM (already handled)
     if isinstance(layer, LSTMLayer):
         return STCode.empty()
 
-    bias_type = plc_type_from_onnx_dtype(layer.output_type)
-    return generate_array_constant(f"bias_{layer.layer_id}", layer.bias, bias_type)
+    # Delegate to utility
+    return generate_bias_constant(layer)
 
 
 def generate_layer_quantization_params(layer) -> STCode:
     """
     Generate quantization parameters for QuantizeLinear/DequantizeLinear layers.
-    Only generates arrays for per-channel quantization (per-tensor is inlined).
+
+    Delegates to utility function. Only generates arrays for per-channel
+    quantization (per-tensor is inlined).
     """
-    # Only generate if per-channel (size > 1)
-    if layer.scale.size == 1:
-        return STCode.empty()
-
-    builder = STCodeBuilder()
-
-    # Scale array
-    builder.add_code(
-        generate_array_constant(f"scale_{layer.layer_id}", layer.scale, "REAL")
-    )
-
-    # Zero point array
-    if isinstance(layer, QuantizeLinearLayer):
-        dtype_str = layer.output_type
-    else:  # DequantizeLinearLayer
-        dtype_str = layer.input_type
-
-    zp_type = plc_type_from_onnx_dtype(dtype_str)
-    builder.add_code(
-        generate_array_constant(
-            f"zero_point_{layer.layer_id}", layer.zero_point, zp_type, is_integer=True
-        )
-    )
-
-    return builder.build()
+    return generate_quantization_params(layer)
 
 
 def generate_constants_section(network: NetworkIR) -> STCode:
@@ -558,17 +341,10 @@ def generate_constants_section(network: NetworkIR) -> STCode:
 
         # BatchNorm precomputed parameters
         if isinstance(layer, BatchNormLayer):
-            code += generate_array_constant(
-                f"bn_scale_{layer.layer_id}",
-                layer.combined_scale,
-                "REAL",
-            ).indent()
-            code += generate_array_constant(
-                f"bn_bias_{layer.layer_id}",
-                layer.combined_bias,
-                "REAL",
-            ).indent()
-            has_constants = True
+            bn_code = generate_batchnorm_constants(layer)
+            if bn_code.lines:
+                code += bn_code.indent()
+                has_constants = True
 
         if has_constants:
             code += STCode.blank_line()
@@ -736,63 +512,12 @@ def generate_var_section(
 def generate_activation_code(
     activation: ActivationType, input_var: str, output_var: str, size: int
 ) -> STCode:
-    """Generate activation code for activations that need separate loops."""
-    builder = STCodeBuilder()
+    """
+    Generate activation code for activations that need separate loops.
 
-    if activation == ActivationType.NONE:
-        # Identity - should never reach here (handled inline)
-        raise ValueError("NONE activation should be handled inline")
-
-    elif activation == ActivationType.RELU:
-        # ReLU - can be inline but also support separate
-        builder.add_line(f"FOR i := 0 TO {size-1} DO")
-        with builder.indent():
-            builder.add_line(f"{output_var}[i] := MAX({input_var}[i], 0.0);")
-        builder.add_line("END_FOR;")
-
-    elif activation == ActivationType.SIGMOID:
-        builder.add_line(f"FOR i := 0 TO {size-1} DO")
-        with builder.indent():
-            builder.add_line(f"{output_var}[i] := 1.0 / (1.0 + EXP(-{input_var}[i]));")
-        builder.add_line("END_FOR;")
-
-    elif activation == ActivationType.TANH:
-        builder.add_line(f"FOR i := 0 TO {size-1} DO")
-        with builder.indent():
-            builder.add_line(
-                f"{output_var}[i] := (EXP({input_var}[i]) - EXP(-{input_var}[i])) / "
-                f"(EXP({input_var}[i]) + EXP(-{input_var}[i]));"
-            )
-        builder.add_line("END_FOR;")
-
-    elif activation == ActivationType.SOFTMAX:
-        # Find maximum value
-        builder.add_line(f"max_val := {input_var}[0];")
-        builder.add_line(f"FOR i := 1 TO {size-1} DO")
-        with builder.indent():
-            builder.add_line(f"IF {input_var}[i] > max_val THEN")
-            with builder.indent():
-                builder.add_line(f"max_val := {input_var}[i];")
-            builder.add_line("END_IF;")
-        builder.add_line("END_FOR;")
-        builder.add_line("")
-
-        # Compute exp sum
-        builder.add_line("exp_sum := 0.0;")
-        builder.add_line(f"FOR i := 0 TO {size-1} DO")
-        with builder.indent():
-            builder.add_line(f"{output_var}[i] := EXP({input_var}[i] - max_val);")
-            builder.add_line(f"exp_sum := exp_sum + {output_var}[i];")
-        builder.add_line("END_FOR;")
-        builder.add_line("")
-
-        # Normalize
-        builder.add_line(f"FOR i := 0 TO {size-1} DO")
-        with builder.indent():
-            builder.add_line(f"{output_var}[i] := {output_var}[i] / exp_sum;")
-        builder.add_line("END_FOR;")
-
-    return builder.build()
+    Delegates to utility function for consistent implementation.
+    """
+    return generate_activation_loop(activation, input_var, output_var, size)
 
 
 def generate_activation_layer_code(
@@ -835,15 +560,8 @@ def generate_linear_layer_code(
         # Apply bias and activation inline
         final_expr = build_final_linear_layer_expression(layer, layer.bias is not None)
 
-        # Inline activation if possible
-        if activation == ActivationType.RELU:
-            activated_expr = f"MAX({final_expr}, 0.0)"
-        elif activation == ActivationType.SIGMOID:
-            activated_expr = f"1.0 / (1.0 + EXP(-({final_expr})))"
-        elif activation == ActivationType.TANH:
-            activated_expr = f"((EXP({final_expr}) - EXP(-({final_expr}))) / (EXP({final_expr}) + EXP(-({final_expr}))))"
-        else:  # NONE, SOFTMAX, or other
-            activated_expr = final_expr
+        # Inline activation if possible using utility
+        activated_expr = generate_activation_inline(activation, final_expr)
 
         builder.add_line(f"{output_var}[j] := {activated_expr};")
 
@@ -903,14 +621,12 @@ def generate_reshape_code(
             "Reshape layer with different sizes is not implemented yet."
         )
 
-    builder = STCodeBuilder()
-    builder.add_line(f"(* Layer {layer.layer_id}: Reshape (copy input to output) *)")
-    builder.add_line(f"FOR i := 0 TO {layer.input_size-1} DO")
-    with builder.indent():
-        builder.add_line(f"{output_var}[i] := {input_var}[i];")
-    builder.add_line("END_FOR;")
-
-    return builder.build()
+    return generate_simple_copy(
+        input_var,
+        output_var,
+        layer.output_size,
+        f"Layer {layer.layer_id}: Reshape (copy input to output)",
+    )
 
 
 def generate_quantize_linear_code(
@@ -1234,15 +950,12 @@ def generate_flatten_code(
     Since both input and output are already stored as flat 1-D arrays
     this is simply a memcopy (same as Reshape with identical sizes).
     """
-    builder = STCodeBuilder()
-    builder.add_line(
-        f"(* Layer {layer.layer_id}: Flatten (axis={layer.axis}) — copy *)"
+    return generate_simple_copy(
+        input_var,
+        output_var,
+        layer.output_size,
+        f"Layer {layer.layer_id}: Flatten (axis={layer.axis}) — copy",
     )
-    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
-    with builder.indent():
-        builder.add_line(f"{output_var}[i] := {input_var}[i];")
-    builder.add_line("END_FOR;")
-    return builder.build()
 
 
 def generate_squeeze_code(
@@ -1255,14 +968,9 @@ def generate_squeeze_code(
     are stored as flat 1-D arrays with the same number of elements,
     this is simply a memcopy — identical to Flatten.
     """
-    builder = STCodeBuilder()
-    axes_str = ",".join(str(a) for a in layer.axes) if layer.axes else "auto"
-    builder.add_line(f"(* Layer {layer.layer_id}: Squeeze *)")
-    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
-    with builder.indent():
-        builder.add_line(f"{output_var}[i] := {input_var}[i];")
-    builder.add_line("END_FOR;")
-    return builder.build()
+    return generate_simple_copy(
+        input_var, output_var, layer.output_size, f"Layer {layer.layer_id}: Squeeze"
+    )
 
 
 def generate_lstm_code(layer: "LSTMLayer", input_var: str, output_var: str) -> STCode:
@@ -1476,15 +1184,11 @@ def generate_identity_copy(
 
     Used by layers that don't change data layout in flat-array representation
     (Unsqueeze, Reshape, Squeeze, identity Cast, identity Expand).
+
+    Delegates to utility function for consistent implementation.
     """
-    builder = STCodeBuilder()
     label = comment or f"Layer {layer.layer_id}: {layer.op_type}"
-    builder.add_line(f"(* {label} *)")
-    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
-    with builder.indent():
-        builder.add_line(f"{output_var}[i] := {input_var}[i];")
-    builder.add_line("END_FOR;")
-    return builder.build()
+    return generate_simple_copy(input_var, output_var, layer.output_size, label)
 
 
 def generate_cast_code(layer: "CastLayer", input_var: str, output_var: str) -> STCode:
@@ -2221,13 +1925,11 @@ def generate_model_function_block(
     all_variables = collect_all_variables_from_regions(optimization_results)
     code += generate_merged_var_section(all_variables)
 
-    code += STCode.from_lines("(* Forward pass execution *)")
+    code += st_comment("Forward pass execution")
 
     for region in model.regions:
         code += STCode.blank_line()
-        code += STCode.from_lines(
-            f"(* Region: {region.region_id} [{region.kind.name}] *)"
-        )
+        code += st_comment(f"Region: {region.region_id} [{region.kind.name}]")
 
         if region.region_id not in optimization_results:
             raise KeyError(

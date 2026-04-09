@@ -16,20 +16,9 @@ from ..graph_algorithms import condensation_execution_order, topo_sort_onnx_node
 from .tensor_resolution import TensorResolver, ResolvedTensor
 from .shape_inference import infer_layer_shapes
 from .layer_extractors import LAYER_EXTRACTORS
+from .state_detection import detect_state_tensors
 
 logger = logging.getLogger(__name__)
-
-
-# ONNX RNN operator input index specifications
-# See: https://github.com/onnx/onnx/blob/main/docs/Operators.md
-_STATE_INPUT_INDICES = {
-    # LSTM: inputs[5]=initial_h, inputs[6]=initial_c
-    "LSTM": (5, 6),
-    # GRU: inputs[5]=initial_h
-    "GRU": (5,),
-    # RNN: inputs[5]=initial_h
-    "RNN": (5,),
-}
 
 
 # ============================================================================
@@ -302,178 +291,6 @@ def _evaluate_constant_op(
 
 
 # ============================================================================
-# State Tensor Detection
-# ============================================================================
-
-
-def _extract_lstm_state_tensors(
-    layer_name: str,
-    ir_layer: BaseLayer,
-    state_tensors: Dict[str, str],
-) -> None:
-    """
-    Extract state tensors from an LSTM layer.
-    Per ONNX spec, LSTM initial_h and initial_c are at inputs[5] and inputs[6].
-    Empty-string inputs indicate the optional tensor was omitted.
-    """
-    indices = _STATE_INPUT_INDICES["LSTM"]  # (5, 6)
-    if len(ir_layer.inputs) > max(indices):
-        for idx, label in zip(indices, ("initial_h", "initial_c")):
-            name = ir_layer.inputs[idx]
-            if name:  # skip empty optional slots
-                state_tensors[name] = "state"
-                logger.debug(f"LSTM '{layer_name}': marked {label} = '{name}' as state")
-    else:
-        logger.debug(
-            f"LSTM '{layer_name}': insufficient inputs for state detection "
-            f"(got {len(ir_layer.inputs)}, need > {max(indices)})"
-        )
-
-
-def _extract_gru_state_tensors(
-    layer_name: str,
-    ir_layer: BaseLayer,
-    state_tensors: Dict[str, str],
-) -> None:
-    """
-    Extract state tensors from a GRU layer.
-    Per ONNX spec, GRU initial_h is at inputs[5].
-    """
-    indices = _STATE_INPUT_INDICES["GRU"]  # (5,)
-    if len(ir_layer.inputs) > max(indices):
-        name = ir_layer.inputs[indices[0]]
-        if name:
-            state_tensors[name] = "state"
-            logger.debug(f"GRU '{layer_name}': marked initial_h = '{name}' as state")
-    else:
-        logger.debug(
-            f"GRU '{layer_name}': insufficient inputs for state detection "
-            f"(got {len(ir_layer.inputs)}, need > {max(indices)})"
-        )
-
-
-def _extract_rnn_state_tensors(
-    layer_name: str,
-    ir_layer: BaseLayer,
-    state_tensors: Dict[str, str],
-) -> None:
-    """
-    Extract state tensors from an RNN layer.
-    Per ONNX spec, RNN initial_h is at inputs[5].
-    """
-    indices = _STATE_INPUT_INDICES["RNN"]  # (5,)
-    if len(ir_layer.inputs) > max(indices):
-        name = ir_layer.inputs[indices[0]]
-        if name:
-            state_tensors[name] = "state"
-            logger.debug(f"RNN '{layer_name}': marked initial_h = '{name}' as state")
-    else:
-        logger.debug(
-            f"RNN '{layer_name}': insufficient inputs for state detection "
-            f"(got {len(ir_layer.inputs)}, need > {max(indices)})"
-        )
-
-
-def _extract_scan_state_tensors(
-    layer_name: str,
-    layer_dict: Dict,
-    state_tensors: Dict[str, str],
-) -> None:
-    """
-    Extract state tensors from a Scan layer.
-
-    Scan operators declare state variables via the 'loop_state_variables'
-    attribute, which specifies which inputs participate in the loop state.
-    """
-    attributes = layer_dict.get("attributes", {})
-    if "loop_state_variables" in attributes:
-        for state_var in attributes["loop_state_variables"]:
-            state_tensors[state_var] = "state"
-        logger.debug(
-            f"Scan '{layer_name}': marked {len(attributes['loop_state_variables'])} "
-            f"state variables from loop_state_variables attribute"
-        )
-
-
-def _extract_loop_state_tensors(
-    layer_name: str,
-    layer_dict: Dict,
-    state_tensors: Dict[str, str],
-) -> None:
-    """
-    Extract state tensors from a Loop layer.
-
-    Note: Loop state detection requires analyzing the subgraph body, which is
-    more complex. This is marked for future enhancement.
-    TODO: Implement subgraph analysis for Loop state detection
-    """
-    logger.debug(
-        f"Loop '{layer_name}': state detection requires subgraph analysis (TODO)"
-    )
-
-
-# Dispatcher for state tensor extraction by operator type
-_STATE_EXTRACTORS = {
-    "LSTM": _extract_lstm_state_tensors,
-    "GRU": _extract_gru_state_tensors,
-    "RNN": _extract_rnn_state_tensors,
-    "Scan": _extract_scan_state_tensors,
-    "Loop": _extract_loop_state_tensors,
-}
-
-
-def _detect_state_tensors(
-    analyzer: ONNXModel,
-    layers: Dict[str, BaseLayer],
-) -> Dict[str, str]:
-    """
-    Detect state tensors from RNN-family operators.
-
-    Scans the ONNX model for RNN-family operators (LSTM, GRU, RNN, Scan, Loop)
-    and extracts their state tensor information. This allows regionization to
-    correctly identify recurrent control flow without heuristics.
-
-    The detection leverages ONNX operator specifications, which define explicit
-    positions or attributes for state tensors. Each operator type has a dedicated
-    extraction function for clarity and maintainability.
-
-    Args:
-        analyzer: The loaded ONNX model
-        layers: Dictionary of extracted IR layers
-
-    Returns:
-        Dict mapping tensor_name -> "state" for each detected state tensor
-    """
-    state_tensors: Dict[str, str] = {}
-
-    for layer_dict in analyzer.layers:
-        op_type = layer_dict.get("op_type", "")
-
-        # Skip if this operator type doesn't have state semantics
-        if op_type not in _STATE_EXTRACTORS:
-            continue
-
-        # Find the corresponding IR layer
-        layer_name = layer_dict.get("name", "")
-        if layer_name not in layers:
-            logger.debug(
-                f"Operator '{op_type}' layer '{layer_name}' not found in IR layers"
-            )
-            continue
-
-        ir_layer = layers[layer_name]
-
-        # Delegate to operator-specific extractor
-        # Scan and Loop need the full layer_dict for attributes
-        if op_type in {"Scan", "Loop"}:
-            _STATE_EXTRACTORS[op_type](layer_name, layer_dict, state_tensors)
-        else:
-            _STATE_EXTRACTORS[op_type](layer_name, ir_layer, state_tensors)
-
-    return state_tensors
-
-
-# ============================================================================
 # Main Conversion Entry Point
 # ============================================================================
 
@@ -609,8 +426,8 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
         layers, tensor_producers, input_tensors
     )
 
-    # Detect state tensors from RNN-family operators
-    state_tensors = _detect_state_tensors(analyzer, layers)
+    # Detect state tensors from RNN-family operators (LSTM, GRU, RNN, etc.)
+    state_tensors = detect_state_tensors(analyzer, layers)
     if state_tensors:
         logger.info(
             f"Detected {len(state_tensors)} state tensors: {list(state_tensors.keys())}"

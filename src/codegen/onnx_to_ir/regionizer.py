@@ -6,7 +6,6 @@ strongly connected component (SCC) analysis.
 """
 
 import logging
-from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 from ..types import (
     NetworkIR,
@@ -16,11 +15,7 @@ from ..types import (
     LoopRegionIR,
     RegionKind,
 )
-from ..graph_algorithms import (
-    tarjan_scc,
-    topological_order_components,
-    build_layer_graph,
-)
+from ..graph.core import LayerGraph
 from ..ir_utils import (
     TensorMapBuilder,
     build_tensor_maps,  # Legacy, kept for compatibility
@@ -83,8 +78,7 @@ def _subgraph_for_component(
 
 def _classify_region_kind(
     component_nodes: Set[str],
-    adjacency: Dict[str, Set[str]],
-    graph: NetworkIR,
+    layer_graph: LayerGraph,
 ) -> RegionKind:
     """
     Classify a component as one of: Loop, Recurrent, or Acyclic.
@@ -96,7 +90,7 @@ def _classify_region_kind(
     """
     # Check for explicit control flow operators (highest priority)
     has_control_flow = any(
-        graph.layers[n].op_type in _CONTROL_FLOW_OPS for n in component_nodes
+        layer_graph.ir.layers[n].op_type in _CONTROL_FLOW_OPS for n in component_nodes
     )
     if has_control_flow:
         return RegionKind.LOOP
@@ -107,7 +101,7 @@ def _classify_region_kind(
 
     # Check for self-loop on single node
     single_node = next(iter(component_nodes))
-    if single_node in adjacency.get(single_node, set()):
+    if single_node in layer_graph.adjacency.get(single_node, set()):
         return RegionKind.RECURRENT
 
     # No cycles, no control flow → purely acyclic
@@ -357,30 +351,22 @@ def regionize_network_ir(network_ir) -> ModelIR:
             },
         )
 
-    adjacency, _ = build_layer_graph(
-        graph.layers, graph.tensor_producers, graph.tensor_consumers
-    )
-    sccs = tarjan_scc(adjacency)
+    # NEW: Use LayerGraph for all graph analysis
+    layer_graph = LayerGraph(graph)
+    sccs = layer_graph.strongly_connected_components
+    ordered_sccs = layer_graph.get_ordered_sccs()
 
+    # Map each node to its SCC component ID
     node_to_component: Dict[str, int] = {}
     for cid, component in enumerate(sccs):
         for node in component:
             node_to_component[node] = cid
 
-    component_edges: Dict[int, Set[int]] = {cid: set() for cid in range(len(sccs))}
-    for src, neighbors in adjacency.items():
-        src_cid = node_to_component[src]
-        for dst in neighbors:
-            dst_cid = node_to_component[dst]
-            if src_cid != dst_cid:
-                component_edges[src_cid].add(dst_cid)
-
-    ordered_component_ids = topological_order_components(component_edges)
     regions = []
 
-    for ridx, cid in enumerate(ordered_component_ids):
-        component_nodes = set(sccs[cid])
-        kind = _classify_region_kind(component_nodes, adjacency, graph)
+    for ridx, scc in enumerate(ordered_sccs):
+        component_nodes = set(scc)
+        kind = _classify_region_kind(component_nodes, layer_graph)
         subgraph = _subgraph_for_component(graph, component_nodes)
         region_id = f"r{ridx}"
 

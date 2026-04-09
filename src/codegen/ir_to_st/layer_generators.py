@@ -5,12 +5,14 @@ Centralizes and organizes all layer-to-ST code generation logic.
 Provides clean registration, lookup, and extension mechanisms.
 
 Architecture:
+  - GeneratorMetadata: Metadata describing a registered generator
   - LayerCodeGeneratorRegistry: Central registry mapping layer types to generators
   - Generator functions: Implementation for each layer type
   - Registry instance: Singleton registry used throughout codegen
 """
 
-from typing import Dict, Callable, Optional
+from typing import Dict, Callable, Optional, Set
+from dataclasses import dataclass
 import logging
 
 from ..types import *
@@ -19,42 +21,98 @@ from .st_code import STCode
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class GeneratorMetadata:
+    """
+    Metadata describing a registered code generator.
+
+    Attributes:
+        layer_type: The layer type this generator handles (e.g., MatMulLayer)
+        generator: The generator function implementation
+        wrap_single_input: Whether to wrap generator to handle single-input convention
+        supported_regions: Set of region types this generator can be used in
+                          (e.g., {'acyclic', 'recurrent', 'loop'})
+        requires_state: Whether this generator requires state information
+        fused_activation: Whether this layer can fuse activation functions
+    """
+
+    layer_type: type
+    generator: Callable
+    wrap_single_input: bool = False
+    supported_regions: Set[str] = None
+    requires_state: bool = False
+    fused_activation: bool = False
+
+    def __post_init__(self):
+        if self.supported_regions is None:
+            object.__setattr__(
+                self, "supported_regions", {"acyclic", "recurrent", "loop"}
+            )
+
+    def supports_region(self, region_type: str) -> bool:
+        """Check if this generator supports a specific region type."""
+        return region_type in self.supported_regions
+
+
 class LayerCodeGeneratorRegistry:
     """
     Central registry for layer code generation.
 
-    Maps layer types to their respective code generation functions.
+    Maps layer types to their respective code generation functions and metadata.
     Provides a clean interface for:
-    - Registering new layer generators
-    - Looking up generators by layer type
+    - Registering new layer generators with metadata
+    - Looking up generators and their capabilities
     - Handling single-input vs multi-input layers transparently
+    - Querying capabilities (supported regions, state requirements, fused activations)
     """
 
     def __init__(self):
         """Initialize an empty registry."""
-        self._generators: Dict[type, Callable] = {}
+        self._generators: Dict[type, GeneratorMetadata] = {}
 
     def register(
         self,
         layer_type: type,
         generator: Callable,
         wrap_single_input: bool = False,
+        supported_regions: Optional[Set[str]] = None,
+        requires_state: bool = False,
+        fused_activation: bool = False,
     ) -> None:
         """
-        Register a code generator for a layer type.
+        Register a code generator for a layer type with metadata.
 
         Args:
             layer_type: The layer class to register for (e.g., MatMulLayer)
             generator: Function implementing code generation for this layer
             wrap_single_input: If True, wrap generator to handle single-input convention
                               (layer, inputs, output) instead of (layer, input_var, output)
+            supported_regions: Set of region types this generator supports
+                              (default: {'acyclic', 'recurrent', 'loop'})
+            requires_state: Whether this generator requires state information
+            fused_activation: Whether this layer can fuse activation functions
         """
         if wrap_single_input:
             # Wrap generator to unpack single input from list
             generator = self._single_input_wrapper(generator)
 
-        self._generators[layer_type] = generator
-        logger.debug(f"Registered generator for {layer_type.__name__}")
+        if supported_regions is None:
+            supported_regions = {"acyclic", "recurrent", "loop"}
+
+        metadata = GeneratorMetadata(
+            layer_type=layer_type,
+            generator=generator,
+            wrap_single_input=wrap_single_input,
+            supported_regions=supported_regions,
+            requires_state=requires_state,
+            fused_activation=fused_activation,
+        )
+
+        self._generators[layer_type] = metadata
+        logger.debug(
+            f"Registered generator for {layer_type.__name__} "
+            f"(regions: {', '.join(supported_regions)}, state: {requires_state})"
+        )
 
     def get(self, layer_type: type) -> Optional[Callable]:
         """
@@ -65,6 +123,19 @@ class LayerCodeGeneratorRegistry:
 
         Returns:
             Generator function, or None if not registered
+        """
+        metadata = self._generators.get(layer_type)
+        return metadata.generator if metadata else None
+
+    def get_metadata(self, layer_type: type) -> Optional[GeneratorMetadata]:
+        """
+        Look up metadata for a generator.
+
+        Args:
+            layer_type: The layer class to look up
+
+        Returns:
+            GeneratorMetadata object, or None if not registered
         """
         return self._generators.get(layer_type)
 
@@ -133,7 +204,14 @@ class LayerCodeGeneratorRegistry:
     def __repr__(self) -> str:
         """Return a string representation of registered generators."""
         registered_types = sorted([t.__name__ for t in self._generators.keys()])
-        return f"LayerCodeGeneratorRegistry({len(registered_types)} registered: {', '.join(registered_types)})"
+        state_required = sum(1 for m in self._generators.values() if m.requires_state)
+        fused_act = sum(1 for m in self._generators.values() if m.fused_activation)
+        return (
+            f"LayerCodeGeneratorRegistry("
+            f"{len(registered_types)} registered, "
+            f"{state_required} require state, "
+            f"{fused_act} support fused activation)"
+        )
 
 
 # Global registry instance (singleton)
@@ -162,21 +240,29 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
     # Import here to avoid circular imports
     from . import generator
 
-    # Register all layer generators
-    # Note: Most use wrap_single_input=True because they follow the
-    # (layer, input_var, output_var) convention
-
     registry.register(
-        MatMulLayer, generator.generate_linear_layer_code, wrap_single_input=True
+        MatMulLayer,
+        generator.generate_linear_layer_code,
+        wrap_single_input=True,
+        fused_activation=True,
     )
     registry.register(
-        GemmLayer, generator.generate_linear_layer_code, wrap_single_input=True
+        GemmLayer,
+        generator.generate_linear_layer_code,
+        wrap_single_input=True,
+        fused_activation=True,
     )
     registry.register(
-        FusedGemmLayer, generator.generate_linear_layer_code, wrap_single_input=True
+        FusedGemmLayer,
+        generator.generate_linear_layer_code,
+        wrap_single_input=True,
+        fused_activation=True,
     )
     registry.register(
-        FusedLinearLayer, generator.generate_linear_layer_code, wrap_single_input=True
+        FusedLinearLayer,
+        generator.generate_linear_layer_code,
+        wrap_single_input=True,
+        fused_activation=True,
     )
     registry.register(AddLayer, generator.generate_add_code, wrap_single_input=False)
     registry.register(
@@ -201,7 +287,10 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
         DropoutLayer, generator.generate_dropout_code, wrap_single_input=True
     )
     registry.register(
-        Conv2DLayer, generator.generate_conv2d_code, wrap_single_input=True
+        Conv2DLayer,
+        generator.generate_conv2d_code,
+        wrap_single_input=True,
+        fused_activation=True,
     )
     registry.register(
         Pool2DLayer, generator.generate_pool2d_code, wrap_single_input=True
@@ -218,8 +307,20 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
     registry.register(
         SqueezeLayer, generator.generate_squeeze_code, wrap_single_input=True
     )
-    registry.register(LSTMLayer, generator.generate_lstm_code, wrap_single_input=True)
-    registry.register(GRULayer, generator.generate_gru_code, wrap_single_input=True)
+    registry.register(
+        LSTMLayer,
+        generator.generate_lstm_code,
+        wrap_single_input=True,
+        requires_state=True,
+        supported_regions={"recurrent", "loop"},
+    )
+    registry.register(
+        GRULayer,
+        generator.generate_gru_code,
+        wrap_single_input=True,
+        requires_state=True,
+        supported_regions={"recurrent", "loop"},
+    )
 
     registry.register(
         CastLayer,
