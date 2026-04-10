@@ -959,32 +959,128 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
     if len(inputs) > 3 and inputs[3].is_weight and inputs[3].value is not None:
         B = inputs[3].value
 
+    # ── Strip num_directions dimension ──────────────────────────────────────
+    # ONNX W: (num_directions, 3*hidden_size, input_size) → (3*hidden_size, input_size)
+    if W.ndim == 3:
+        logger.debug(
+            f"GRU '{layer['name']}': stripping num_directions from W "
+            f"{W.shape} -> {W[0].shape}"
+        )
+        W = W[0]
+
+    # ONNX R: (num_directions, 3*hidden_size, hidden_size) → (3*hidden_size, hidden_size)
+    if R.ndim == 3:
+        logger.debug(
+            f"GRU '{layer['name']}': stripping num_directions from R "
+            f"{R.shape} -> {R[0].shape}"
+        )
+        R = R[0]
+
+    # ONNX B: (num_directions, 6*hidden_size) → (6*hidden_size,)
+    if B is not None and B.ndim == 2:
+        logger.debug(
+            f"GRU '{layer['name']}': stripping num_directions from B "
+            f"{B.shape} -> {B[0].shape}"
+        )
+        B = B[0]
+
+    # ── Validate bias shape (preserve raw ONNX layout) ─────────────────────
+    # ONNX B layout: [Wb_z, Wb_r, Wb_h, Rb_z, Rb_r, Rb_h]
+    # where z is the update gate (u).
+    # Keep raw B so codegen can correctly handle linear_before_reset semantics.
+    if B is not None:
+        if B.shape[0] == 6 * hidden_size:
+            logger.debug(
+                f"GRU '{layer['name']}': B has full ONNX layout (6*hidden_size)"
+            )
+        elif B.shape[0] == 3 * hidden_size:
+            logger.debug(
+                f"GRU '{layer['name']}': B has combined layout (3*hidden_size)"
+            )
+        else:
+            logger.warning(
+                f"GRU '{layer['name']}': unexpected B shape {B.shape}, "
+                f"expected ({6 * hidden_size},) or ({3 * hidden_size},)"
+            )
+
+    # ── Validate shapes ─────────────────────────────────────────────────────
+    # Derive actual input_size from W (more reliable than shape inference for features)
+    actual_input_size = W.shape[1]
+
+    if W.shape != (3 * hidden_size, actual_input_size):
+        raise ValueError(
+            f"GRU '{layer['name']}': W shape mismatch — "
+            f"expected ({3 * hidden_size}, {actual_input_size}), got {W.shape}"
+        )
+    if R.shape != (3 * hidden_size, hidden_size):
+        raise ValueError(
+            f"GRU '{layer['name']}': R shape mismatch — "
+            f"expected ({3 * hidden_size}, {hidden_size}), got {R.shape}"
+        )
+
+    # ── Extract sequence_length from input shape ────────────────────────────
+    # After batch-dim stripping, input_shape is typically (seq_length, input_size)
+    # or just (seq_length,) if input_size == 1.
+    if input_shape and len(input_shape) >= 2:
+        sequence_length = input_shape[0]
+    elif input_shape and len(input_shape) == 1:
+        # Flat input: seq_length = total_size / input_size
+        sequence_length = (
+            input_shape[0] // actual_input_size if actual_input_size > 0 else 1
+        )
+    else:
+        logger.warning(
+            f"GRU '{layer['name']}': could not determine sequence_length "
+            f"from input_shape {input_shape}, defaulting to 1"
+        )
+        sequence_length = 1
+
+    logger.info(
+        f"GRU '{layer['name']}': seq_len={sequence_length}, "
+        f"input_size={actual_input_size}, hidden_size={hidden_size}, "
+        f"W={W.shape}, R={R.shape}, B={'None' if B is None else B.shape}"
+    )
+
     # Extract activations
     activations = tuple(attrs.get("activations", ["Sigmoid", "Tanh"]))
     direction = attrs.get("direction", "forward")
     clip = attrs.get("clip")
+    linear_before_reset = int(attrs.get("linear_before_reset", 0))
 
     # ── Build output index mapping ──────────────────────────────────────────
-    # ONNX GRU has outputs: [Y, Y_h]
-    # Map output tensor names to their indices
+    # ONNX GRU canonical outputs: [Y, Y_h]
+    # IMPORTANT: resolved_outputs may be a subset/reordered view of node outputs.
+    # We must map using the original node output order whenever possible.
+    raw_output_names = list(layer.get("outputs", []))
     resolved_output_names = [t.name for t in layer["resolved_outputs"]]
-    output_indices = {name: idx for idx, name in enumerate(resolved_output_names)}
 
-    logger.debug(
-        f"GRU '{layer['name']}': output_indices={output_indices}, "
-        f"primary_output=Y (full sequence)"
-    )
+    output_indices = {}
+    for local_idx, name in enumerate(resolved_output_names):
+        if name in raw_output_names:
+            output_indices[name] = raw_output_names.index(name)
+        else:
+            # Fallback if metadata is missing
+            output_indices[name] = local_idx
 
     # ── Determine primary output ────────────────────────────────────────────
-    # The IR only uses the first output (Y - full sequence)
-    # Other output (Y_h) is internal to the RNN
-    primary_output = resolved_output_names[0] if resolved_output_names else "Y"
+    # Primary output is the first ONNX output index that is actually used.
+    output_type_map = {0: "Y", 1: "Y_h"}
+    primary_output = "Y"
+    if output_indices:
+        first_idx = min(output_indices.values())
+        primary_output = output_type_map.get(first_idx, "Y")
+
+    logger.debug(
+        f"GRU '{layer['name']}': raw_outputs={raw_output_names}, "
+        f"resolved_outputs={resolved_output_names}, "
+        f"output_indices={output_indices}, primary_output={primary_output}"
+    )
 
     return GRULayer(
         layer_id=layer_id,
         name=layer["name"],
         op_type=layer["op_type"],
-        input_size=input_size,
+        input_size=actual_input_size,
         output_size=output_size,
         inputs=tuple(t.name for t in inputs),
         outputs=tuple(t.name for t in layer["resolved_outputs"]),
@@ -993,12 +1089,14 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
         input_type=inputs[0].dtype,
         output_type=layer["resolved_outputs"][0].dtype,
         hidden_size=hidden_size,
+        sequence_length=sequence_length,
         W=W,
         R=R,
         B=B,
         activations=activations,
         direction=direction,
         clip=clip,
+        linear_before_reset=linear_before_reset,
         output_indices=output_indices,
         primary_output=primary_output,
     )

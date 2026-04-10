@@ -24,6 +24,7 @@ from .constant_helpers import (
     generate_scalar_constant,
     generate_weights_constants,
     generate_lstm_weights_constants,
+    generate_gru_weights_constants,
     generate_bias_constant,
     generate_quantization_params,
     generate_batchnorm_constants,

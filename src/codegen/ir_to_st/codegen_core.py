@@ -58,15 +58,15 @@ def generate_input_output_vars(network: NetworkIR) -> STCode:
     first_layer = network.layers[network.execution_order[0]]
     last_layer = network.layers[network.execution_order[-1]]
 
-    # Adjust input size for LSTM models (which use full sequences)
+    # Adjust input size for LSTM/GRU models (which use full sequences)
     actual_input_size = first_layer.input_size
     for layer_name in network.execution_order:
         layer = network.layers[layer_name]
-        if isinstance(layer, LSTMLayer):
-            lstm_total_input = layer.sequence_length * layer.input_size
-            actual_input_size = max(actual_input_size, lstm_total_input)
+        if isinstance(layer, (LSTMLayer, GRULayer)):
+            recurrent_total_input = layer.sequence_length * layer.input_size
+            actual_input_size = max(actual_input_size, recurrent_total_input)
             logger.debug(
-                f"Adjusted input_data for LSTM: "
+                f"Adjusted input_data for {layer.__class__.__name__}: "
                 f"seq_len={layer.sequence_length} x input_size={layer.input_size}"
             )
             break
@@ -106,11 +106,11 @@ def generate_constants_section(network: NetworkIR) -> STCode:
         if hasattr(layer, "weights") and layer.weights is not None:
             code += generate_layer_weights(layer).indent()
 
-        # Bias (skip LSTM—handled in generate_layer_weights)
+        # Bias (skip LSTM and GRU—handled in generate_layer_weights)
         if (
             hasattr(layer, "bias")
             and layer.bias is not None
-            and not isinstance(layer, LSTMLayer)
+            and not isinstance(layer, (LSTMLayer, GRULayer))
         ):
             code += generate_layer_bias(layer).indent()
 
@@ -158,22 +158,34 @@ def generate_merged_constants_section(
                             added_constants.add(f"weights_{layer.layer_id}_{gate}")
                             added_constants.add(f"recurrent_{layer.layer_id}_{gate}")
                             added_constants.add(f"bias_{layer.layer_id}_{gate}")
+                    # Mark per-gate constants for GRU
+                    elif isinstance(layer, GRULayer):
+                        for gate in ("r", "u", "h"):
+                            added_constants.add(f"weights_{layer.layer_id}_{gate}")
+                            added_constants.add(f"recurrent_{layer.layer_id}_{gate}")
+                            added_constants.add(f"bias_{layer.layer_id}_{gate}")
 
-            # Bias (skip LSTM)
-            elif isinstance(layer, LSTMLayer) and layer.W is not None:
+            # Bias (skip LSTM and GRU)
+            elif isinstance(layer, (LSTMLayer, GRULayer)) and layer.W is not None:
                 const_name = f"weights_{layer.layer_id}"
                 if const_name not in added_constants:
                     code += generate_layer_weights(layer).indent()
                     added_constants.add(const_name)
-                    for gate in ("i", "f", "g", "o"):
-                        added_constants.add(f"weights_{layer.layer_id}_{gate}")
-                        added_constants.add(f"recurrent_{layer.layer_id}_{gate}")
-                        added_constants.add(f"bias_{layer.layer_id}_{gate}")
+                    if isinstance(layer, LSTMLayer):
+                        for gate in ("i", "f", "g", "o"):
+                            added_constants.add(f"weights_{layer.layer_id}_{gate}")
+                            added_constants.add(f"recurrent_{layer.layer_id}_{gate}")
+                            added_constants.add(f"bias_{layer.layer_id}_{gate}")
+                    elif isinstance(layer, GRULayer):
+                        for gate in ("r", "u", "h"):
+                            added_constants.add(f"weights_{layer.layer_id}_{gate}")
+                            added_constants.add(f"recurrent_{layer.layer_id}_{gate}")
+                            added_constants.add(f"bias_{layer.layer_id}_{gate}")
 
             if (
                 hasattr(layer, "bias")
                 and layer.bias is not None
-                and not isinstance(layer, LSTMLayer)
+                and not isinstance(layer, (LSTMLayer, GRULayer))
             ):
                 const_name = f"bias_{layer.layer_id}"
                 if const_name not in added_constants:
@@ -315,6 +327,29 @@ def generate_var_section(
                             f"{state}_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
                         )
 
+    # GRU variables
+    has_gru = any(
+        isinstance(network.layers[ln], GRULayer) for ln in network.execution_order
+    )
+    if has_gru:
+        with builder.indent():
+            builder.add_line("(* GRU gate buffers and temporary variables *)")
+            builder.add_line("t : DINT;")
+            builder.add_line("exp_val : REAL;")
+            for ln in network.execution_order:
+                layer = network.layers[ln]
+                if isinstance(layer, GRULayer):
+                    h_size = layer.hidden_size
+                    builder.add_line(f"(* Layer {layer.layer_id} gate buffers *)")
+                    for gate in ("r_gate", "u_gate"):
+                        builder.add_line(
+                            f"{gate}_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                        )
+                    for state in ("h_state", "h_new"):
+                        builder.add_line(
+                            f"{state}_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
+                        )
+
     builder.add_line("")
     builder.add_line("END_VAR")
     builder.add_line("")
@@ -381,6 +416,20 @@ def collect_all_variables_from_regions(
                     if var_name not in all_variables:
                         all_variables[var_name] = (h, "REAL")
                 for state in ("h_state", "c_state"):
+                    var_name = f"{state}_{layer.layer_id}"
+                    if var_name not in all_variables:
+                        all_variables[var_name] = (h, "REAL")
+
+        # GRU buffers
+        for layer_name in network.execution_order:
+            layer = network.layers[layer_name]
+            if isinstance(layer, GRULayer):
+                h = layer.hidden_size
+                for gate in ("r_gate", "u_gate"):
+                    var_name = f"{gate}_{layer.layer_id}"
+                    if var_name not in all_variables:
+                        all_variables[var_name] = (h, "REAL")
+                for state in ("h_state", "h_new"):
                     var_name = f"{state}_{layer.layer_id}"
                     if var_name not in all_variables:
                         all_variables[var_name] = (h, "REAL")

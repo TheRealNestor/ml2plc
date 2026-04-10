@@ -217,11 +217,128 @@ def generate_lstm_weights_constants(layer) -> STCode:
     return builder.build()
 
 
+def generate_gru_weights_constants(layer) -> STCode:
+    """
+    Generate GRU weight constant declarations.
+
+    GRU weights organized as:
+    - W: (3*hidden_size, input_size)  — ONNX order [z, r, h] (update, reset, hidden)
+    - R: (3*hidden_size, hidden_size) — ONNX order [z, r, h]
+    - B: either (6*hidden_size,) raw ONNX [Wb_z, Wb_r, Wb_h, Rb_z, Rb_r, Rb_h]
+        or (3*hidden_size,) pre-combined [b_z, b_r, b_h]
+
+    Args:
+        layer: GRULayer with .W, .R, .B attributes
+
+    Returns:
+        STCode with per-gate weight declarations
+    """
+    builder = STCodeBuilder()
+
+    h_size = layer.hidden_size
+    x_size = layer.input_size
+    W = layer.W
+    R = layer.R
+    B = layer.B if layer.B is not None else np.zeros(6 * h_size)
+
+    weight_type = "REAL"
+
+    # ONNX gate order is [z, r, h], where z == update gate (u)
+    # We map to local names [u, r, h] used by ST generator.
+    gate_to_onnx_index = {"u": 0, "r": 1, "h": 2}
+    gate_order = ["u", "r", "h"]
+
+    # Prepare bias vectors
+    if B.shape[0] == 6 * h_size:
+        Wb = B[: 3 * h_size]
+        Rb = B[3 * h_size :]
+    elif B.shape[0] == 3 * h_size:
+        # Legacy/combined format: treat recurrent bias as zero
+        Wb = B
+        Rb = np.zeros_like(B)
+    else:
+        raise ValueError(
+            f"GRU layer {layer.layer_id}: invalid bias size {B.shape[0]}, "
+            f"expected {3 * h_size} or {6 * h_size}"
+        )
+
+    for gate in gate_order:
+        onnx_idx = gate_to_onnx_index[gate]
+        start, end = onnx_idx, onnx_idx + 1
+
+        # Input weight: W[start*h_size:end*h_size, :]
+        W_gate = W[start * h_size : end * h_size, :]
+        builder.add_code(
+            generate_array_constant(
+                f"weights_{layer.layer_id}_{gate}",
+                W_gate.flatten(),
+                weight_type,
+                is_integer=False,
+            )
+        )
+
+        # Recurrent weight: R[start*h_size:end*h_size, :]
+        R_gate = R[start * h_size : end * h_size, :]
+        builder.add_code(
+            generate_array_constant(
+                f"recurrent_{layer.layer_id}_{gate}",
+                R_gate.flatten(),
+                weight_type,
+                is_integer=False,
+            )
+        )
+
+        # Biases:
+        # - For reset/update gates we use combined bias (Wb + Rb).
+        # - For candidate gate we expose separate Wb_h / Rb_h because
+        #   linear_before_reset affects where Rb_h is applied.
+        Wb_gate = Wb[start * h_size : end * h_size]
+        Rb_gate = Rb[start * h_size : end * h_size]
+
+        if gate in ("u", "r"):
+            builder.add_code(
+                generate_array_constant(
+                    f"bias_{layer.layer_id}_{gate}",
+                    Wb_gate + Rb_gate,
+                    weight_type,
+                    is_integer=False,
+                )
+            )
+        else:
+            builder.add_code(
+                generate_array_constant(
+                    f"bias_w_{layer.layer_id}_{gate}",
+                    Wb_gate,
+                    weight_type,
+                    is_integer=False,
+                )
+            )
+            builder.add_code(
+                generate_array_constant(
+                    f"bias_r_{layer.layer_id}_{gate}",
+                    Rb_gate,
+                    weight_type,
+                    is_integer=False,
+                )
+            )
+            # Backward-compat convenience combined form
+            builder.add_code(
+                generate_array_constant(
+                    f"bias_{layer.layer_id}_{gate}",
+                    Wb_gate + Rb_gate,
+                    weight_type,
+                    is_integer=False,
+                )
+            )
+
+    return builder.build()
+
+
 def generate_bias_constant(layer) -> STCode:
     """
     Generate bias constant declaration for a layer.
 
-    Skips LSTM layers (biases handled by generate_lstm_weights_constants).
+    Skips LSTM and GRU layers (biases handled by their dedicated weight generators).
 
     Args:
         layer: Layer with .bias attribute
@@ -229,10 +346,10 @@ def generate_bias_constant(layer) -> STCode:
     Returns:
         STCode with bias array declaration
     """
-    # Check layer type to avoid LSTM
-    from ...types import LSTMLayer
+    # Check layer type to avoid LSTM and GRU
+    from ...types import LSTMLayer, GRULayer
 
-    if isinstance(layer, LSTMLayer):
+    if isinstance(layer, (LSTMLayer, GRULayer)):
         return STCode.empty()
 
     if not hasattr(layer, "bias") or layer.bias is None:

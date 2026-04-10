@@ -9,6 +9,7 @@ from .st_code import STCode
 from .utils.constant_helpers import (
     generate_weights_constants,
     generate_lstm_weights_constants,
+    generate_gru_weights_constants,
     generate_bias_constant,
     generate_quantization_params,
 )
@@ -16,10 +17,12 @@ from .utils.constant_helpers import (
 
 def generate_layer_weights(layer) -> STCode:
     """Generate weight constants for a layer."""
-    from ..types import LSTMLayer
+    from ..types import LSTMLayer, GRULayer
 
     if isinstance(layer, LSTMLayer):
         return generate_lstm_weights_constants(layer)
+    if isinstance(layer, GRULayer):
+        return generate_gru_weights_constants(layer)
     from ..types import LinearLayer
 
     is_quantized = isinstance(layer, LinearLayer) and layer.is_quantized()
@@ -28,9 +31,9 @@ def generate_layer_weights(layer) -> STCode:
 
 def generate_layer_bias(layer) -> STCode:
     """Generate bias constant for a layer."""
-    from ..types import LSTMLayer
+    from ..types import LSTMLayer, GRULayer
 
-    if isinstance(layer, LSTMLayer):
+    if isinstance(layer, (LSTMLayer, GRULayer)):
         return STCode.empty()
     return generate_bias_constant(layer)
 

@@ -154,6 +154,7 @@ def test_gru_output_indices_mapping():
         input_shape=(10, 20),
         output_shape=(10, 32),
         hidden_size=32,
+        sequence_length=10,
         W=np.zeros((96, 20)),  # 3*hidden_size x input_size
         R=np.zeros((96, 32)),  # 3*hidden_size x hidden_size
         output_indices={"Y": 0, "Y_h": 1},

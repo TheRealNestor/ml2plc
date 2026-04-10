@@ -159,7 +159,7 @@ def train_minimal_model(models_dir):
 
     Strategy:
     - Check if trained model exists in cache → use it (fast path)
-    - If not cached → train on MINIMAL data (1 epoch) → cache it
+    - If not cached → train on MINIMAL data (default: 1 epoch, configurable) → cache it
     - Never retrain if cached
 
     All models now implement MLModel interface:
@@ -168,16 +168,33 @@ def train_minimal_model(models_dir):
       - export_to_onnx(output_path)
 
     Usage:
+        # Train with default epochs (1 for most, 5 for GRU by default)
         trained_onnx = train_minimal_model(
             model_file_path,
             "ClassName",
             "model_prefix"
         )
+
+        # Or explicitly specify epochs
+        trained_onnx = train_minimal_model(
+            model_file_path,
+            "ClassName",
+            "model_prefix",
+            epochs=10
+        )
     """
 
-    def _train_model(model_file: Path, class_name: str, prefix: str) -> Path:
+    def _train_model(
+        model_file: Path, class_name: str, prefix: str, epochs: int | None = None
+    ) -> Path:
         onnx_dir = models_dir / "onnx"
         onnx_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine epochs if not explicitly provided
+        if epochs is None:
+            # Default: more epochs for GRU (needs more training for convergence)
+            # Other models use 1 epoch
+            epochs = 5 if prefix == "gru" else 1
 
         # FAST PATH: Check if trained model already exists
         trained_model = onnx_dir / f"{prefix}_trained.onnx"
@@ -185,7 +202,7 @@ def train_minimal_model(models_dir):
             print(f"  [CACHED-TRAINED] {prefix}", flush=True)
             return trained_model
 
-        # SLOW PATH: Train minimally and cache
+        # SLOW PATH: Train and cache
         print(f"  [TRAIN-MINIMAL] {prefix}...", end="", flush=True)
         try:
             ModelClass = load_python_model_class(model_file, class_name)
@@ -195,9 +212,9 @@ def train_minimal_model(models_dir):
             print(" [build]", end="", flush=True)
             model.create_model()
 
-            # Train with ONLY 1 epoch (minimal data is handled by generate_training_data)
-            print(" [1-epoch]", end="", flush=True)
-            model.train(epochs=1)
+            # Train with specified epochs
+            print(f" [{epochs}-epoch]", end="", flush=True)
+            model.train(epochs=epochs)
 
             # Export and cache
             print(" [export]", end="", flush=True)

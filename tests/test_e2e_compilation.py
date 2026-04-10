@@ -3,9 +3,10 @@ End-to-end compilation tests: ONNX model → Structured Text → Validation.
 
 Tests the complete compilation pipeline for different model architectures:
 - LSTM: Recurrent temporal model
+- GRU: Gated recurrent unit (simpler than LSTM)
 - MLP: Multi-layer perceptron (feedforward)
 - CNN: Convolutional neural network
-- (Future: GRU, RNN, Transformer, etc.)
+- (Future: RNN, Transformer, etc.)
 
 FAST FUNCTIONAL VALIDATION STRATEGY:
 ====================================
@@ -426,6 +427,64 @@ class TestCNNModel:
         )
         logger.info(
             f"CNN Functional: max_abs_diff={results['max_abs_diff']:.2e}, "
+            f"max_rel_diff={results['max_rel_diff']:.2e}"
+        )
+
+
+class TestGRUModel:
+    """GRU model tests: Gated Recurrent Unit (similar to LSTM but simpler).
+
+    NOTE: GRU model implements MLModel interface correctly, but the code generator
+    has incomplete GRU code generation (would need dedicated implementation like LSTM).
+    This is a codegen issue, not a model interface issue.
+    """
+
+    @pytest.fixture
+    def gru_onnx(self, models_dir):
+        """Load cached GRU ONNX model."""
+        onnx_dir = models_dir / "onnx"
+        candidates = list(onnx_dir.glob("gru_model_*.onnx"))
+        assert candidates, "GRU model not found. Models should be cached by conftest."
+        return candidates[0]
+
+    @pytest.mark.fast
+    def test_gru_structural(self, gru_onnx, tmp_output_dir):
+        """
+        FAST: Test GRU structural validation (10 samples).
+
+        Catches: Recurrent connection bugs, gate logic errors, state handling
+        Uses: Untrained ONNX (fast caching)
+        """
+        results = compile_and_validate_structural(
+            gru_onnx, tmp_output_dir, "gru_struct", num_samples=10, input_shape=(20,)
+        )
+        assert results["passed"], f"Structural validation failed: {results}"
+        logger.info(f"GRU Structural: max_abs_diff={results['max_abs_diff']:.2e}")
+
+    @pytest.mark.slow
+    def test_gru_functional(
+        self, gru_onnx, tmp_output_dir, train_minimal_model, models_dir
+    ):
+        """
+        SLOW: Minimal functional validation.
+
+        Verifies translation preserves semantic correctness.
+        Uses: Trained ONNX model (minimal training)
+        """
+        # Train model minimally (1 epoch, cached)
+        trained_model = train_minimal_model(
+            models_dir / "gru_model.py", "GRUTemperatureModel", "gru"
+        )
+
+        results = compile_and_validate_functional(
+            trained_model, tmp_output_dir, "gru_func", num_samples=3, input_shape=(20,)
+        )
+        assert results["passed"], (
+            f"Functional validation failed: max_abs_diff={results.get('max_abs_diff', 'N/A')}, "
+            f"error={results.get('error', 'Unknown')}"
+        )
+        logger.info(
+            f"GRU Functional: max_abs_diff={results['max_abs_diff']:.2e}, "
             f"max_rel_diff={results['max_rel_diff']:.2e}"
         )
 
