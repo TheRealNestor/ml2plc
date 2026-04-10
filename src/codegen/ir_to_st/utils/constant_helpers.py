@@ -140,15 +140,10 @@ def generate_weights_constants(layer, is_integer: bool = False) -> STCode:
 
 def generate_lstm_weights_constants(layer) -> STCode:
     """
-    Generate LSTM weight constant declarations.
+    Generate LSTM weight constant declarations using the unified recurrent generator.
 
     ONNX gate order: i (input), o (output), f (forget), g (cell/candidate)
     We reorder to: i, f, g, o for standard LSTM notation.
-
-    LSTM weights organized as:
-    - W: (4*hidden_size, input_size)  — ONNX order [i, o, f, g]
-    - R: (4*hidden_size, hidden_size) — ONNX order [i, o, f, g]
-    - B: (4*hidden_size,) — ONNX order [i, o, f, g]
 
     Args:
         layer: LSTMLayer with .W, .R, .B attributes
@@ -156,7 +151,7 @@ def generate_lstm_weights_constants(layer) -> STCode:
     Returns:
         STCode with per-gate weight declarations
     """
-    builder = STCodeBuilder()
+    from ..layers.constant_generation import generate_recurrent_weight_constants
 
     h_size = layer.hidden_size
     x_size = layer.input_size
@@ -164,62 +159,27 @@ def generate_lstm_weights_constants(layer) -> STCode:
     R = layer.R
     B = layer.B if layer.B is not None else np.zeros(4 * h_size)
 
-    weight_type = "REAL"
-
     # ONNX gate order: i, o, f, g (cell candidate)
-    # Extract gate weights using ONNX ordering
-    gates_onnx = {
-        "i": (0, 1),  # input gate
-        "o": (1, 2),  # output gate
-        "f": (2, 3),  # forget gate
-        "g": (3, 4),  # cell/candidate gate
-    }
+    # Map to: i, f, g, o (standard LSTM order)
+    gate_to_onnx_index = {"i": 0, "f": 2, "g": 3, "o": 1}
+    gate_order = ("i", "f", "g", "o")
 
-    # Reorder to: i, f, g, o (standard LSTM)
-    gate_order = ["i", "f", "g", "o"]
-
-    for gate in gate_order:
-        start, end = gates_onnx[gate]
-
-        # Input weight: W[start*h_size:end*h_size, :]
-        W_gate = W[start * h_size : end * h_size, :]
-        builder.add_code(
-            generate_array_constant(
-                f"weights_{layer.layer_id}_{gate}",
-                W_gate.flatten(),
-                weight_type,
-                is_integer=False,
-            )
-        )
-
-        # Recurrent weight: R[start*h_size:end*h_size, :]
-        R_gate = R[start * h_size : end * h_size, :]
-        builder.add_code(
-            generate_array_constant(
-                f"recurrent_{layer.layer_id}_{gate}",
-                R_gate.flatten(),
-                weight_type,
-                is_integer=False,
-            )
-        )
-
-        # Bias: B[start*h_size:end*h_size]
-        B_gate = B[start * h_size : end * h_size]
-        builder.add_code(
-            generate_array_constant(
-                f"bias_{layer.layer_id}_{gate}",
-                B_gate,
-                weight_type,
-                is_integer=False,
-            )
-        )
-
-    return builder.build()
+    return generate_recurrent_weight_constants(
+        layer_id=layer.layer_id,
+        hidden_size=h_size,
+        input_size=x_size,
+        W=W,
+        R=R,
+        B=B,
+        gate_order=gate_order,
+        gate_to_onnx_index=gate_to_onnx_index,
+        has_separate_biases=False,
+    )
 
 
 def generate_gru_weights_constants(layer) -> STCode:
     """
-    Generate GRU weight constant declarations.
+    Generate GRU weight constant declarations using the unified recurrent generator.
 
     GRU weights organized as:
     - W: (3*hidden_size, input_size)  — ONNX order [z, r, h] (update, reset, hidden)
@@ -233,7 +193,7 @@ def generate_gru_weights_constants(layer) -> STCode:
     Returns:
         STCode with per-gate weight declarations
     """
-    builder = STCodeBuilder()
+    from ..layers.constant_generation import generate_recurrent_weight_constants
 
     h_size = layer.hidden_size
     x_size = layer.input_size
@@ -241,97 +201,23 @@ def generate_gru_weights_constants(layer) -> STCode:
     R = layer.R
     B = layer.B if layer.B is not None else np.zeros(6 * h_size)
 
-    weight_type = "REAL"
-
     # ONNX gate order is [z, r, h], where z == update gate (u)
     # We map to local names [u, r, h] used by ST generator.
     gate_to_onnx_index = {"u": 0, "r": 1, "h": 2}
-    gate_order = ["u", "r", "h"]
+    gate_order = ("u", "r", "h")
 
-    # Prepare bias vectors
-    if B.shape[0] == 6 * h_size:
-        Wb = B[: 3 * h_size]
-        Rb = B[3 * h_size :]
-    elif B.shape[0] == 3 * h_size:
-        # Legacy/combined format: treat recurrent bias as zero
-        Wb = B
-        Rb = np.zeros_like(B)
-    else:
-        raise ValueError(
-            f"GRU layer {layer.layer_id}: invalid bias size {B.shape[0]}, "
-            f"expected {3 * h_size} or {6 * h_size}"
-        )
-
-    for gate in gate_order:
-        onnx_idx = gate_to_onnx_index[gate]
-        start, end = onnx_idx, onnx_idx + 1
-
-        # Input weight: W[start*h_size:end*h_size, :]
-        W_gate = W[start * h_size : end * h_size, :]
-        builder.add_code(
-            generate_array_constant(
-                f"weights_{layer.layer_id}_{gate}",
-                W_gate.flatten(),
-                weight_type,
-                is_integer=False,
-            )
-        )
-
-        # Recurrent weight: R[start*h_size:end*h_size, :]
-        R_gate = R[start * h_size : end * h_size, :]
-        builder.add_code(
-            generate_array_constant(
-                f"recurrent_{layer.layer_id}_{gate}",
-                R_gate.flatten(),
-                weight_type,
-                is_integer=False,
-            )
-        )
-
-        # Biases:
-        # - For reset/update gates we use combined bias (Wb + Rb).
-        # - For candidate gate we expose separate Wb_h / Rb_h because
-        #   linear_before_reset affects where Rb_h is applied.
-        Wb_gate = Wb[start * h_size : end * h_size]
-        Rb_gate = Rb[start * h_size : end * h_size]
-
-        if gate in ("u", "r"):
-            builder.add_code(
-                generate_array_constant(
-                    f"bias_{layer.layer_id}_{gate}",
-                    Wb_gate + Rb_gate,
-                    weight_type,
-                    is_integer=False,
-                )
-            )
-        else:
-            builder.add_code(
-                generate_array_constant(
-                    f"bias_w_{layer.layer_id}_{gate}",
-                    Wb_gate,
-                    weight_type,
-                    is_integer=False,
-                )
-            )
-            builder.add_code(
-                generate_array_constant(
-                    f"bias_r_{layer.layer_id}_{gate}",
-                    Rb_gate,
-                    weight_type,
-                    is_integer=False,
-                )
-            )
-            # Backward-compat convenience combined form
-            builder.add_code(
-                generate_array_constant(
-                    f"bias_{layer.layer_id}_{gate}",
-                    Wb_gate + Rb_gate,
-                    weight_type,
-                    is_integer=False,
-                )
-            )
-
-    return builder.build()
+    return generate_recurrent_weight_constants(
+        layer_id=layer.layer_id,
+        hidden_size=h_size,
+        input_size=x_size,
+        W=W,
+        R=R,
+        B=B,
+        gate_order=gate_order,
+        gate_to_onnx_index=gate_to_onnx_index,
+        has_separate_biases=True,
+        separate_bias_gates=("h",),
+    )
 
 
 def generate_bias_constant(layer) -> STCode:
