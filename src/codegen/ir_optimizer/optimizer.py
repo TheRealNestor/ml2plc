@@ -9,7 +9,7 @@ import logging
 from typing import List, Optional, Dict
 from collections import defaultdict
 
-from ..graph_algorithms import topological_sort, has_cycle, condensation_execution_order
+from ..graph import LayerGraph
 from ..ir_utils import build_tensor_maps
 from ..types import NetworkIR, ModelIR, RegionKind
 from .base_pass import OptimizationPass
@@ -215,15 +215,18 @@ class IROptimizer:
             new_layers
         )
 
-        # 5. Rebuild execution order (SCC-aware for cyclic graphs)
-        if has_cycle(new_layers, new_tensor_producers, self.ir.input_tensors):
-            new_execution_order = condensation_execution_order(
-                new_layers, new_tensor_producers, self.ir.input_tensors
-            )
-        else:
-            new_execution_order = topological_sort(
-                new_layers, new_tensor_producers, self.ir.input_tensors
-            )
+        # 5. Rebuild execution order using LayerGraph (single source of truth)
+        temp_ir = NetworkIR(
+            layers=new_layers,
+            execution_order=[],  # Temporary
+            tensor_producers=new_tensor_producers,
+            tensor_consumers=new_tensor_consumers,
+            input_tensors=self.ir.input_tensors,
+            output_tensors=tuple(new_output_tensors),
+            state_tensors=self.ir.state_tensors,
+        )
+        layer_graph = LayerGraph(temp_ir)
+        new_execution_order = layer_graph.get_execution_order()
 
         # 6. Renumber layer IDs sequentially
         new_layers = self._renumber_layer_ids(new_layers, new_execution_order)

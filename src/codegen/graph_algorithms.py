@@ -23,8 +23,17 @@ def topological_sort(
     input_tensors: tuple,
 ) -> List[str]:
     """
-    Perform topological sort on the layer graph using Kahn's algorithm.
+    [DEPRECATED] Use LayerGraph.get_execution_order() instead.
 
+    This function is kept for backward compatibility only. It rebuilds the
+    adjacency list on every call, which is inefficient compared to LayerGraph's
+    cached properties.
+
+    Migration:
+        Old: execution_order = topological_sort(layers, tensor_producers, input_tensors)
+        New: graph = LayerGraph(ir); execution_order = graph.get_execution_order()
+
+    Perform topological sort on the layer graph using Kahn's algorithm.
     Validates that the graph is acyclic. Raises ValueError if a cycle is detected.
 
     Args:
@@ -245,6 +254,16 @@ def condensation_execution_order(
     input_tensors: tuple,
 ) -> List[str]:
     """
+    [DEPRECATED] Use LayerGraph.get_execution_order() instead.
+
+    This function is kept for backward compatibility only. It rebuilds the
+    adjacency list and SCCs on every call, which is inefficient compared to
+    LayerGraph's cached properties.
+
+    Migration:
+        Old: execution_order = condensation_execution_order(layers, tensor_producers, input_tensors)
+        New: graph = LayerGraph(ir); execution_order = graph.get_execution_order()
+
     Compute a deterministic execution order that supports cyclic graphs.
 
     Strategy:
@@ -298,6 +317,16 @@ def has_cycle(
     input_tensors: tuple,
 ) -> bool:
     """
+    [DEPRECATED] Use LayerGraph.has_cycle() instead.
+
+    This function is kept for backward compatibility only. It rebuilds the
+    adjacency list on every call, which is inefficient compared to LayerGraph's
+    cached properties.
+
+    Migration:
+        Old: has_cycle(layers, tensor_producers, input_tensors)
+        New: graph = LayerGraph(ir); graph.has_cycle()
+
     Return True if the layer dependency graph contains at least one cycle.
 
     Detects:

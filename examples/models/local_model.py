@@ -4,9 +4,14 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 import argparse
+import sys
+
+# Add parent directory to path for base_model import
+sys.path.insert(0, str(Path(__file__).parent))
+from base_model import MLModel
 
 
-class TemperaturePredictionModel:
+class TemperaturePredictionModel(MLModel):
     def __init__(
         self, sequence_length=5, model_name=None
     ):  # Small window for real-time
@@ -18,8 +23,8 @@ class TemperaturePredictionModel:
         self.models_dir.mkdir(exist_ok=True)
 
         if model_name is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_name = f"temp_sensor_{timestamp}"
+            date_str = datetime.now().strftime("%d%m%Y")
+            model_name = f"local_model_{date_str}"
 
         self.model_path = self.models_dir / f"{model_name}.keras"
 
@@ -133,29 +138,34 @@ class TemperaturePredictionModel:
 
         return np.array(X).reshape(-1, self.sequence_length, 1), np.array(y)
 
-    def train_model(
-        self,
-        csv_file_path="data/temperature_data.csv",
-        generate_new_data=False,
-        samples=10000,
-    ):
-        """Train the model using CSV data or generate new training data"""
+    def train(self, epochs: int = 100, **kwargs):
+        """Train the model for specified epochs (MLModel interface).
+
+        Args:
+            epochs: Number of training epochs
+            **kwargs: Optional arguments:
+                - csv_path: Path to CSV file (default: "examples/data/temperature_data.csv")
+                - generate_new: Whether to generate new data (default: False)
+        """
         if self.model is None:
             self.create_model()
 
+        csv_path = kwargs.get("csv_path", "examples/data/temperature_data.csv")
+        generate_new = kwargs.get("generate_new", False)
+
         # Generate new data if requested or if CSV doesn't exist
-        if generate_new_data or not Path(csv_file_path).exists():
+        if generate_new or not Path(csv_path).exists():
             print("Generating new training data...")
             temperatures, labels = self.generate_training_data_with_labels(
-                samples, csv_file_path
+                10000, csv_path
             )
         else:
             # Try to load existing CSV data
-            temperatures, labels = self.load_data_from_csv(csv_file_path)
+            temperatures, labels = self.load_data_from_csv(csv_path)
             if temperatures is None or labels is None:
                 print("Failed to load CSV, generating new data...")
                 temperatures, labels = self.generate_training_data_with_labels(
-                    samples, csv_file_path
+                    10000, csv_path
                 )
 
         print("Creating training sequences...")
@@ -165,7 +175,7 @@ class TemperaturePredictionModel:
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_train, y_val = y[:split_idx], y[split_idx:]
 
-        print(f"Training model with {len(X_train)} samples...")
+        print(f"Training model with {len(X_train)} samples for {epochs} epochs...")
         print(f"Input shape: {X_train.shape}")
         print(f"Output shape: {y_train.shape}")
 
@@ -185,7 +195,7 @@ class TemperaturePredictionModel:
             X_train,
             y_train,
             validation_data=(X_val, y_val),
-            epochs=150,
+            epochs=epochs,
             batch_size=16,
             verbose=1,
             callbacks=callbacks,
@@ -198,6 +208,17 @@ class TemperaturePredictionModel:
         print(f"Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
 
         return temperatures
+
+    def train_model(
+        self,
+        csv_file_path="data/temperature_data.csv",
+        generate_new_data=False,
+        samples=10000,
+    ):
+        """DEPRECATED: Use train() method instead. Kept for backwards compatibility."""
+        return self.train(
+            epochs=150, csv_path=csv_file_path, generate_new=generate_new_data
+        )
 
     def predict(self, recent_temperatures, steps_ahead=1):
         """Predict temperature category from recent sensor readings"""
@@ -289,6 +310,55 @@ class TemperaturePredictionModel:
         except Exception as e:
             print(f"Failed to load weights: {e}")
             return False
+
+    def export_to_onnx(self, output_path: str | None = None) -> str:
+        """Export model to ONNX format using tf2onnx."""
+        if output_path is None:
+            # Save ONNX to examples/models/onnx, not keras subdirectory
+            onnx_dir = Path("examples/models/onnx")
+            onnx_dir.mkdir(exist_ok=True)
+            # Extract date from model name (e.g., "local_model_10042026" -> "10042026")
+            date_part = self.model_path.stem.split("_")[-1]
+            output_path = str(onnx_dir / f"local_model_{date_part}.onnx")
+
+        Path(output_path).parent.mkdir(exist_ok=True)
+
+        # Create temporary SavedModel for tf2onnx conversion
+        saved_model_dir = Path(self.model_path.parent) / ".tmp_saved_model"
+        tf.saved_model.save(self.model, str(saved_model_dir))
+
+        try:
+            import subprocess
+            import sys
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "tf2onnx.convert",
+                "--saved-model",
+                str(saved_model_dir),
+                "--output",
+                output_path,
+                "--opset",
+                "13",
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            # Clean up temporary SavedModel
+            import shutil
+
+            if saved_model_dir.exists():
+                shutil.rmtree(saved_model_dir)
+
+            if result.returncode == 0:
+                return output_path
+            else:
+                print(f"Export failed:\n{result.stderr}")
+                raise RuntimeError(f"ONNX export failed: {result.stderr}")
+        except Exception as e:
+            print(f"Error exporting to ONNX: {e}")
+            raise
 
     def load_data_from_csv(self, csv_file_path="temperature_data.csv"):
         """Load temperature data from CSV file"""

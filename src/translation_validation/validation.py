@@ -1,7 +1,50 @@
-from st_to_python import translate_st_to_python
+"""
+NUMERICAL VALIDATION of generated ST code (after compilation).
+
+This is the SECOND validation layer that runs AFTER compilation completes:
+- Loads original ONNX model
+- Translates generated ST code to Python
+- Runs both on identical test inputs
+- Compares numerical outputs element-by-element
+- Reports pass/fail with error tolerances (atol, rtol)
+
+DIFFERENT FROM: src/codegen/ir_to_st/validation.py
+  That module does STRUCTURAL VALIDATION during compilation:
+  - Validates code generation correctness
+  - Checks buffer size specifications
+  - Verifies multi-output layer handling
+  - Catches code generation bugs early
+
+VALIDATION PIPELINE:
+  1. python src/codegen/main.py model.onnx
+  2.    └─→ src/codegen/ir_to_st/validation.py (structural checks during generation)
+  3.    └─→ Returns: model.st file
+  4. python src/translation_validation/validation.py model.st [THIS FILE]
+  5.    └─→ Loads original ONNX model
+  6.    └─→ Translates ST to Python
+  7.    └─→ Compares outputs numerically
+  8.    └─→ Reports: Validation PASSED / FAILED
+
+EXPECTED RESULTS:
+  max_abs_diff < 1e-5  (absolute error < 0.00001)
+  max_rel_diff < 1e-5  (relative error < 0.001%)
+  All samples PASSED
+
+Example:
+    After compilation creates model.st:
+    >>> python src/translation_validation/validation.py model.st
+    >>> # Output: Validation PASSED [OK]
+    >>> # Max absolute difference: 1.62e-06
+    >>> # Max relative difference: 5.55e-05
+"""
+
+from .st_to_python import translate_st_to_python
 from pathlib import Path
 import numpy as np
 import importlib.util
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def translate_and_save(st_file: Path, save_file: Path) -> str:
@@ -51,29 +94,25 @@ def run_onnx_inference(session, input_data: np.ndarray) -> np.ndarray:
     input_name = session.get_inputs()[0].name
     expected_shape = session.get_inputs()[0].shape
 
-    print(f"Model expects shape: {expected_shape}")  # Debug info
-    print(f"Input shape before reshape: {input_data.shape}")  # Debug info
-
     # Handle different expected shapes
     # expected_shape might be like [None, 5, 1] or [None, 5] or [None, 1, 5]
     expected_rank = len(expected_shape)
 
-    if expected_rank == 3:
-        # Model expects 3D input
-        if input_data.ndim == 2:
-            batch_size, features = input_data.shape
-            # Check if model expects (batch, features, 1) or (batch, 1, features)
-            if expected_shape[1] == features or expected_shape[1] is None:
-                # Model expects (batch, features, 1)
-                input_data = np.expand_dims(input_data, axis=-1)
-            elif expected_shape[2] == features or expected_shape[2] is None:
-                # Model expects (batch, 1, features)
-                input_data = np.expand_dims(input_data, axis=1)
-    elif expected_rank == 2:
-        # Model expects 2D input (batch, features) - already correct
-        pass
-
-    print(f"Input shape after reshape: {input_data.shape}")  # Debug info
+    # Reshape input to match expected rank
+    if expected_rank == 3 and input_data.ndim == 2:
+        # Model expects 3D, we have 2D - expand dims
+        batch_size = input_data.shape[0]
+        # Try to infer which dimension should be 1
+        # Usually: (batch, seq_len, features) or (batch, features, seq_len)
+        if expected_shape[2] == 1 or (isinstance(expected_shape[2], str)):
+            # (batch, ?, 1) format
+            input_data = np.expand_dims(input_data, axis=-1)
+        else:
+            # (batch, 1, ?) format
+            input_data = np.expand_dims(input_data, axis=1)
+    elif expected_rank == 2 and input_data.ndim == 1:
+        # Model expects 2D, we have 1D - add batch dimension
+        input_data = np.expand_dims(input_data, axis=0)
 
     result = session.run(None, {input_name: input_data.astype(np.float32)})
 
@@ -121,6 +160,11 @@ def compare_inference(
     else:
         model_outputs = model.predict(test_inputs, verbose=0)
 
+    logger.info(f"Comparing {len(test_inputs)} test samples...")
+    logger.debug(
+        f"Model output shape: {model_outputs.shape}, Test inputs shape: {test_inputs.shape}"
+    )
+
     for i, input_data in enumerate(test_inputs):
         translated_output = translated_func(input_data)
         model_output = model_outputs[i]
@@ -143,12 +187,21 @@ def compare_inference(
             results["passed"] = False
             results["failed_indices"].append(i)
 
+            if verbose and i < 5:
+                logger.warning(
+                    f"Sample {i} FAILED: max_abs_diff={max_abs:.6e}, max_rel_diff={max_rel:.6e}"
+                )
+
         # Store first few comparisons for debugging
         if i < 3 or verbose:
             results["sample_comparisons"].append(
                 {
                     "index": i,
-                    "input": input_data.tolist(),
+                    "input": (
+                        input_data.tolist()
+                        if hasattr(input_data, "tolist")
+                        else input_data
+                    ),
                     "model_output": (
                         model_output.tolist()
                         if hasattr(model_output, "tolist")
@@ -164,6 +217,12 @@ def compare_inference(
                     ),
                 }
             )
+
+    logger.info(
+        f"Comparison complete: max_abs_diff={results['max_abs_diff']:.6e}, "
+        f"max_rel_diff={results['max_rel_diff']:.6e}, "
+        f"failed={len(results['failed_indices'])}/{len(test_inputs)}"
+    )
 
     return results
 
@@ -312,6 +371,10 @@ def main():
     )
     args = parser.parse_args()
 
+    # Setup logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(name)s: %(message)s")
+
     st_file = args.st_file
     if not st_file.exists():
         parser.error(f"ST file not found: {st_file}")
@@ -343,7 +406,7 @@ def main():
     # Report
     passed = results.get("passed", False)
     print(f"\n{'=' * 50}")
-    print(f"  Validation {'PASSED ✓' if passed else 'FAILED ✗'}")
+    print(f"  Validation {'PASSED [OK]' if passed else 'FAILED [FAIL]'}")
     print(f"{'=' * 50}")
     print(f"  Max absolute difference: {results.get('max_abs_diff', 'N/A'):.2e}")
     print(f"  Max relative difference: {results.get('max_rel_diff', 'N/A'):.2e}")

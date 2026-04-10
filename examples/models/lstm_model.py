@@ -34,6 +34,9 @@ import subprocess
 import sys
 import argparse
 
+# Add parent directory to path for base_model import
+sys.path.insert(0, str(Path(__file__).parent))
+from base_model import MLModel
 
 # ── Temperature thresholds (shared with other example models) ──────────────
 COLD_THRESHOLD = 10.0
@@ -41,7 +44,7 @@ HOT_THRESHOLD = 30.0
 CLASS_NAMES = ["Cold (≤10°C)", "Normal (10-30°C)", "Hot (>30°C)"]
 
 
-class LSTMTemperatureModel:
+class LSTMTemperatureModel(MLModel):
     """LSTM-based classifier for temperature sensor sequences."""
 
     def __init__(self, sequence_length: int = 20, model_name: str | None = None):
@@ -52,8 +55,8 @@ class LSTMTemperatureModel:
         self.models_dir.mkdir(exist_ok=True)
 
         if model_name is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_name = f"lstm_temp_{timestamp}"
+            date_str = datetime.now().strftime("%d%m%Y")
+            model_name = f"lstm_model_{date_str}"
 
         self.model_name = model_name
         self.model_path = self.models_dir / f"{model_name}.keras"

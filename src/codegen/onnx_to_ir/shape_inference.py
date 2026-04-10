@@ -273,6 +273,117 @@ def infer_squeeze_output_shape(
     return tuple(result) if result else (1,)
 
 
+def infer_cast_output_shape(input_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """
+    Infer output shape for Cast operation.
+
+    Cast preserves the tensor shape exactly (only changes dtype).
+
+    Args:
+        input_shape: Input tensor shape
+
+    Returns:
+        Same as input shape
+    """
+    return input_shape
+
+
+def infer_unsqueeze_output_shape(
+    input_shape: Tuple[int, ...], axes: Tuple[int, ...]
+) -> Tuple[int, ...]:
+    """
+    Infer output shape for Unsqueeze operation.
+
+    Unsqueeze inserts dimensions of size 1 at specified axes.
+    For PLC flattened data, element count remains unchanged.
+
+    Args:
+        input_shape: Input tensor shape
+        axes: Axes where dimensions of size 1 are inserted
+
+    Returns:
+        Output shape with size-1 dimensions inserted
+    """
+    if not input_shape:
+        return ()
+
+    if not axes:
+        return input_shape
+
+    # For PLC code generation with flattened data, we conservatively keep
+    # the total element count the same (no actual reshape happens in code generation).
+    # Return input shape unchanged as the actual reshape isn't needed for flat buffers.
+    return input_shape
+
+
+def infer_slice_output_shape(
+    input_shape: Tuple[int, ...],
+    starts: Tuple[int, ...],
+    ends: Tuple[int, ...],
+    axes: Tuple[int, ...] = (),
+    steps: Tuple[int, ...] = (),
+) -> Tuple[int, ...]:
+    """
+    Infer output shape for Slice operation.
+
+    For flattened PLC data, slice reduces the total element count.
+
+    Args:
+        input_shape: Input tensor shape
+        starts: Start indices for each axis
+        ends: End indices for each axis
+        axes: Which axes to slice (default: all axes in order)
+        steps: Step sizes for each axis (default: 1)
+
+    Returns:
+        Output shape after slicing
+    """
+    if not input_shape:
+        return ()
+
+    if not axes:
+        # If no axes specified, apply to first len(starts) dimensions
+        axes = tuple(range(len(starts)))
+    if not steps:
+        steps = tuple([1] * len(axes))
+
+    output_shape = list(input_shape)
+    for ax, start, end, step in zip(axes, starts, ends, steps):
+        if 0 <= ax < len(output_shape):
+            # For each sliced dimension, compute the output size
+            dim_size = output_shape[ax]
+            actual_start = (
+                max(0, min(start, dim_size)) if start >= 0 else max(0, dim_size + start)
+            )
+            actual_end = (
+                max(0, min(end, dim_size)) if end >= 0 else max(0, dim_size + end)
+            )
+            slice_size = max(0, (actual_end - actual_start + (step - 1)) // step)
+            output_shape[ax] = slice_size
+
+    return tuple(output_shape)
+
+
+def infer_expand_output_shape(
+    input_shape: Tuple[int, ...], target_shape: Optional[Tuple[int, ...]]
+) -> Tuple[int, ...]:
+    """
+    Infer output shape for Expand operation.
+
+    Expand broadcasts a tensor to a larger shape.
+
+    Args:
+        input_shape: Input tensor shape
+        target_shape: Target shape to broadcast to
+
+    Returns:
+        Output shape (the target shape)
+    """
+    if target_shape and all(s > 0 for s in target_shape):
+        return target_shape
+    return input_shape
+
+
 def infer_reshape_output_shape(
     input_shape: Tuple[int, ...], target_shape: Optional[Tuple[int, ...]]
 ) -> Tuple[int, ...]:
@@ -443,17 +554,62 @@ def infer_layer_shapes(
             axes = tuple(a - 1 for a in axes if a != 0)
         output_shape = infer_squeeze_output_shape(input_shape, axes)
 
-    if op_type == "Cast":
-        # Same shape as input
-        return _passthrough_shape(layer_dict)
-    if op_type == "Slice":
-        # Use resolved output shape if available
-        return _use_resolved_output_shape(layer_dict)
-    if op_type == "Concat":
-        return _use_resolved_output_shape(layer_dict)
+    elif op_type == "Cast":
+        # Cast preserves shape, only changes dtype
+        output_shape = infer_cast_output_shape(input_shape)
 
-    if op_type in ("Unsqueeze", "Expand", "Gather", "Shape"):
-        return _use_resolved_output_shape(layer_dict)
+    elif op_type == "Unsqueeze":
+        # Extract axes from second input (opset 13+) or attribute (opset < 13)
+        axes = ()
+        if len(resolved_inputs) > 1 and resolved_inputs[1].value is not None:
+            axes = tuple(int(a) for a in resolved_inputs[1].value.flatten().tolist())
+        else:
+            attrs = layer_dict.get("attributes", {})
+            axes = tuple(attrs.get("axes", ()))
+        output_shape = infer_unsqueeze_output_shape(input_shape, axes)
+
+    elif op_type == "Slice":
+        # Extract slice parameters (starts, ends, axes, steps)
+        starts = ()
+        ends = ()
+        axes = ()
+        steps = ()
+
+        if len(resolved_inputs) > 1 and resolved_inputs[1].value is not None:
+            starts = tuple(int(s) for s in resolved_inputs[1].value.flatten().tolist())
+        if len(resolved_inputs) > 2 and resolved_inputs[2].value is not None:
+            ends = tuple(int(e) for e in resolved_inputs[2].value.flatten().tolist())
+        if len(resolved_inputs) > 3 and resolved_inputs[3].value is not None:
+            axes = tuple(int(a) for a in resolved_inputs[3].value.flatten().tolist())
+        if len(resolved_inputs) > 4 and resolved_inputs[4].value is not None:
+            steps = tuple(int(s) for s in resolved_inputs[4].value.flatten().tolist())
+
+        output_shape = infer_slice_output_shape(input_shape, starts, ends, axes, steps)
+
+    elif op_type == "Expand":
+        # Extract target shape from second input (always a constant)
+        target_shape = None
+        if len(resolved_inputs) > 1 and resolved_inputs[1].value is not None:
+            target_shape = tuple(
+                int(s) for s in resolved_inputs[1].value.flatten().tolist()
+            )
+        output_shape = infer_expand_output_shape(input_shape, target_shape)
+
+    elif op_type == "Concat":
+        # Try resolved output shape first
+        if resolved_outputs and resolved_outputs[0].shape:
+            output_shape = resolved_outputs[0].shape
+        else:
+            # Fallback: sum sizes along concat axis
+            # For now, return input shape (conservative estimate)
+            output_shape = input_shape
+
+    elif op_type in ("Gather", "Shape"):
+        # These require more complex inference, use resolved output if available
+        if resolved_outputs and resolved_outputs[0].shape:
+            output_shape = resolved_outputs[0].shape
+        else:
+            output_shape = input_shape
 
     else:
         logger.warning(f"No shape inference for op_type '{op_type}', using input shape")
@@ -489,23 +645,21 @@ def get_feature_sizes(
     input_shape: Tuple[int, ...], output_shape: Tuple[int, ...]
 ) -> Tuple[int, int]:
     """
-    Get input and output feature sizes (ignoring batch dimensions).
+    Get input and output feature sizes as total flattened element counts.
 
-    For PLC code generation, we typically work with flattened 1D arrays,
-    so we take the last dimension as the feature size, or the total size
-    if the shape is 1D.
+    For PLC code generation, we work with flattened 1D buffers, so we need
+    the total number of elements in each tensor.
 
     Args:
         input_shape: Input tensor shape
         output_shape: Output tensor shape
 
     Returns:
-        (input_size, output_size) - number of features/elements
+        (input_size, output_size) - total flattened element counts
     """
-    # For 1D shapes, use the dimension directly
-    # For multi-dimensional, use the last dimension (feature dimension)
-    input_size = input_shape[-1] if input_shape else 0
-    output_size = output_shape[-1] if output_shape else 0
+    # Compute total flattened size as product of all dimensions
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
 
     return input_size, output_size
 

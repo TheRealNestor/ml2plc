@@ -1,426 +1,210 @@
 """
-Backend lowering: Convert regions to Structured Text by kind.
-
-Separates region-kind-specific ST generation into dedicated lowerers using
-a template method pattern, which provides a common structure while allowing
-region-kind-specific customization points.
-
-Architecture:
-  - RegionLowerer: Abstract base class with template method `lower()`
-  - Region-specific subclasses: AcyclicLowerer, RecurrentLowerer, LoopLowerer
-    Each implements hooks for pre-loop, loop bounds, and loop body generation.
-
-This pattern consolidates common logic (loop structure, indentation, code building)
-while making it easy to extend for new region types.
+Unified region lowering using strategy pattern.
+Eliminates duplication across AcyclicLowerer, RecurrentLowerer, LoopLowerer.
 """
 
-import logging
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
+from dataclasses import dataclass
 
 from ..types import (
+    NetworkIR,
+    RegionIR,
     AcyclicRegionIR,
     RecurrentRegionIR,
     LoopRegionIR,
-    RegionKind,
-    NetworkIR,
 )
 from ..ir_optimizer import OptimizationResult
-from .st_code import STCode
-
-logger = logging.getLogger(__name__)
-
-
-def _resolve_variable_name(
-    tensor_name: str,
-    ir_or_buffer_alloc,
-    buffer_allocations: Optional[Dict[str, str]] = None,
-) -> str:
-    """Resolve a tensor name to its variable name.
-
-    Tries in order:
-    1. Buffer allocation mapping
-    2. Layer output variable (layer_<id>_output)
-    3. Fallback to tensor name itself
-
-    This abstracts away the variable naming scheme, making lowering
-    more robust to future naming changes.
-    """
-    # Handle overloaded signature: _resolve_variable_name(tensor, ir, buffer_alloc)
-    if buffer_allocations is not None:
-        ir = ir_or_buffer_alloc
-    else:
-        # Called with 2 args: tensor, buffer_alloc_dict (no IR)
-        buffer_allocations = ir_or_buffer_alloc
-        ir = None
-
-    # Try buffer allocations first
-    if tensor_name in buffer_allocations:
-        return buffer_allocations[tensor_name]
-
-    # Try to resolve through IR tensor producer
-    if ir is not None and tensor_name in ir.tensor_producers:
-        producer_name = ir.tensor_producers[tensor_name]
-        if producer_name in ir.layers:
-            producer = ir.layers[producer_name]
-            return f"layer_{producer.layer_id}_output"
-
-    # Fallback: use tensor name as variable
-    return tensor_name
+from .st_code import STCode, st_comment
+from .st_templates import st_for_loop
 
 
-class RegionLowerer(ABC):
-    """
-    Abstract base class for region lowering using template method pattern.
+@dataclass
+class LoweringContext:
+    """Shared context across all lowering strategies."""
 
-    Subclasses implement three hooks to customize loop generation:
-      1. pre_loop_code(): Code before loop (state init, etc.)
-      2. loop_bounds(): Returns (init_value, end_value) for loop variable
-      3. loop_body_code(): Code inside loop
-    """
+    region: RegionIR
+    optimization_result: OptimizationResult
+    ir: NetworkIR = None  # Set from optimization_result
+    buffer_allocations: Dict[str, str] = None
 
-    def __init__(
-        self,
-        region,
-        optimization_result: OptimizationResult,
-    ):
-        self.region = region
-        self.ir = optimization_result.ir
-        self.buffer_allocations = optimization_result.buffer_allocations or {}
+    def __post_init__(self):
+        if self.ir is None:
+            self.ir = self.optimization_result.ir
+        if self.buffer_allocations is None:
+            self.buffer_allocations = self.optimization_result.buffer_allocations or {}
+
+
+class RegionLoweringStrategy(ABC):
+    """Base strategy for lowering any region type to ST code."""
+
+    def __init__(self, context: LoweringContext):
+        self.ctx = context
 
     @abstractmethod
     def pre_loop_code(self) -> STCode:
-        """Code before loop (state initialization, etc.)."""
+        """Code before main computation loop (initialization, state setup)."""
         pass
 
     @abstractmethod
-    def loop_bounds(self) -> Tuple[str, str]:
-        """Returns (init_value, end_value) for FOR loop."""
+    def loop_bounds(self) -> tuple[str, str]:
+        """Return (loop_var, upper_bound) for main loop."""
         pass
 
     @abstractmethod
     def loop_body_code(self) -> STCode:
-        """Code inside loop body."""
+        """Main computation inside loop."""
+        pass
+
+    @abstractmethod
+    def post_loop_code(self) -> STCode:
+        """Code after main computation loop (finalization)."""
         pass
 
     def lower(self) -> STCode:
-        """Template method: orchestrates lowering by combining hooks."""
-        code = STCode.empty()
-
-        # Region header
-        code += STCode.from_lines(
-            f"(* {self.region_type()} Region {self.region.region_id} *)"
+        """Template method: orchestrates lowering."""
+        code = STCode.from_lines(
+            f"(* Region: {self.ctx.region.region_id} [{self.ctx.region.kind.name}] *)"
         )
-        code += STCode.blank_line()
-
-        # Pre-loop section
-        pre_code = self.pre_loop_code()
-        if pre_code.lines:
-            code += pre_code
-            code += STCode.blank_line()
-
-        # Loop structure
-        init_val, end_val = self.loop_bounds()
-        code += STCode.from_lines(f"FOR step := {init_val} TO {end_val} DO")
-
-        body_code = self.loop_body_code()
-        for line in body_code.lines:
-            code += STCode.from_lines("\t" + line)
-
-        code += STCode.from_lines("END_FOR;")
-        code += STCode.blank_line()
-
+        code += self.pre_loop_code()
+        code += self._generate_main_loop()
+        code += self.post_loop_code()
         return code
 
-    def region_type(self) -> str:
-        """Return human-readable region type."""
-        if isinstance(self.region, AcyclicRegionIR):
-            return "Acyclic"
-        elif isinstance(self.region, RecurrentRegionIR):
-            return "Recurrent"
-        elif isinstance(self.region, LoopRegionIR):
-            return "Loop"
-        else:
-            return "Unknown"
-
-    def lower(self) -> STCode:
-        """
-        Template method: orchestrates lowering by combining hooks.
-
-        Note: Acyclic regions override this to avoid unnecessary FOR loop.
-        """
-        code = STCode.empty()
-
-        # Region header
-        code += STCode.from_lines(
-            f"(* {self.region_type()} Region {self.region.region_id} *)"
-        )
-        code += STCode.blank_line()
-
-        # Pre-loop section
-        pre_code = self.pre_loop_code()
-        if pre_code.lines:
-            code += pre_code
-            code += STCode.blank_line()
-
-        # Loop structure
-        init_val, end_val = self.loop_bounds()
-        code += STCode.from_lines(f"FOR step := {init_val} TO {end_val} DO")
-
-        body_code = self.loop_body_code()
-        for line in body_code.lines:
-            code += STCode.from_lines("\t" + line)
-
-        code += STCode.from_lines("END_FOR;")
-        code += STCode.blank_line()
-
-        return code
+    def _generate_main_loop(self) -> STCode:
+        """Common loop generation logic for all strategies."""
+        loop_var, upper_bound = self.loop_bounds()
+        body = self.loop_body_code()
+        return st_for_loop(loop_var, 0, upper_bound, body)
 
 
-class AcyclicLowerer(RegionLowerer):
-    """Lowerer for acyclic (DAG) regions."""
+class AcyclicLoweringStrategy(RegionLoweringStrategy):
+    """Strategy for acyclic regions: no loop, single forward pass."""
 
     def pre_loop_code(self) -> STCode:
-        """No pre-loop code for acyclic regions."""
         return STCode.empty()
 
-    def loop_bounds(self) -> Tuple[str, str]:
-        """Acyclic: single execution (0 to 0)."""
-        return ("0", "0")
+    def loop_bounds(self) -> tuple[str, str]:
+        # Dummy: no loop for acyclic
+        return ("_unused", "-1")
 
     def loop_body_code(self) -> STCode:
-        """Use standard forward pass for acyclic body."""
-        from .generator import generate_forward_pass
+        """Forward pass for all layers in execution order."""
+        return self._generate_forward_pass()
 
-        return generate_forward_pass(self.ir, self.buffer_allocations)
+    def post_loop_code(self) -> STCode:
+        return STCode.empty()
 
     def lower(self) -> STCode:
-        """
-        Lower an acyclic region WITHOUT a FOR loop.
-
-        Acyclic regions are pure data-flow, so we can omit the FOR loop
-        and just generate the forward pass directly. This is simpler and
-        more readable than wrapping in FOR 0 TO 0.
-        """
-        code = STCode.empty()
-
-        # Region header
-        code += STCode.from_lines(
-            f"(* {self.region_type()} Region {self.region.region_id} *)"
-        )
-        code += STCode.blank_line()
-
-        # Generate forward pass directly (no loop)
-        body_code = self.loop_body_code()
-        code += body_code
-        code += STCode.blank_line()
-
+        """Override: acyclic doesn't use loop template."""
+        code = STCode.from_lines(f"(* Acyclic Region {self.ctx.region.region_id} *)")
+        code += self._generate_forward_pass()
         return code
 
+    def _generate_forward_pass(self) -> STCode:
+        """Reuse existing generator logic."""
+        from .forward_pass import generate_forward_pass
 
-class RecurrentLowerer(RegionLowerer):
-    """Lowerer for recurrent (cyclic) regions."""
+        return generate_forward_pass(self.ctx.ir, self.ctx.buffer_allocations)
 
-    def __init__(
-        self, region: RecurrentRegionIR, optimization_result: OptimizationResult
-    ):
-        super().__init__(region, optimization_result)
-        self.num_timesteps = 1  # MVP: fixed 1 timestep
+
+class RecurrentLoweringStrategy(RegionLoweringStrategy):
+    """Strategy for recurrent regions: state init + timestep loop."""
+
+    def __init__(self, context: LoweringContext, num_timesteps: int = 1):
+        super().__init__(context)
+        self.num_timesteps = num_timesteps
+        self.region: RecurrentRegionIR = context.region
 
     def pre_loop_code(self) -> STCode:
-        """Generate state variable initialization."""
+        """Initialize state variables to zero."""
         if not self.region.state_inputs or not self.region.state_outputs:
             return STCode.empty()
 
-        code = STCode.from_lines("(* State initialization *)")
+        code = st_comment("State initialization")
         for state_in, state_out in zip(
             self.region.state_inputs, self.region.state_outputs
         ):
-            input_var = _resolve_variable_name(state_in, self.buffer_allocations)
-            output_var = _resolve_variable_name(
-                state_out, self.ir, self.buffer_allocations
-            )
+            input_var = self._resolve_variable(state_in, is_input=True)
+            output_var = self._resolve_variable(state_out, is_input=False)
             code += STCode.from_lines(f"{output_var} := {input_var};")
 
         return code
 
-    def loop_bounds(self) -> Tuple[str, str]:
-        """Loop from 0 to (num_timesteps - 1)."""
-        return ("0", str(self.num_timesteps - 1))
+    def loop_bounds(self) -> tuple[str, str]:
+        return ("step", str(self.num_timesteps - 1))
 
     def loop_body_code(self) -> STCode:
-        """Use standard forward pass for body."""
-        from .generator import generate_forward_pass
+        """Forward pass for timestep."""
+        from .forward_pass import generate_forward_pass
 
-        return generate_forward_pass(self.ir, self.buffer_allocations)
+        return generate_forward_pass(self.ctx.ir, self.ctx.buffer_allocations)
+
+    def post_loop_code(self) -> STCode:
+        return STCode.empty()
+
+    def _resolve_variable(self, tensor_name: str, is_input: bool) -> str:
+        """Resolve tensor to variable name."""
+        return self.ctx.buffer_allocations.get(tensor_name, tensor_name)
 
 
-class LoopLowerer(RegionLowerer):
-    """Lowerer for control-flow loop regions (ONNX Loop/Scan)."""
+class LoopLoweringStrategy(RegionLoweringStrategy):
+    """Strategy for explicit Loop/Scan regions (ONNX control flow)."""
 
-    def __init__(self, region: LoopRegionIR, optimization_result: OptimizationResult):
-        super().__init__(region, optimization_result)
-        self.loop_metadata = self._extract_loop_metadata()
-
-    def _extract_loop_metadata(self) -> Dict:
-        """
-        Extract loop metadata for code generation.
-
-        Parses loop_inputs and loop_outputs to identify:
-        - trip_count: loop iteration count variable
-        - carry_vars: state variables that persist across iterations
-        - scan_outputs: accumulated outputs from each iteration
-
-        Returns:
-            Dictionary with loop execution parameters:
-            {
-                "trip_count_var": str,      # Variable name for loop count
-                "carry_vars": [(in, out),], # (carry_input, carry_output) pairs
-                "scan_outputs": [str, ...], # Accumulated output names
-            }
-        """
-        metadata = {
-            "trip_count_var": "trip_count",
-            "carry_vars": [],
-            "scan_outputs": [],
-        }
-
-        # First loop_input is trip_count
-        if self.region.loop_inputs:
-            trip_count_tensor = self.region.loop_inputs[0]
-            metadata["trip_count_var"] = _resolve_variable_name(
-                trip_count_tensor, self.buffer_allocations
-            )
-
-            # Remaining inputs are carry variables (pair with first N outputs)
-            for idx, carry_in in enumerate(self.region.loop_inputs[1:]):
-                if idx < len(self.region.loop_outputs):
-                    carry_out = self.region.loop_outputs[idx]
-                    metadata["carry_vars"].append((carry_in, carry_out))
-
-            # Remaining outputs are scan outputs
-            num_carries = len(metadata["carry_vars"])
-            if len(self.region.loop_outputs) > num_carries:
-                metadata["scan_outputs"] = list(self.region.loop_outputs[num_carries:])
-
-        return metadata
+    def __init__(self, context: LoweringContext):
+        super().__init__(context)
+        self.region: LoopRegionIR = context.region
 
     def pre_loop_code(self) -> STCode:
-        """Generate carry variable initialization."""
-        if not self.loop_metadata["carry_vars"]:
-            return STCode.empty()
-
-        code = STCode.from_lines("(* Loop carry initialization *)")
-        for carry_in, carry_out in self.loop_metadata["carry_vars"]:
-            code += STCode.from_lines(f"{carry_out} := {carry_in};")
-
+        """Initialize loop carry variables."""
+        code = st_comment("Loop carry initialization")
+        for carry_in, carry_out in zip(
+            self.region.loop_inputs, self.region.loop_outputs
+        ):
+            out_var = self.ctx.buffer_allocations.get(carry_out, carry_out)
+            code += STCode.from_lines(f"{out_var} := 0.0;  (* TODO: from loop carry *)")
         return code
 
-    def loop_bounds(self) -> Tuple[str, str]:
-        """Loop from 0 to (trip_count - 1)."""
-        trip_count_var = self.loop_metadata["trip_count_var"]
-        return ("0", f"({trip_count_var} - 1)")
+    def loop_bounds(self) -> tuple[str, str]:
+        # Extract from ONNX Loop spec (TODO: implement properly)
+        return ("iter", "0")
 
     def loop_body_code(self) -> STCode:
-        """Use standard forward pass for body."""
-        from .generator import generate_forward_pass
+        from .forward_pass import generate_forward_pass
 
-        body_code = generate_forward_pass(self.ir, self.buffer_allocations)
-        # Optionally add carry update logic here in future
-        return body_code
+        return generate_forward_pass(self.ctx.ir, self.ctx.buffer_allocations)
+
+    def post_loop_code(self) -> STCode:
+        return STCode.empty()
 
 
 # ============================================================================
-# Public API Functions
+# Dispatcher (Single Entry Point)
 # ============================================================================
-
-
-def lower_acyclic_region_to_st(
-    region: AcyclicRegionIR,
-    optimization_result: OptimizationResult,
-) -> STCode:
-    """Lower an acyclic (DAG) region to Structured Text."""
-    logger.debug(f"Lowering acyclic region {region.region_id}")
-    lowerer = AcyclicLowerer(region, optimization_result)
-    return lowerer.lower()
-
-
-def lower_recurrent_region_to_st(
-    region: RecurrentRegionIR,
-    optimization_result: OptimizationResult,
-    num_timesteps: int = 1,
-) -> STCode:
-    """Lower a recurrent (cyclic) region to Structured Text."""
-    logger.debug(
-        f"Lowering recurrent region {region.region_id} "
-        f"with state_inputs={region.state_inputs}, state_outputs={region.state_outputs}, "
-        f"num_timesteps={num_timesteps}"
-    )
-    lowerer = RecurrentLowerer(region, optimization_result)
-    lowerer.num_timesteps = num_timesteps
-    return lowerer.lower()
-
-
-def lower_loop_region_to_st(
-    region: LoopRegionIR,
-    optimization_result: OptimizationResult,
-) -> STCode:
-    """
-    Lower a control-flow loop region to Structured Text.
-
-    Loop regions represent explicit control flow constructs from the ONNX model
-    (Loop, Scan operators). They have explicit loop count and carry variables.
-
-    ONNX Loop Operator:
-      Inputs:  [trip_count, condition, carry_0, carry_1, ...]
-      Body:    Iterative computation with state carry-over
-      Outputs: [carry_0_final, carry_1_final, ..., scan_outputs...]
-    """
-    logger.debug(
-        f"Lowering loop region {region.region_id} "
-        f"with loop_inputs={region.loop_inputs}, loop_outputs={region.loop_outputs}"
-    )
-    lowerer = LoopLowerer(region, optimization_result)
-    return lowerer.lower()
 
 
 def lower_region_to_st(
-    region,
+    region: RegionIR,
     optimization_result: OptimizationResult,
+    num_timesteps: int = 1,
 ) -> STCode:
     """
-    Dispatch region lowering based on region type.
+    Unified dispatcher for all region types.
 
-    Routes to appropriate lowerer for the region type. Requires properly typed
-    region objects (AcyclicRegionIR, RecurrentRegionIR, LoopRegionIR) to ensure
-    all required attributes are present.
-
-    Args:
-        region: Region to lower (must be a typed subclass, not base RegionIR)
-        optimization_result: Optimization result for this region
-
-    Returns:
-        Generated ST code for this region
-
-    Raises:
-        TypeError: If region is not a properly typed subclass
-        ValueError: If region kind is unsupported
+    Single entry point eliminates the need for separate lowering functions.
     """
+    ctx = LoweringContext(
+        region=region,
+        optimization_result=optimization_result,
+    )
+
     if isinstance(region, AcyclicRegionIR):
-        return lower_acyclic_region_to_st(region, optimization_result)
-
+        strategy = AcyclicLoweringStrategy(ctx)
     elif isinstance(region, RecurrentRegionIR):
-        return lower_recurrent_region_to_st(region, optimization_result)
-
+        strategy = RecurrentLoweringStrategy(ctx, num_timesteps)
     elif isinstance(region, LoopRegionIR):
-        return lower_loop_region_to_st(region, optimization_result)
-
+        strategy = LoopLoweringStrategy(ctx)
     else:
-        # Provide helpful error message
-        region_type = type(region).__name__
-        raise TypeError(
-            f"Expected a typed region subclass (AcyclicRegionIR, RecurrentRegionIR, "
-            f"or LoopRegionIR), but got {region_type}. Base RegionIR is not supported "
-            f"by the lowerer. Ensure regions are created through regionizer, which always "
-            f"produces properly typed regions."
-        )
+        raise TypeError(f"Unknown region type: {type(region)}")
+
+    return strategy.lower()

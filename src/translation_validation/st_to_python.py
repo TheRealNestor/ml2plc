@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Tuple, List
 
 # Update import path based on your project structure
-from python_builder import PyCodeBuilder
+from .python_builder import PyCodeBuilder
 
 
 def translate_st_to_python(st_code: str) -> Tuple[str, str]:
@@ -213,6 +213,10 @@ def translate_expression(expr: str) -> str:
     # Replace functions
     expr = re.sub(r"MAX\((.+?),\s*(.+?)\)", r"max(\1, \2)", expr)
     expr = re.sub(r"EXP\((.+?)\)", r"exp(\1)", expr)
+
+    # Replace type conversion functions (identity functions in Python)
+    expr = re.sub(r"DINT_TO_LINT\((.+?)\)", r"\1", expr)
+    expr = re.sub(r"LINT_TO_DINT\((.+?)\)", r"\1", expr)
 
     # Replace operators
     expr = expr.replace(":=", "=")

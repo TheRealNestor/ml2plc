@@ -37,6 +37,9 @@ import subprocess
 import sys
 import argparse
 
+# Add parent directory to path for base_model import
+sys.path.insert(0, str(Path(__file__).parent))
+from base_model import MLModel
 
 # ── Temperature thresholds (shared with other example models) ──────────────
 COLD_THRESHOLD = 10.0
@@ -44,7 +47,7 @@ HOT_THRESHOLD = 30.0
 CLASS_NAMES = ["Cold (≤10°C)", "Normal (10-30°C)", "Hot (>30°C)"]
 
 
-class ResNetTemperatureModel:
+class ResNetTemperatureModel(MLModel):
     """
     A tiny ResNet-style classifier for temperature sensor readings.
 
@@ -73,8 +76,8 @@ class ResNetTemperatureModel:
         self.models_dir.mkdir(exist_ok=True)
 
         if model_name is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_name = f"resnet_temp_{timestamp}"
+            date_str = datetime.now().strftime("%d%m%Y")
+            model_name = f"resnet_model_{date_str}"
 
         self.model_name = model_name
         self.model_path = self.models_dir / f"{model_name}.keras"
@@ -274,6 +277,55 @@ class ResNetTemperatureModel:
             return True
         print(f"Model not found: {self.model_path}")
         return False
+
+    def export_to_onnx(self, output_path: str | None = None) -> str:
+        """Export model to ONNX format using tf2onnx."""
+        if output_path is None:
+            # Save ONNX to examples/models/onnx
+            onnx_dir = Path("examples/models/onnx")
+            onnx_dir.mkdir(exist_ok=True)
+            # Extract date from model name (e.g., "resnet_model_10042026" -> "10042026")
+            date_part = self.model_path.stem.split("_")[-1]
+            output_path = str(onnx_dir / f"resnet_model_{date_part}.onnx")
+
+        Path(output_path).parent.mkdir(exist_ok=True)
+
+        # Create temporary SavedModel for tf2onnx conversion
+        saved_model_dir = Path(self.model_path.parent) / ".tmp_saved_model"
+        tf.saved_model.save(self.model, str(saved_model_dir))
+
+        try:
+            import subprocess
+            import sys
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "tf2onnx.convert",
+                "--saved-model",
+                str(saved_model_dir),
+                "--output",
+                output_path,
+                "--opset",
+                "13",
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            # Clean up temporary SavedModel
+            import shutil
+
+            if saved_model_dir.exists():
+                shutil.rmtree(saved_model_dir)
+
+            if result.returncode == 0:
+                return output_path
+            else:
+                print(f"Export failed:\n{result.stderr}")
+                raise RuntimeError(f"ONNX export failed: {result.stderr}")
+        except Exception as e:
+            print(f"Error exporting to ONNX: {e}")
+            raise
 
     # ── Prediction / demo ─────────────────────────────────────────────────
 

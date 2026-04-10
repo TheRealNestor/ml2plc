@@ -46,6 +46,14 @@ class BaseLayer:
 
     # State role for RNN/LSTM/GRU layers (e.g., "state_input", "state_output", None)
     state_role: Optional[str] = None
+    
+    # For multi-output layers: mapping of output tensor name to ONNX output index
+    # E.g., for LSTM: {"Y": 0, "Y_h": 1, "Y_c": 2}
+    output_indices: Dict[str, int] = field(default_factory=dict)
+    
+    # Which output this layer generates code for (primary/used output)
+    # E.g., for LSTM used in sequence processing: "Y"
+    primary_output: Optional[str] = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -288,8 +296,12 @@ class LSTMLayer(BaseLayer):
     - Outputs: [Y, Y_h, Y_c]
     - Attributes: activation_alpha, activation_beta, activations, clip, direction, hidden_size
 
+    The IR layer stores which ONNX outputs are used (via output_indices) and which is
+    the primary output being generated (via primary_output).
+
     Attributes:
         hidden_size: Number of hidden units (h dimension)
+        sequence_length: Length of input sequence
         W: Input weight matrix (num_directions, 4*hidden_size, input_size)
         R: Recurrent weight matrix (num_directions, 4*hidden_size, hidden_size)
         B: Bias vectors (num_directions, 8*hidden_size) [W_bias + R_bias]
@@ -297,6 +309,10 @@ class LSTMLayer(BaseLayer):
         activations: List of activation function types (default: ["Sigmoid", "Tanh", "Tanh"])
         direction: "forward", "reverse", or "bidirectional"
         clip: Optional clipping threshold for cell state
+        output_indices: Dict mapping output tensor names to ONNX output indices
+                        E.g., {"Y": 0, "Y_h": 1, "Y_c": 2} (inherited from BaseLayer)
+        primary_output: Which output is generated (e.g., "Y" for full sequence)
+                        (inherited from BaseLayer)
     """
 
     hidden_size: int
@@ -317,6 +333,9 @@ class GRULayer(BaseLayer):
 
     GRU is a simplified RNN variant with reset and update gates.
 
+    The IR layer stores which ONNX outputs are used (via output_indices) and which is
+    the primary output being generated (via primary_output).
+
     Attributes:
         hidden_size: Number of hidden units
         W: Input weight matrix (num_directions, 3*hidden_size, input_size)
@@ -325,6 +344,10 @@ class GRULayer(BaseLayer):
         activations: List of activation function types (default: ["Sigmoid", "Tanh"])
         direction: "forward", "reverse", or "bidirectional"
         clip: Optional clipping threshold
+        output_indices: Dict mapping output tensor names to ONNX output indices
+                        E.g., {"Y": 0, "Y_h": 1} (inherited from BaseLayer)
+        primary_output: Which output is generated (e.g., "Y" for full sequence)
+                        (inherited from BaseLayer)
     """
 
     hidden_size: int

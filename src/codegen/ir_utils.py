@@ -56,6 +56,31 @@ class TensorMapBuilder:
                 builder.producers[out] = layer.name
         return builder
 
+    @staticmethod
+    def from_graph(graph: NetworkIR) -> "TensorMapBuilder":
+        """
+        Build from NetworkIR (explicit contract with NetworkIR structure).
+
+        This factory method is clearer than passing separate dicts.
+        Centralizes the assumption that NetworkIR has pre-built maps.
+
+        Args:
+            graph: NetworkIR instance
+
+        Returns:
+            TensorMapBuilder with maps from graph
+
+        Example:
+            builder = TensorMapBuilder.from_graph(ir)
+            component_builder = builder.extract_for_nodes(component_nodes)
+        """
+        builder = TensorMapBuilder()
+        builder.producers = graph.tensor_producers.copy()
+        builder.consumers = defaultdict(list)
+        for tensor, consumers in graph.tensor_consumers.items():
+            builder.consumers[tensor] = list(consumers)
+        return builder
+
     def extract_for_nodes(self, component_nodes: Set[str]) -> "TensorMapBuilder":
         """
         Extract a filtered builder containing only tensors for a component subset.

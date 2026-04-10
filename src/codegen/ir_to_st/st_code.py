@@ -1,10 +1,14 @@
 """
-Helpers to represent and manipulate Structured Text code snippets.
+Core Structured Text code representation and building utilities.
+
+Provides:
+  - STCode: Immutable representation of ST code blocks
+  - STCodeBuilder: Chainable builder with automatic indentation management
+  - Comments: ST comment generation
 """
 
-
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Tuple, Optional, List
 from contextlib import contextmanager
 
 
@@ -90,6 +94,27 @@ class STCodeBuilder:
         finally:
             self._indent_level -= 1
 
+    def add_comment(self, text: str) -> "STCodeBuilder":
+        """Add a single-line comment and return self for chaining."""
+        return self.add_line(f"(* {text} *)")
+
     def build(self) -> STCode:
         """Get the final STCode."""
         return self._code
+
+
+# ============================================================================
+# Common ST Comments
+# ============================================================================
+
+
+def st_comment(text: str) -> STCode:
+    """Create a single-line ST comment."""
+    return STCode.from_lines(f"(* {text} *)")
+
+
+def st_multiline_comment(lines: List[str]) -> STCode:
+    """Create a multi-line ST comment block."""
+    if not lines:
+        return STCode.empty()
+    return STCode.from_lines("(*", *[f"  {line}" for line in lines], "*)")

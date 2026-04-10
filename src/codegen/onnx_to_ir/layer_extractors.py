@@ -631,6 +631,10 @@ def extract_squeeze_layer(
     input_size = int(np.prod(input_shape)) if input_shape else 0
     output_size = int(np.prod(output_shape)) if output_shape else 0
 
+    logger.info(
+        f"Squeeze '{layer['name']}': input_shape={input_shape} (size={input_size}), output_shape={output_shape} (size={output_size})"
+    )
+
     # Squeeze is a reshape — total element count must be preserved.
     # If they differ, it's a shape inference issue; use the consistent value.
     # TODO: If this is always an inference issue, it may be better to simply throw an exception! Fail fast!
@@ -697,6 +701,10 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
     # Input tensor properties
     input_shape, output_shape = infer_layer_shapes(layer)
     input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    logger.info(
+        f"LSTM '{layer['name']}': input_shape={input_shape} (size={input_size}), output_shape={output_shape} (size={output_size}), hidden_size={hidden_size}"
+    )
 
     # Extract weights from inputs
     # Input 0: X (sequence data)
@@ -833,11 +841,39 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
         f"input_size={actual_input_size}, hidden_size={hidden_size}, "
         f"W={W.shape}, R={R.shape}, B={'None' if B is None else B.shape}"
     )
+    logger.info(
+        f"LSTM '{layer['name']}' outputs: {[t.name for t in layer['resolved_outputs']]} (count={len(layer['resolved_outputs'])})"
+    )
 
     # Extract activations
     activations = tuple(attrs.get("activations", ["Sigmoid", "Tanh", "Tanh"]))
     direction = attrs.get("direction", "forward")
     clip = attrs.get("clip")
+
+    # ── Build output index mapping ──────────────────────────────────────────
+    # ONNX LSTM has outputs: [Y, Y_h, Y_c]
+    # Map output tensor names to their indices
+    resolved_output_names = [t.name for t in layer["resolved_outputs"]]
+    output_indices = {name: idx for idx, name in enumerate(resolved_output_names)}
+
+    # ── Determine primary output ────────────────────────────────────────────
+    # The IR only uses the first output (Y - full sequence)
+    # Map from ONNX output index to output type: [Y, Y_h, Y_c]
+    # Determine which output is used by finding the first resolved output
+    # For now, assume the first output is the primary one (Y)
+    output_type_map = {0: "Y", 1: "Y_h", 2: "Y_c"}
+    primary_output = "Y"  # Default to Y (full sequence)
+
+    # If we have output_indices mapping tensor name to index, find the primary
+    if output_indices:
+        # The first entry in output_indices corresponds to the primary output
+        first_idx = min(output_indices.values()) if output_indices else 0
+        primary_output = output_type_map.get(first_idx, "Y")
+
+    logger.debug(
+        f"LSTM '{layer['name']}': primary_output={primary_output} "
+        f"(output_indices={output_indices})"
+    )
 
     return LSTMLayer(
         layer_id=layer_id,
@@ -860,6 +896,8 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
         activations=activations,
         direction=direction,
         clip=clip,
+        output_indices=output_indices,
+        primary_output=primary_output,
     )
 
 
@@ -926,6 +964,22 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
     direction = attrs.get("direction", "forward")
     clip = attrs.get("clip")
 
+    # ── Build output index mapping ──────────────────────────────────────────
+    # ONNX GRU has outputs: [Y, Y_h]
+    # Map output tensor names to their indices
+    resolved_output_names = [t.name for t in layer["resolved_outputs"]]
+    output_indices = {name: idx for idx, name in enumerate(resolved_output_names)}
+
+    logger.debug(
+        f"GRU '{layer['name']}': output_indices={output_indices}, "
+        f"primary_output=Y (full sequence)"
+    )
+
+    # ── Determine primary output ────────────────────────────────────────────
+    # The IR only uses the first output (Y - full sequence)
+    # Other output (Y_h) is internal to the RNN
+    primary_output = resolved_output_names[0] if resolved_output_names else "Y"
+
     return GRULayer(
         layer_id=layer_id,
         name=layer["name"],
@@ -945,6 +999,8 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
         activations=activations,
         direction=direction,
         clip=clip,
+        output_indices=output_indices,
+        primary_output=primary_output,
     )
 
 
@@ -960,11 +1016,12 @@ def _extract_cast_layer(enriched_layer: Dict, layer_id: int, analyzer) -> CastLa
     np_dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE.get(to_type, np.float32)
     target_type_str = str(np_dtype)
 
+    # Infer shapes using the proper inference logic
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
     resolved_in = enriched_layer["resolved_inputs"]
     resolved_out = enriched_layer["resolved_outputs"]
-
-    input_size = resolved_in[0].size if resolved_in else 1
-    output_size = resolved_out[0].size if resolved_out else input_size
 
     input_dtype = resolved_in[0].dtype if resolved_in else None
     output_dtype = target_type_str
@@ -977,16 +1034,8 @@ def _extract_cast_layer(enriched_layer: Dict, layer_id: int, analyzer) -> CastLa
         output_size=output_size,
         inputs=tuple(enriched_layer["inputs"]),
         outputs=tuple(enriched_layer["outputs"]),
-        input_shape=(
-            tuple(resolved_in[0].shape)
-            if resolved_in and resolved_in[0].shape
-            else None
-        ),
-        output_shape=(
-            tuple(resolved_out[0].shape)
-            if resolved_out and resolved_out[0].shape
-            else None
-        ),
+        input_shape=input_shape,
+        output_shape=output_shape,
         input_type=input_dtype,
         output_type=output_dtype,
         target_type=target_type_str,
@@ -1010,9 +1059,50 @@ def _extract_slice_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Slice
     axes = _get_const_list(3, list(range(len(starts))))
     steps = _get_const_list(4, [1] * len(starts))
 
+    # Infer shapes using the proper inference logic
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    logger.debug(
+        f"Slice '{enriched_layer.get('name')}' (layer {layer_id}): "
+        f"input_shape={input_shape} → output_shape={output_shape}, "
+        f"starts={starts}, ends={ends}, axes={axes}, steps={steps}"
+    )
+
+    # ── Normalize negative indices ──────────────────────────────────────────
+    # ONNX allows negative indices (e.g., -1 for last element)
+    # Structured Text doesn't support negative indices, so we must convert them
+    # to positive indices based on the dimension size
+    normalized_starts = []
+    normalized_ends = []
+
+    for i, axis in enumerate(axes):
+        if input_shape and axis < len(input_shape):
+            dim_size = input_shape[axis]
+        else:
+            dim_size = 2**31  # Fallback for unknown dimensions
+
+        start = starts[i] if i < len(starts) else 0
+        end = ends[i] if i < len(ends) else dim_size
+
+        # Handle negative indices
+        if start < 0:
+            start = max(0, dim_size + start)
+        if end < 0:
+            end = max(0, dim_size + end)
+
+        # Clamp to valid range
+        start = max(0, min(start, dim_size))
+        end = max(0, min(end, dim_size))
+
+        normalized_starts.append(start)
+        normalized_ends.append(end)
+
+    logger.debug(
+        f"  Slice normalized: starts={normalized_starts}, ends={normalized_ends}"
+    )
+
     data_input = resolved_in[0] if resolved_in else None
-    input_size = data_input.size if data_input else 1
-    output_size = resolved_out[0].size if resolved_out else input_size
 
     # Only the data tensor is a runtime input; the rest are parameters
     runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
@@ -1025,18 +1115,12 @@ def _extract_slice_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Slice
         output_size=output_size,
         inputs=runtime_inputs,
         outputs=tuple(enriched_layer["outputs"]),
-        input_shape=(
-            tuple(data_input.shape) if data_input and data_input.shape else None
-        ),
-        output_shape=(
-            tuple(resolved_out[0].shape)
-            if resolved_out and resolved_out[0].shape
-            else None
-        ),
+        input_shape=input_shape,
+        output_shape=output_shape,
         input_type=data_input.dtype if data_input else None,
         output_type=resolved_out[0].dtype if resolved_out else None,
-        starts=[int(s) for s in starts],
-        ends=[int(e) for e in ends],
+        starts=normalized_starts,
+        ends=normalized_ends,
         axes=[int(a) for a in axes],
         steps=[int(s) for s in steps],
     )
@@ -1093,8 +1177,15 @@ def _extract_unsqueeze_layer(
         attrs = enriched_layer.get("attributes", {})
         axes = attrs.get("axes", [])
 
+    # Infer shapes using the proper inference logic
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    logger.info(
+        f"Unsqueeze '{enriched_layer.get('name')}': input_shape={input_shape} (size={input_size}), output_shape={output_shape} (size={output_size}), axes={axes}"
+    )
+
     data_input = resolved_in[0] if resolved_in else None
-    input_size = data_input.size if data_input else 1
 
     # Only the data tensor is a runtime input
     runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
@@ -1104,17 +1195,11 @@ def _extract_unsqueeze_layer(
         name=enriched_layer.get("name") or f"unsqueeze_{layer_id}",
         op_type="Unsqueeze",
         input_size=input_size,
-        output_size=input_size,  # same element count
+        output_size=output_size,
         inputs=runtime_inputs,
         outputs=tuple(enriched_layer["outputs"]),
-        input_shape=(
-            tuple(data_input.shape) if data_input and data_input.shape else None
-        ),
-        output_shape=(
-            tuple(resolved_out[0].shape)
-            if resolved_out and resolved_out[0].shape
-            else None
-        ),
+        input_shape=input_shape,
+        output_shape=output_shape,
         input_type=data_input.dtype if data_input else None,
         output_type=data_input.dtype if data_input else None,
         unsqueeze_axes=[int(a) for a in axes],
@@ -1126,16 +1211,16 @@ def _extract_expand_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Expa
     resolved_in = enriched_layer["resolved_inputs"]
     resolved_out = enriched_layer["resolved_outputs"]
 
+    # Infer shapes using the proper inference logic
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
     # Target shape from second input (always a constant)
+    target_shape = ()
     if len(resolved_in) > 1 and resolved_in[1].value is not None:
         target_shape = tuple(int(s) for s in resolved_in[1].value.flatten().tolist())
-        output_size = int(np.prod(target_shape)) if target_shape else 1
-    else:
-        target_shape = ()
-        output_size = resolved_out[0].size if resolved_out else 1
 
     data_input = resolved_in[0] if resolved_in else None
-    input_size = data_input.size if data_input else 1
 
     # Only the data tensor is a runtime input
     runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
@@ -1159,14 +1244,8 @@ def _extract_expand_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Expa
         output_size=output_size,
         inputs=runtime_inputs,
         outputs=tuple(enriched_layer["outputs"]),
-        input_shape=(
-            tuple(data_input.shape) if data_input and data_input.shape else None
-        ),
-        output_shape=(
-            tuple(resolved_out[0].shape)
-            if resolved_out and resolved_out[0].shape
-            else None
-        ),
+        input_shape=input_shape,
+        output_shape=output_shape,
         input_type=data_input.dtype if data_input else None,
         output_type=output_dtype,
         target_shape=target_shape,
