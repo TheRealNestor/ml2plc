@@ -35,12 +35,17 @@ class TensorResolver:
     3. Resolving weight tensors (including dequantized weights)
     4. Determining dtypes for computation
 
-    It does NOT perform operation-specific shape inference - that's in shape_inference.py
+    It does NOT perform operation-specific shape inference - that's in `onnx_to_ir.shape`.
     """
 
-    def __init__(self, analyzer: ONNXModel):
+    def __init__(
+        self,
+        analyzer: ONNXModel,
+        compile_time_constants: Optional[Dict[str, np.ndarray]] = None,
+    ):
         self.analyzer = analyzer
         self.inferred_shapes: Dict[str, Tuple[int, ...]] = {}
+        self.compile_time_constants = compile_time_constants or {}
 
         # Initialize with network input shapes
         input_info, _ = analyzer.get_input_output_info()
@@ -87,24 +92,32 @@ class TensorResolver:
         self, tensor_name: str, computation_dtype: str, is_output: bool = False
     ) -> ResolvedTensor:
         """
-        Resolve a single tensor (input or output).
+            Resolve a single tensor (input or output).
 
-        Shape resolution priority:
-        1. Actual numpy array shape (for weights)
-        2. Previously inferred shape (from earlier layers)
-        3. ONNX tensor_info static shape
-        4. Empty tuple (will be inferred by shape_inference.py later)
+            Shape resolution priority:
+            1. Actual numpy array shape (for weights)
+            2. Previously inferred shape (from earlier layers)
+            3. ONNX tensor_info static shape
+        4. Empty tuple (will be inferred by the shape engine later)
 
-        Args:
-            tensor_name: Name of the tensor
-            computation_dtype: Fallback dtype for computation
-            is_output: Whether this is an output tensor
+            Args:
+                tensor_name: Name of the tensor
+                computation_dtype: Fallback dtype for computation
+                is_output: Whether this is an output tensor
         """
         tensor_info = self.analyzer.tensor_info.get(tensor_name, {})
 
         # Check if this is a weight
         is_weight = tensor_name in self.analyzer.weights
         weight_value = self.analyzer.weights.get(tensor_name)
+
+        # Compile-time constants from constant-folding should behave like weights
+        # for extraction purposes (e.g., Reshape target shapes).
+        if not is_weight and weight_value is None:
+            folded_value = self.compile_time_constants.get(tensor_name)
+            if folded_value is not None:
+                weight_value = folded_value
+                is_weight = True
 
         # Try to get dequantized weight if not found directly
         if not is_weight and weight_value is None:
@@ -203,7 +216,7 @@ class TensorResolver:
         }
 
     def store_inferred_shape(self, tensor_name: str, shape: Tuple[int, ...]):
-        """Store an inferred shape for a tensor (from shape_inference.py)."""
+        """Store an inferred shape for a tensor (from `onnx_to_ir.shape`)."""
         if shape:
             self.inferred_shapes[tensor_name] = shape
             logger.debug(f"Stored inferred shape: {tensor_name} -> {shape}")

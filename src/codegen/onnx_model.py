@@ -163,6 +163,22 @@ class ONNXModel:
         self.tensor_info = tensor_info
         logger.info(f"Extracted tensor info for {len(self.tensor_info)} tensors.")
 
+    def refresh_after_model_mutation(self):
+        """Refresh all cached analysis after in-place graph/model changes.
+
+        Use this after any pass mutates `self.model` (for example shape
+        canonicalization), so `tensor_info`, `weights`, and `layers` stay
+        synchronized with the current ModelProto.
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded.")
+
+        self.graph = self.model.graph
+        self._build_tensor_info()
+        self.extract_weights()
+        self.layers = []
+        self.analyze_layers()
+
     def extract_weights(self) -> Dict[str, np.ndarray]:
         """
         Extract all weights and constants from the model.

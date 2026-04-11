@@ -184,6 +184,28 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
 
     # Elementwise and data movement
     registry.register(AddLayer, gen.generate_add_code, wrap_single_input=False)
+    registry.register(
+        ReduceMeanLayer, gen.generate_reduce_mean_code, wrap_single_input=True
+    )
+    registry.register(
+        ReduceProdLayer, gen.generate_reduce_prod_code, wrap_single_input=True
+    )
+    registry.register(
+        RuntimeMatMulLayer,
+        gen.generate_runtime_matmul_code,
+        wrap_single_input=False,
+    )
+    registry.register(EinsumLayer, gen.generate_einsum_code, wrap_single_input=True)
+    registry.register(
+        BinaryElementwiseLayer,
+        gen.generate_binary_elementwise_code,
+        wrap_single_input=False,
+    )
+    registry.register(
+        UnaryElementwiseLayer,
+        gen.generate_unary_elementwise_code,
+        wrap_single_input=True,
+    )
     registry.register(ReshapeLayer, gen.generate_reshape_code, wrap_single_input=True)
     registry.register(FlattenLayer, gen.generate_flatten_code, wrap_single_input=True)
     registry.register(SqueezeLayer, gen.generate_squeeze_code, wrap_single_input=True)

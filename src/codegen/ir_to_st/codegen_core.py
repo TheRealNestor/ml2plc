@@ -21,6 +21,7 @@ from .layer_constants import (
     generate_layer_weights,
     generate_layer_bias,
     generate_layer_quantization_params,
+    generate_layer_rhs_constants,
 )
 from .utils.constant_helpers import (
     generate_array_constant,
@@ -121,6 +122,11 @@ def generate_constants_section(network: NetworkIR) -> STCode:
                 if quant_params.lines:
                     code += quant_params.indent()
 
+        # Binary elementwise RHS constants
+        rhs_constants = generate_layer_rhs_constants(layer)
+        if rhs_constants.lines:
+            code += rhs_constants.indent()
+
         # BatchNorm parameters
         if isinstance(layer, BatchNormLayer):
             bn_code = generate_batchnorm_constants(layer)
@@ -201,6 +207,13 @@ def generate_merged_constants_section(
                         if const_name not in added_constants:
                             code += quant_params.indent()
                             added_constants.add(const_name)
+
+            rhs_constants = generate_layer_rhs_constants(layer)
+            if rhs_constants.lines:
+                const_name = f"rhs_const_{layer.layer_id}"
+                if const_name not in added_constants:
+                    code += rhs_constants.indent()
+                    added_constants.add(const_name)
 
             if isinstance(layer, BatchNormLayer):
                 scale_name = f"bn_scale_{layer.layer_id}"

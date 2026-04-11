@@ -12,6 +12,7 @@ from .utils.constant_helpers import (
     generate_gru_weights_constants,
     generate_bias_constant,
     generate_quantization_params,
+    generate_array_constant,
 )
 
 
@@ -41,3 +42,24 @@ def generate_layer_bias(layer) -> STCode:
 def generate_layer_quantization_params(layer) -> STCode:
     """Generate quantization parameters."""
     return generate_quantization_params(layer)
+
+
+def generate_layer_rhs_constants(layer) -> STCode:
+    """Generate RHS constant declarations for binary elementwise layers."""
+    from ..types import BinaryElementwiseLayer, EinsumLayer
+
+    if isinstance(layer, EinsumLayer):
+        return generate_array_constant(
+            f"einsum_rhs_{layer.layer_id}",
+            layer.rhs_const,
+            "REAL",
+        )
+
+    if not isinstance(layer, BinaryElementwiseLayer) or layer.rhs_const is None:
+        return STCode.empty()
+
+    return generate_array_constant(
+        f"rhs_const_{layer.layer_id}",
+        layer.rhs_const,
+        "REAL",
+    )

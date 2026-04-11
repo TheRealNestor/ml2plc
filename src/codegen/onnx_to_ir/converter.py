@@ -13,10 +13,16 @@ from onnx import numpy_helper, TensorProto
 from ..types import NetworkIR, BaseLayer
 from ..onnx_model import ONNXModel
 from ..graph_algorithms import condensation_execution_order, topo_sort_onnx_nodes
+from ..shape_semantics import ShapeSemanticsTracker
 from .tensor_resolution import TensorResolver, ResolvedTensor
-from .shape_inference import infer_layer_shapes
+from .shape import (
+    infer_layer_shapes,
+    validate_model_shapes,
+    ShapeValidationError,
+)
 from .layer_extractors import LAYER_EXTRACTORS
 from .state_detection import detect_state_tensors
+from .einsum_lowering import lower_supported_einsum_layers
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +316,17 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
     """
     logger.info("Converting ONNX model to IR...")
 
+    # ✅ LAYER 1: GROUND TRUTH EXTRACTION & VALIDATION
+    # Run shape validation BEFORE any layer extraction to fail fast if model
+    # has unresolvable dynamic dimensions (e.g., dynamic batch size)
+    try:
+        resolution_report = validate_model_shapes(analyzer.model)
+        if resolution_report.modified:
+            analyzer.refresh_after_model_mutation()
+    except ShapeValidationError as e:
+        logger.error(str(e))
+        raise
+
     # --- Constant-folding pre-pass ---
     # Collect all known constant tensors (initializers + Constant nodes)
     constant_values = _collect_constant_values(analyzer.model)
@@ -346,8 +363,21 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
             f"Constant folding: resolved {folded_count} tensor(s) at compile time"
         )
 
+    # --- Einsum lowering pass (pattern-driven canonicalization) ---
+    working_layers, einsum_report = lower_supported_einsum_layers(
+        analyzer.layers,
+        analyzer,
+        constant_values,
+    )
+    if einsum_report.lowered_count:
+        logger.info(
+            "Einsum lowering: lowered %d node(s) to core ops",
+            einsum_report.lowered_count,
+        )
+
     # --- Main layer extraction ---
-    resolver = TensorResolver(analyzer)
+    resolver = TensorResolver(analyzer, compile_time_constants=constant_values)
+    shape_semantics = ShapeSemanticsTracker(constant_values)
     input_info, output_info = analyzer.get_input_output_info()
     input_tensors = tuple(input_info["names"])
     output_tensors = tuple(output_info["names"])
@@ -358,7 +388,7 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
     unsupported_ops: Dict[str, List[int]] = defaultdict(list)  # op_type -> [layer_ids]
 
     # Process each layer
-    for layer_id, layer_dict in enumerate(analyzer.layers):
+    for layer_id, layer_dict in enumerate(working_layers):
 
         node_outputs = layer_dict.get("outputs", [])
         op_type = layer_dict.get("op_type", "")
@@ -371,6 +401,7 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
             continue
 
         enriched_layer = resolver.resolve_layer_tensors(layer_dict)
+        enriched_layer["_shape_semantics"] = shape_semantics
         _, output_shape = infer_layer_shapes(enriched_layer)
 
         for out_name in enriched_layer["outputs"]:
@@ -389,6 +420,8 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
                 for out in enriched_layer["resolved_outputs"]
             ]
 
+        shape_semantics.record_layer(enriched_layer)
+
         op_type = enriched_layer["op_type"]
         if op_type in LAYER_EXTRACTORS:
             try:
@@ -400,6 +433,13 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
                     tensor_consumers[inp].append(ir_layer.name)
                 for out in ir_layer.outputs:
                     tensor_producers[out] = ir_layer.name
+
+            except NotImplementedError as e:
+                unsupported_ops[op_type].append(layer_id)
+                logger.warning(
+                    f"Skipping unsupported op '{op_type}' at layer {layer_id} "
+                    f"({layer_dict.get('name', '?')}): {e}"
+                )
 
             except Exception as e:
                 logger.error(f"Failed to extract layer {layer_id} ({op_type}): {e}")

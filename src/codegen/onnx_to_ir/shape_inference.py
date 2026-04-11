@@ -1,14 +1,458 @@
+"""Legacy module intentionally disabled.
+
+Use `codegen.onnx_to_ir.shape` as the only supported shape API surface.
+"""
+
+raise ModuleNotFoundError(
+    "`codegen.onnx_to_ir.shape_inference` has been removed. "
+    "Import from `codegen.onnx_to_ir.shape` instead."
+)
+
 """
 Central shape inference for IR construction.
 Infers shapes from operation semantics when ONNX shape info is incomplete.
 I.e. infer output shape based on the operation (after tensors are resolved, during layer extraction).
+
+Three-Layer Architecture:
+  Layer 1: GROUND TRUTH EXTRACTION & VALIDATION
+    - Runs BEFORE layer extraction
+    - Identifies all dynamic dimensions (0 in shape)
+    - Attempts to resolve using heuristics
+
+  Layer 2: DIMENSION RESOLUTION (infer dynamic batch dims as 1)
+    - Dynamic batch dimension (0 in position 0) → resolve to 1
+    - Other dynamic dimensions → fail with actionable error
+
+  Layer 3: OPERATION-SPECIFIC INFERENCE
+    - Infer output given ALREADY RESOLVED inputs
+    - No fallbacks, no heuristics - just pure inference
 """
 
 import numpy as np
 import logging
 from typing import Tuple, Optional, List, Dict, Any
+from dataclasses import dataclass
+import onnx
+from onnx import numpy_helper
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# LAYER 1: GROUND TRUTH EXTRACTION & VALIDATION
+# ============================================================================
+
+
+class ShapeValidationError(ValueError):
+    """Raised when shapes cannot be resolved for PLC compilation."""
+
+    def __init__(
+        self,
+        tensor_name: str,
+        issue: str,
+        shape: Tuple[int, ...],
+        suggestions: Optional[List[str]] = None,
+    ):
+        self.tensor_name = tensor_name
+        self.issue = issue
+        self.shape = shape
+        self.suggestions = suggestions or []
+
+        msg = (
+            f"\n╔════════════════════════════════════════════════════════════════╗\n"
+            f"║         SHAPE VALIDATION FAILED - Cannot Compile to ST         ║\n"
+            f"╚════════════════════════════════════════════════════════════════╝\n\n"
+            f"Tensor: '{tensor_name}' has shape {shape}\n"
+            f"Issue: {issue}\n"
+        )
+
+        if self.suggestions:
+            msg += "\nSolutions:\n"
+            for i, suggestion in enumerate(self.suggestions, 1):
+                msg += f"  ✓ Option {i}: {suggestion}\n"
+        else:
+            msg += (
+                "\nNote: Structured Text requires all tensor dimensions to be "
+                "statically known at compile time.\n"
+            )
+
+        super().__init__(msg)
+
+
+@dataclass(frozen=True)
+class ShapeResolutionReport:
+    """Summary of model-level shape resolution done during validation."""
+
+    dynamic_tensors_found: int
+    resolved_dimensions: int
+    modified: bool
+
+
+def validate_model_shapes(model: onnx.ModelProto) -> ShapeResolutionReport:
+    """
+    PRE-PASS VALIDATOR: Ensure all tensors can be resolved to concrete shapes.
+
+    This runs BEFORE any layer extraction and:
+    1. Identifies all dynamic dimensions (0 in shape)
+    2. Attempts to resolve them using heuristics
+    3. Fails early with actionable errors if unresolvable
+
+    For PLC code generation, all dimensions must be concrete at compile time.
+    Dynamic batch dimensions (0 in position 0) are automatically resolved to 1.
+
+    Returns:
+        ShapeResolutionReport summarizing whether the graph was mutated.
+
+    Raises:
+        ShapeValidationError if unresolvable dynamic dimensions found
+    """
+    # First ask ONNX to populate as much shape information as possible.
+    # This gives us the strongest "provided shape info first" baseline.
+    _run_onnx_shape_inference_inplace(model)
+
+    dynamic_tensors = _find_dynamic_tensors(model)
+    initial_dynamic_tensor_count = len(dynamic_tensors)
+
+    if not dynamic_tensors:
+        logger.info("✓ All tensor shapes are concrete (no dynamic dims found)")
+        return ShapeResolutionReport(
+            dynamic_tensors_found=0,
+            resolved_dimensions=0,
+            modified=False,
+        )
+
+    # Step 1: Resolve unknown dims from already-provided static shape hints
+    # on other occurrences of the same tensor (input/output/value_info).
+    static_hint_resolutions = _resolve_dims_from_provided_shapes(model, dynamic_tensors)
+    modified_dims = _apply_resolved_dimensions(model, static_hint_resolutions)
+
+    # Step 2: Resolve the common PLC-safe case: dynamic batch dim -> 1.
+    dynamic_tensors = _find_dynamic_tensors(model)
+    batch_resolutions = _resolve_dynamic_batch_dims(dynamic_tensors)
+    modified_dims += _apply_resolved_dimensions(model, batch_resolutions)
+
+    # Step 3: Resolve recurrent state dimensions from op attributes.
+    # ONNX RNN-family ops (LSTM/GRU/RNN) frequently carry hidden_size as an
+    # attribute while some connected tensors may still appear dynamic in
+    # value_info/input metadata (e.g., (1, 0)).
+    dynamic_tensors = _find_dynamic_tensors(model)
+    recurrent_resolutions = _resolve_recurrent_state_dims(model, dynamic_tensors)
+    modified_dims += _apply_resolved_dimensions(model, recurrent_resolutions)
+
+    # Re-run shape inference so upstream resolutions propagate through value_info.
+    if modified_dims > 0:
+        _run_onnx_shape_inference_inplace(model)
+
+    remaining_dynamic = _find_dynamic_tensors(model)
+
+    if not remaining_dynamic:
+        logger.info(
+            f"✓ Resolved {modified_dims} dynamic dimension(s) "
+            f"(provided shapes + inferred batch size = 1)"
+        )
+        return ShapeResolutionReport(
+            dynamic_tensors_found=initial_dynamic_tensor_count,
+            resolved_dimensions=modified_dims,
+            modified=modified_dims > 0,
+        )
+
+    # If we get here, there are unresolvable dimensions
+    # Find the first one for error reporting
+    unresolvable = remaining_dynamic
+    first_tensor = list(unresolvable.keys())[0]
+    first_shape = unresolvable[first_tensor]
+
+    # Find positions of dynamic dimensions
+    dyn_pos = [i for i, d in enumerate(first_shape) if d == 0]
+
+    suggestions = [
+        "Fix model to use concrete dimension:\n"
+        "    - For batch dimension (position 0): add batch_size=1 to Input()\n"
+        "    - For other dimensions: model accepts variable-length sequences\n"
+        "    - For PLC compilation, all dims must be static at export time",
+        "Provide static input/output signatures where possible so ONNX shape inference "
+        "can propagate concrete dimensions through the graph",
+        "Use onnx-simplifier to resolve shapes:\n"
+        "    pip install onnx-simplifier\n"
+        "    onnxsim model.onnx out.onnx --input-shape 'input:1,20,1'",
+    ]
+
+    raise ShapeValidationError(
+        tensor_name=first_tensor,
+        issue=f"Unresolvable dynamic dimension at position {dyn_pos[0]}: {first_shape}",
+        shape=first_shape,
+        suggestions=suggestions,
+    )
+
+
+def _run_onnx_shape_inference_inplace(model: onnx.ModelProto) -> None:
+    """Run ONNX shape inference and copy results back into the same model object."""
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model)
+        model.CopyFrom(inferred)
+    except Exception as e:
+        logger.warning(f"ONNX shape inference failed during validation: {e}")
+
+
+def _iter_tensor_value_infos(model: onnx.ModelProto):
+    """Yield all ValueInfoProto-like entries carrying tensor shapes."""
+    for inp in model.graph.input:
+        yield inp
+    for out in model.graph.output:
+        yield out
+    for vi in model.graph.value_info:
+        yield vi
+
+
+def _resolve_dims_from_provided_shapes(
+    model: onnx.ModelProto,
+    dynamic_tensors: Dict[str, Tuple[int, ...]],
+) -> Dict[str, Dict[int, int]]:
+    """Resolve dynamic dims using static hints already present in the model."""
+    known_by_tensor_and_axis: Dict[str, Dict[int, int]] = {}
+
+    # Collect known static dims for each tensor at each axis.
+    for value in _iter_tensor_value_infos(model):
+        dims = value.type.tensor_type.shape.dim
+        axis_map = known_by_tensor_and_axis.setdefault(value.name, {})
+        for idx, dim in enumerate(dims):
+            if dim.dim_value > 0:
+                axis_map[idx] = dim.dim_value
+
+    resolved: Dict[str, Dict[int, int]] = {}
+    for tensor_name, shape in dynamic_tensors.items():
+        axis_map = known_by_tensor_and_axis.get(tensor_name, {})
+        for idx, dim in enumerate(shape):
+            if dim == 0 and idx in axis_map and axis_map[idx] > 0:
+                resolved.setdefault(tensor_name, {})[idx] = axis_map[idx]
+
+    return resolved
+
+
+def _resolve_dynamic_batch_dims(
+    dynamic_tensors: Dict[str, Tuple[int, ...]],
+) -> Dict[str, Dict[int, int]]:
+    """Resolve dynamic batch dimensions (axis 0) to 1."""
+    resolved: Dict[str, Dict[int, int]] = {}
+
+    for tensor_name, shape in dynamic_tensors.items():
+        if len(shape) > 0 and shape[0] == 0:
+            resolved.setdefault(tensor_name, {})[0] = 1
+
+    return resolved
+
+
+def _resolve_recurrent_state_dims(
+    model: onnx.ModelProto,
+    dynamic_tensors: Dict[str, Tuple[int, ...]],
+) -> Dict[str, Dict[int, int]]:
+    """
+    Resolve unresolved state-vector dims from recurrent operator hidden_size.
+
+    Applies when a tensor with dynamic dims is consumed only by ONNX recurrent
+    ops (LSTM/GRU/RNN) that agree on a positive hidden_size attribute.
+    """
+    if not dynamic_tensors:
+        return {}
+
+    recurrent_ops = {"LSTM", "GRU", "RNN"}
+    transparent_ops = {
+        "Identity",
+        "Transpose",
+        "Reshape",
+        "Squeeze",
+        "Unsqueeze",
+        "Concat",
+        "Slice",
+        "Gather",
+        "Cast",
+        "Expand",
+        "Shape",
+        "ConstantOfShape",
+        "Tile",
+    }
+    consumers_by_tensor: Dict[str, List[onnx.NodeProto]] = {}
+
+    for node in model.graph.node:
+        for inp in node.input:
+            if inp:
+                consumers_by_tensor.setdefault(inp, []).append(node)
+
+    resolved: Dict[str, Dict[int, int]] = {}
+
+    for tensor_name, shape in dynamic_tensors.items():
+        zero_axes = [i for i, dim in enumerate(shape) if dim == 0]
+        if not zero_axes:
+            continue
+
+        hidden_sizes = _find_reachable_recurrent_hidden_sizes(
+            tensor_name,
+            consumers_by_tensor,
+            recurrent_ops=recurrent_ops,
+            transparent_ops=transparent_ops,
+        )
+
+        if len(hidden_sizes) != 1:
+            continue
+
+        hidden_size = next(iter(hidden_sizes))
+
+        # Prefer resolving the semantic hidden axis (usually the last axis).
+        hidden_axis: Optional[int] = None
+        if len(shape) > 0 and shape[-1] == 0:
+            hidden_axis = len(shape) - 1
+
+        tensor_resolution = resolved.setdefault(tensor_name, {})
+
+        if hidden_axis is not None:
+            tensor_resolution[hidden_axis] = hidden_size
+
+        # Remaining dynamic axes in recurrent-context tensors are typically
+        # sequence/batch placeholders. For PLC compilation we concretize them
+        # to 1 (same policy as leading dynamic batch).
+        for axis in zero_axes:
+            if axis == hidden_axis:
+                continue
+            if axis in (0, 1):
+                tensor_resolution[axis] = 1
+
+        if not tensor_resolution:
+            resolved.pop(tensor_name, None)
+
+    return resolved
+
+
+def _find_reachable_recurrent_hidden_sizes(
+    tensor_name: str,
+    consumers_by_tensor: Dict[str, List[onnx.NodeProto]],
+    *,
+    recurrent_ops: set,
+    transparent_ops: set,
+    max_depth: int = 8,
+) -> set:
+    """Find hidden_size values of recurrent ops reachable through transparent ops."""
+    hidden_sizes = set()
+    visited_tensors = {tensor_name}
+    frontier = [(tensor_name, 0)]
+
+    while frontier:
+        current_tensor, depth = frontier.pop(0)
+        consumers = consumers_by_tensor.get(current_tensor, [])
+
+        for node in consumers:
+            if node.op_type in recurrent_ops:
+                hidden_size = next(
+                    (
+                        int(attr.i)
+                        for attr in node.attribute
+                        if attr.name == "hidden_size" and int(attr.i) > 0
+                    ),
+                    0,
+                )
+                if hidden_size > 0:
+                    hidden_sizes.add(hidden_size)
+                continue
+
+            if node.op_type not in transparent_ops or depth >= max_depth:
+                continue
+
+            for out_name in node.output:
+                if not out_name or out_name in visited_tensors:
+                    continue
+                visited_tensors.add(out_name)
+                frontier.append((out_name, depth + 1))
+
+    return hidden_sizes
+
+
+def _apply_resolved_dimensions(
+    model: onnx.ModelProto,
+    resolutions: Dict[str, Dict[int, int]],
+) -> int:
+    """Apply resolved axis values to graph input/output/value_info tensors."""
+    if not resolutions:
+        return 0
+
+    modifications = 0
+
+    for value in _iter_tensor_value_infos(model):
+        tensor_resolutions = resolutions.get(value.name)
+        if not tensor_resolutions:
+            continue
+
+        dims = value.type.tensor_type.shape.dim
+        for axis, target in tensor_resolutions.items():
+            if axis >= len(dims) or target <= 0:
+                continue
+
+            dim = dims[axis]
+            if dim.dim_value != target or dim.dim_param:
+                dim.ClearField("dim_param")
+                dim.dim_value = target
+                modifications += 1
+
+    return modifications
+
+
+def _find_dynamic_tensors(model: onnx.ModelProto) -> Dict[str, Tuple[int, ...]]:
+    """Find all tensors with dynamic (0) dimensions in the ONNX model."""
+    dynamic_tensors: Dict[str, Tuple[int, ...]] = {}
+
+    # Check graph inputs
+    for inp in model.graph.input:
+        shape = tuple(
+            dim.dim_value if dim.dim_value > 0 else 0
+            for dim in inp.type.tensor_type.shape.dim
+        )
+        if 0 in shape:
+            dynamic_tensors[inp.name] = shape
+
+    # Check graph outputs
+    for output in model.graph.output:
+        shape = tuple(
+            dim.dim_value if dim.dim_value > 0 else 0
+            for dim in output.type.tensor_type.shape.dim
+        )
+        if 0 in shape:
+            dynamic_tensors[output.name] = shape
+
+    # Check intermediate tensors (skip weights/initializers)
+    initializer_names = {init.name for init in model.graph.initializer}
+    for vi in model.graph.value_info:
+        shape = tuple(
+            dim.dim_value if dim.dim_value > 0 else 0
+            for dim in vi.type.tensor_type.shape.dim
+        )
+        if 0 in shape and vi.name not in initializer_names:
+            dynamic_tensors[vi.name] = shape
+
+    return dynamic_tensors
+
+
+def _attempt_resolve_dynamic_shapes(
+    model: onnx.ModelProto, dynamic_tensors: Dict[str, Tuple[int, ...]]
+) -> Dict[str, Tuple[int, ...]]:
+    """
+    Attempt to resolve dynamic dimensions.
+
+    Strategy: Dynamic batch dimensions (0 in position 0) are resolved to 1.
+    Other dynamic dimensions are considered unresolvable.
+
+    Returns:
+        Dict mapping tensor_name -> resolved_shape for successfully resolved tensors
+    """
+    # Backward-compatible shim for older callers; this module now uses
+    # dimension-level resolution + in-place graph mutation.
+    resolved: Dict[str, Tuple[int, ...]] = {}
+    batch_resolutions = _resolve_dynamic_batch_dims(dynamic_tensors)
+    for tensor_name, shape in dynamic_tensors.items():
+        axis_map = batch_resolutions.get(tensor_name, {})
+        if not axis_map:
+            continue
+        resolved_shape = tuple(axis_map.get(i, d) for i, d in enumerate(shape))
+        resolved[tensor_name] = resolved_shape
+
+    return resolved
 
 
 def infer_matmul_output_shape(
@@ -17,28 +461,55 @@ def infer_matmul_output_shape(
     """
     Infer output shape for MatMul operation.
 
-    MatMul: (M, K) @ (K, N) -> (M, N)
-    For batched: (..., M, K) @ (K, N) -> (..., M, N)
+    ONNX MatMul follows NumPy matmul semantics.
+    This implementation supports vector/matrix/batched variants and returns
+    a static output shape whenever both input shapes are static.
 
-    For our PLC use case, we flatten batches, so:
-    (K,) @ (K, N) -> (N,)
+    For scalar outputs (e.g., (K,) @ (K,)), return (1,) so downstream PLC
+    codegen does not treat it as an "empty" shape.
     """
-    if not weight_shape or len(weight_shape) < 2:
-        logger.warning(f"Invalid weight shape for MatMul: {weight_shape}")
+    if not input_shape or not weight_shape:
+        logger.warning(f"Invalid shapes for MatMul: {input_shape} @ {weight_shape}")
         return ()
 
-    # Weight is always 2D: (input_features, output_features)
-    output_features = weight_shape[1]
+    a = tuple(input_shape)
+    b = tuple(weight_shape)
 
-    if not input_shape:
-        return (output_features,)
+    if len(a) == 1 and len(b) == 1:
+        # Dot product -> scalar (represented as one-element tensor in this IR)
+        return (1,)
 
-    # For PLCs, we typically work with flattened 1D inputs
-    # Keep batch dimensions if present, replace last dim with output_features
-    if len(input_shape) > 1:
-        return (*input_shape[:-1], output_features)
-    else:
-        return (output_features,)
+    if len(a) == 1 and len(b) >= 2:
+        # (K,) @ (..., K, N) -> (..., N)
+        if a[0] != b[-2]:
+            logger.warning(f"MatMul mismatch: {a} @ {b}")
+            return ()
+        batch = b[:-2]
+        return (*batch, b[-1]) if batch else (b[-1],)
+
+    if len(a) >= 2 and len(b) == 1:
+        # (..., M, K) @ (K,) -> (..., M)
+        if a[-1] != b[0]:
+            logger.warning(f"MatMul mismatch: {a} @ {b}")
+            return ()
+        out = a[:-1]
+        return out if out else (1,)
+
+    # General batched matrix multiply: (..., M, K) @ (..., K, N) -> (..., M, N)
+    if a[-1] != b[-2]:
+        logger.warning(f"MatMul mismatch: {a} @ {b}")
+        return ()
+
+    a_batch = a[:-2]
+    b_batch = b[:-2]
+
+    try:
+        batch = np.broadcast_shapes(a_batch, b_batch)
+    except ValueError:
+        logger.warning(f"MatMul batch broadcast mismatch: {a_batch} vs {b_batch}")
+        return ()
+
+    return (*batch, a[-2], b[-1])
 
 
 # TODO: input shape is only needed for batch dim? consider removing this
@@ -384,6 +855,37 @@ def infer_expand_output_shape(
     return input_shape
 
 
+def infer_reduce_mean_output_shape(
+    input_shape: Tuple[int, ...],
+    axes: Tuple[int, ...],
+    keepdims: bool,
+) -> Tuple[int, ...]:
+    """Infer output shape for ReduceMean with static axes."""
+    if not input_shape:
+        return ()
+
+    rank = len(input_shape)
+    if not axes:
+        axes = tuple(range(rank))
+
+    norm_axes = []
+    for ax in axes:
+        a = int(ax)
+        if a < 0:
+            a += rank
+        if 0 <= a < rank:
+            norm_axes.append(a)
+
+    if keepdims:
+        out = list(input_shape)
+        for a in norm_axes:
+            out[a] = 1
+        return tuple(out)
+
+    out = [d for i, d in enumerate(input_shape) if i not in set(norm_axes)]
+    return tuple(out) if out else (1,)
+
+
 def infer_reshape_output_shape(
     input_shape: Tuple[int, ...], target_shape: Optional[Tuple[int, ...]]
 ) -> Tuple[int, ...]:
@@ -422,11 +924,251 @@ def infer_reshape_output_shape(
     return target_shape
 
 
+def infer_einsum_output_shape(
+    equation: str,
+    lhs_shape: Tuple[int, ...],
+    rhs_shape: Tuple[int, ...],
+) -> Tuple[int, ...]:
+    """Infer output shape for supported Einsum equations."""
+    if equation != "abcd,cde->abe":
+        return lhs_shape
+
+    if len(rhs_shape) != 3:
+        return lhs_shape
+
+    c_dim, d_dim, e_dim = rhs_shape
+
+    if len(lhs_shape) == 4 and lhs_shape[2] == c_dim and lhs_shape[3] == d_dim:
+        return (lhs_shape[0], lhs_shape[1], e_dim)
+
+    lhs_size = int(np.prod(lhs_shape)) if lhs_shape else 0
+    contract = c_dim * d_dim
+    if contract <= 0:
+        return (1, 1, e_dim)
+
+    ab = max(1, int(np.ceil(lhs_size / contract))) if lhs_size > 0 else 1
+    return (1, ab, e_dim)
+
+
+def _extract_reshape_target_shape(
+    resolved_inputs: List[Any],
+) -> Optional[Tuple[int, ...]]:
+    """Extract target shape tuple for Reshape from constant shape tensor."""
+    if len(resolved_inputs) <= 1:
+        return None
+
+    shape_tensor = resolved_inputs[1]
+    if not shape_tensor.is_weight or shape_tensor.value is None:
+        return None
+
+    return tuple(int(d) for d in shape_tensor.value if int(d) != 0)
+
+
+def _is_onnx_output_shape_consistent(
+    op_type: str,
+    input_shape: Tuple[int, ...],
+    output_shape: Tuple[int, ...],
+    resolved_inputs: List[Any],
+    layer_dict: Dict[str, Any],
+) -> bool:
+    """Return True if ONNX-provided output shape is compatible with op semantics."""
+    if not output_shape:
+        return False
+
+    try:
+        if op_type == "Reshape":
+            target_shape = _extract_reshape_target_shape(resolved_inputs)
+            if target_shape is None:
+                return True
+
+            inferred = infer_reshape_output_shape(input_shape, target_shape)
+            if not inferred:
+                return False
+
+            # Reshape must preserve element count.
+            return int(np.prod(output_shape)) == int(np.prod(inferred))
+
+        if op_type == "MatMul" and len(resolved_inputs) > 1:
+            inferred = infer_matmul_output_shape(input_shape, resolved_inputs[1].shape)
+            return inferred == output_shape
+
+        if op_type in ["Gemm", "FusedGemm"] and len(resolved_inputs) > 1:
+            attrs = layer_dict.get("attributes", {})
+            transB = attrs.get("transB", 0) == 1
+            inferred = infer_gemm_output_shape(
+                input_shape, resolved_inputs[1].shape, transB
+            )
+            return inferred == output_shape
+    except Exception:
+        return False
+
+    # For all other ops we trust ONNX shape info.
+    return True
+
+
+def _primary_input_shape(resolved_inputs: List[Any]) -> Tuple[int, ...]:
+    """Get primary data input shape (skip weights when possible)."""
+    data_input = next((inp for inp in resolved_inputs if not inp.is_weight), None)
+    if data_input is None and resolved_inputs:
+        data_input = resolved_inputs[0]
+    return data_input.shape if data_input and data_input.shape else ()
+
+
+def _first_resolved_output_shape(resolved_outputs: List[Any]) -> Tuple[int, ...]:
+    """Get first ONNX-resolved output shape if present."""
+    if resolved_outputs and resolved_outputs[0].shape:
+        return tuple(resolved_outputs[0].shape)
+    return ()
+
+
+def _extract_int_tuple_from_input(
+    resolved_inputs: List[Any],
+    input_index: int,
+) -> Tuple[int, ...]:
+    """Extract tuple[int] from constant tensor input if available."""
+    if len(resolved_inputs) <= input_index:
+        return ()
+    value = resolved_inputs[input_index].value
+    if value is None:
+        return ()
+    return tuple(int(v) for v in value.flatten().tolist())
+
+
+def _infer_output_shape_from_semantics(
+    op_type: str,
+    input_shape: Tuple[int, ...],
+    resolved_inputs: List[Any],
+    resolved_outputs: List[Any],
+    attrs: Dict[str, Any],
+) -> Tuple[int, ...]:
+    """Infer output shape from op semantics with centralized dispatch logic."""
+    passthrough_ops = {
+        "Dropout",
+        "Relu",
+        "Sigmoid",
+        "Tanh",
+        "Softmax",
+        "QuantizeLinear",
+        "DequantizeLinear",
+        "Cast",
+        "Sqrt",
+        "Reciprocal",
+    }
+    resolved_preferred_ops = {"Sub", "Mul", "Max", "Concat", "Gather", "Shape"}
+
+    if op_type in passthrough_ops:
+        return input_shape
+
+    if op_type in resolved_preferred_ops:
+        return _first_resolved_output_shape(resolved_outputs) or input_shape
+
+    if op_type == "MatMul":
+        if len(resolved_inputs) < 2:
+            return input_shape
+        return infer_matmul_output_shape(input_shape, resolved_inputs[1].shape)
+
+    if op_type in ["Gemm", "FusedGemm"]:
+        if len(resolved_inputs) < 2:
+            return input_shape
+        transB = attrs.get("transB", 0) == 1
+        return infer_gemm_output_shape(input_shape, resolved_inputs[1].shape, transB)
+
+    if op_type == "Add":
+        if len(resolved_inputs) > 1:
+            return infer_add_output_shape(input_shape, resolved_inputs[1].shape)
+        return input_shape
+
+    if op_type == "Reshape":
+        target_shape = _extract_reshape_target_shape(resolved_inputs)
+        return infer_reshape_output_shape(input_shape, target_shape)
+
+    if op_type == "Conv":
+        if len(resolved_inputs) < 2:
+            return input_shape
+        strides = tuple(attrs.get("strides", [1, 1]))
+        pads = tuple(attrs.get("pads", [0, 0, 0, 0]))
+        dilations = tuple(attrs.get("dilations", [1, 1]))
+        return infer_conv2d_output_shape(
+            input_shape,
+            resolved_inputs[1].shape,
+            strides,
+            pads,
+            dilations,
+        )
+
+    if op_type in ["MaxPool", "AveragePool"]:
+        kernel_shape = tuple(attrs.get("kernel_shape", [2, 2]))
+        strides = tuple(attrs.get("strides", [1, 1]))
+        pads = tuple(attrs.get("pads", [0, 0, 0, 0]))
+        return infer_pool2d_output_shape(input_shape, kernel_shape, strides, pads)
+
+    if op_type == "GlobalAveragePool":
+        return infer_global_avg_pool_output_shape(input_shape)
+
+    if op_type == "Flatten":
+        axis = attrs.get("axis", 1)
+        return infer_flatten_output_shape(input_shape, axis)
+
+    if op_type == "Transpose":
+        perm = tuple(attrs.get("perm", ()))
+        return infer_transpose_output_shape(input_shape, perm)
+
+    if op_type == "BatchNormalization":
+        return infer_batchnorm_output_shape(input_shape)
+
+    if op_type == "Squeeze":
+        axes = tuple(attrs.get("axes", ()))
+        if not axes and len(resolved_inputs) > 1 and resolved_inputs[1].is_weight:
+            axes_val = resolved_inputs[1].value
+            if axes_val is not None:
+                axes = tuple(int(a) for a in axes_val)
+        if axes and any(a > 0 for a in axes):
+            axes = tuple(a - 1 for a in axes if a != 0)
+        return infer_squeeze_output_shape(input_shape, axes)
+
+    if op_type == "Unsqueeze":
+        axes = _extract_int_tuple_from_input(resolved_inputs, 1)
+        if not axes:
+            axes = tuple(attrs.get("axes", ()))
+        return infer_unsqueeze_output_shape(input_shape, axes)
+
+    if op_type == "Slice":
+        starts = _extract_int_tuple_from_input(resolved_inputs, 1)
+        ends = _extract_int_tuple_from_input(resolved_inputs, 2)
+        axes = _extract_int_tuple_from_input(resolved_inputs, 3)
+        steps = _extract_int_tuple_from_input(resolved_inputs, 4)
+        return infer_slice_output_shape(input_shape, starts, ends, axes, steps)
+
+    if op_type == "Expand":
+        target_shape = _extract_int_tuple_from_input(resolved_inputs, 1)
+        return infer_expand_output_shape(input_shape, target_shape or None)
+
+    if op_type in {"ReduceMean", "ReduceProd"}:
+        axes = tuple(int(a) for a in attrs.get("axes", ()))
+        keepdims = bool(attrs.get("keepdims", 1))
+        return infer_reduce_mean_output_shape(input_shape, axes, keepdims)
+
+    if op_type == "Einsum":
+        equation = str(attrs.get("equation", ""))
+        rhs_shape = (
+            tuple(resolved_inputs[1].shape)
+            if len(resolved_inputs) > 1 and resolved_inputs[1].shape
+            else ()
+        )
+        return infer_einsum_output_shape(equation, input_shape, rhs_shape)
+
+    logger.warning(f"No shape inference for op_type '{op_type}', using input shape")
+    return input_shape
+
+
 def infer_layer_shapes(
     layer_dict: Dict[str, Any],
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """
     Infer input and output shapes for a layer based on operation type.
+
+    PRECONDITION: All input tensors must have concrete shapes (no 0 dimensions).
+    If this precondition is violated, that's a bug in the shape validation pass.
 
     This is the main entry point for shape inference. It tries to use ONNX
     tensor_info shapes first, and falls back to operation-specific inference.
@@ -440,180 +1182,48 @@ def infer_layer_shapes(
     op_type = layer_dict["op_type"]
     resolved_inputs = layer_dict["resolved_inputs"]
     resolved_outputs = layer_dict["resolved_outputs"]
+    attrs = layer_dict.get("attributes", {})
 
-    # Get input shape (first data tensor, skip weights)
-    data_input = None
+    # ✅ SAFETY CHECK: Ensure no dynamic dimensions slip through
     for inp in resolved_inputs:
-        if not inp.is_weight:
-            data_input = inp
-            break
+        if inp.shape and 0 in inp.shape:
+            raise RuntimeError(
+                f"BUG in shape validation: infer_layer_shapes received input "
+                f"'{inp.name}' with dynamic dimension {inp.shape}. "
+                f"This should have been caught by validate_model_shapes()."
+            )
 
-    if data_input is None:
-        data_input = resolved_inputs[0]
-
-    input_shape = data_input.shape if data_input.shape else ()
+    input_shape = _primary_input_shape(resolved_inputs)
 
     # Try to get shape from ONNX tensor_info first
-    output_tensor_info_shape = resolved_outputs[0].shape if resolved_outputs else ()
+    output_tensor_info_shape = _first_resolved_output_shape(resolved_outputs)
 
-    # If output shape is valid (has at least one dimension), use it
-    if output_tensor_info_shape:
+    # If output shape is valid and semantically consistent, use it.
+    if output_tensor_info_shape and _is_onnx_output_shape_consistent(
+        op_type,
+        input_shape,
+        output_tensor_info_shape,
+        resolved_inputs,
+        layer_dict,
+    ):
         logger.debug(f"{op_type}: Using ONNX output shape {output_tensor_info_shape}")
         return input_shape, output_tensor_info_shape
 
+    if output_tensor_info_shape:
+        logger.debug(
+            f"{op_type}: Ignoring inconsistent ONNX output shape "
+            f"{output_tensor_info_shape}, falling back to op inference"
+        )
+
     # Otherwise, infer from operation semantics
     logger.debug(f"{op_type}: Inferring output shape (ONNX shape empty)")
-
-    if op_type == "MatMul":
-        weight_tensor = resolved_inputs[1]
-        output_shape = infer_matmul_output_shape(input_shape, weight_tensor.shape)
-
-    elif op_type in ["Gemm", "FusedGemm"]:
-        weight_tensor = resolved_inputs[1]
-        attrs = layer_dict.get("attributes", {})
-        transB = attrs.get("transB", 0) == 1
-        output_shape = infer_gemm_output_shape(input_shape, weight_tensor.shape, transB)
-    elif op_type == "Dropout":
-        output_shape = input_shape
-
-    elif op_type in ["Relu", "Sigmoid", "Tanh"]:
-        output_shape = input_shape
-
-    elif op_type == "Softmax":
-        output_shape = input_shape
-
-    elif op_type == "Add":
-        # Check if second input is bias
-        if len(resolved_inputs) > 1:
-            bias_tensor = resolved_inputs[1]
-            output_shape = infer_add_output_shape(input_shape, bias_tensor.shape)
-        else:
-            output_shape = input_shape
-
-    elif op_type == "Reshape":
-        # Try to get target shape from second input (shape tensor)
-        target_shape = None
-        if len(resolved_inputs) > 1 and resolved_inputs[1].is_weight:
-            shape_array = resolved_inputs[1].value
-            if shape_array is not None:
-                # Filter out 0 and keep positive dimensions, convert -1
-                target_shape = tuple(int(d) for d in shape_array if d != 0)
-        output_shape = infer_reshape_output_shape(input_shape, target_shape)
-
-    elif op_type == "QuantizeLinear":
-        output_shape = input_shape
-
-    elif op_type == "DequantizeLinear":
-        output_shape = input_shape
-
-    elif op_type == "Conv":
-        weight_tensor = resolved_inputs[1]
-        attrs = layer_dict.get("attributes", {})
-        strides = tuple(attrs.get("strides", [1, 1]))
-        pads = tuple(attrs.get("pads", [0, 0, 0, 0]))
-        dilations = tuple(attrs.get("dilations", [1, 1]))
-        output_shape = infer_conv2d_output_shape(
-            input_shape, weight_tensor.shape, strides, pads, dilations
-        )
-
-    elif op_type in ["MaxPool", "AveragePool"]:
-        attrs = layer_dict.get("attributes", {})
-        kernel_shape = tuple(attrs.get("kernel_shape", [2, 2]))
-        strides = tuple(attrs.get("strides", [1, 1]))
-        pads = tuple(attrs.get("pads", [0, 0, 0, 0]))
-        output_shape = infer_pool2d_output_shape(
-            input_shape, kernel_shape, strides, pads
-        )
-
-    elif op_type == "GlobalAveragePool":
-        output_shape = infer_global_avg_pool_output_shape(input_shape)
-
-    elif op_type == "Flatten":
-        attrs = layer_dict.get("attributes", {})
-        axis = attrs.get("axis", 1)
-        output_shape = infer_flatten_output_shape(input_shape, axis)
-
-    elif op_type == "Transpose":
-        attrs = layer_dict.get("attributes", {})
-        perm = tuple(attrs.get("perm", ()))
-        output_shape = infer_transpose_output_shape(input_shape, perm)
-
-    elif op_type == "BatchNormalization":
-        output_shape = infer_batchnorm_output_shape(input_shape)
-
-    elif op_type == "Squeeze":
-        # Axes can come from attributes (opset < 13) or from a constant input
-        attrs = layer_dict.get("attributes", {})
-        axes = tuple(attrs.get("axes", ()))
-        if not axes and len(resolved_inputs) > 1 and resolved_inputs[1].is_weight:
-            axes_val = resolved_inputs[1].value
-            if axes_val is not None:
-                axes = tuple(int(a) for a in axes_val)
-        # Adjust for batch-dim-stripped shapes
-        if axes and any(a > 0 for a in axes):
-            axes = tuple(a - 1 for a in axes if a != 0)
-        output_shape = infer_squeeze_output_shape(input_shape, axes)
-
-    elif op_type == "Cast":
-        # Cast preserves shape, only changes dtype
-        output_shape = infer_cast_output_shape(input_shape)
-
-    elif op_type == "Unsqueeze":
-        # Extract axes from second input (opset 13+) or attribute (opset < 13)
-        axes = ()
-        if len(resolved_inputs) > 1 and resolved_inputs[1].value is not None:
-            axes = tuple(int(a) for a in resolved_inputs[1].value.flatten().tolist())
-        else:
-            attrs = layer_dict.get("attributes", {})
-            axes = tuple(attrs.get("axes", ()))
-        output_shape = infer_unsqueeze_output_shape(input_shape, axes)
-
-    elif op_type == "Slice":
-        # Extract slice parameters (starts, ends, axes, steps)
-        starts = ()
-        ends = ()
-        axes = ()
-        steps = ()
-
-        if len(resolved_inputs) > 1 and resolved_inputs[1].value is not None:
-            starts = tuple(int(s) for s in resolved_inputs[1].value.flatten().tolist())
-        if len(resolved_inputs) > 2 and resolved_inputs[2].value is not None:
-            ends = tuple(int(e) for e in resolved_inputs[2].value.flatten().tolist())
-        if len(resolved_inputs) > 3 and resolved_inputs[3].value is not None:
-            axes = tuple(int(a) for a in resolved_inputs[3].value.flatten().tolist())
-        if len(resolved_inputs) > 4 and resolved_inputs[4].value is not None:
-            steps = tuple(int(s) for s in resolved_inputs[4].value.flatten().tolist())
-
-        output_shape = infer_slice_output_shape(input_shape, starts, ends, axes, steps)
-
-    elif op_type == "Expand":
-        # Extract target shape from second input (always a constant)
-        target_shape = None
-        if len(resolved_inputs) > 1 and resolved_inputs[1].value is not None:
-            target_shape = tuple(
-                int(s) for s in resolved_inputs[1].value.flatten().tolist()
-            )
-        output_shape = infer_expand_output_shape(input_shape, target_shape)
-
-    elif op_type == "Concat":
-        # Try resolved output shape first
-        if resolved_outputs and resolved_outputs[0].shape:
-            output_shape = resolved_outputs[0].shape
-        else:
-            # Fallback: sum sizes along concat axis
-            # For now, return input shape (conservative estimate)
-            output_shape = input_shape
-
-    elif op_type in ("Gather", "Shape"):
-        # These require more complex inference, use resolved output if available
-        if resolved_outputs and resolved_outputs[0].shape:
-            output_shape = resolved_outputs[0].shape
-        else:
-            output_shape = input_shape
-
-    else:
-        logger.warning(f"No shape inference for op_type '{op_type}', using input shape")
-        output_shape = input_shape
+    output_shape = _infer_output_shape_from_semantics(
+        op_type,
+        input_shape,
+        resolved_inputs,
+        resolved_outputs,
+        attrs,
+    )
 
     logger.debug(f"{op_type}: Inferred {input_shape} -> {output_shape}")
     return input_shape, output_shape
@@ -691,7 +1301,7 @@ def validate_inferred_shapes(
         logger.warning(f"Layer {layer_name} ({op_type}): Input shape is empty")
 
     # Operation-specific validation
-    if op_type in ["MatMul", "Gemm", "FusedGemm"] and weight_shape:
+    if op_type in ["Gemm", "FusedGemm"] and weight_shape:
         if len(weight_shape) != 2:
             raise ValueError(
                 f"Layer {layer_name} ({op_type}): "
@@ -709,5 +1319,20 @@ def validate_inferred_shapes(
                     f"Dimension mismatch - input features {input_features} "
                     f"!= weight input features {weight_input_features}"
                 )
+
+    if op_type == "MatMul" and weight_shape and input_shape:
+        if len(weight_shape) < 1:
+            raise ValueError(
+                f"Layer {layer_name} ({op_type}): Invalid RHS shape {weight_shape}"
+            )
+
+        rhs_contract = weight_shape[-2] if len(weight_shape) >= 2 else weight_shape[0]
+        lhs_contract = input_shape[-1]
+        if lhs_contract != rhs_contract:
+            raise ValueError(
+                f"Layer {layer_name} ({op_type}): "
+                f"Dimension mismatch - lhs contract dim {lhs_contract} "
+                f"!= rhs contract dim {rhs_contract}"
+            )
 
     return True

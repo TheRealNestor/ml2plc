@@ -42,7 +42,12 @@ Example:
 from .converter import onnx_to_ir
 from .regionizer import regionize_network_ir
 from .tensor_resolution import TensorResolver, ResolvedTensor
-from .shape_inference import infer_layer_shapes, get_feature_sizes
+from .shape import (
+    infer_layer_shapes,
+    get_feature_sizes,
+    validate_model_shapes,
+    ShapeValidationError,
+)
 from .layer_extractors import LAYER_EXTRACTORS
 
 __all__ = [
@@ -52,5 +57,7 @@ __all__ = [
     "ResolvedTensor",
     "infer_layer_shapes",
     "get_feature_sizes",
+    "validate_model_shapes",
+    "ShapeValidationError",
     "LAYER_EXTRACTORS",
 ]

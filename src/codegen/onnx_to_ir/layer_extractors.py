@@ -7,17 +7,35 @@ import numpy as np
 import logging
 from typing import Dict, List
 from ..types import *
-from .shape_inference import (
+from .shape import (
     infer_layer_shapes,
     get_feature_sizes,
     validate_inferred_shapes,
 )
+from ..matmul_contract import validate_runtime_matmul_contract
 from .weight_utils import extract_quantized_weight, validate_weight_quantization
 from ..onnx_model import ONNXModel
+from .tensor_resolution import ResolvedTensor
 import onnx
 from onnx import TensorProto
 
 logger = logging.getLogger(__name__)
+
+
+def _build_weight_lookup(
+    resolved_inputs: List[ResolvedTensor], analyzer: ONNXModel
+) -> Dict[str, np.ndarray]:
+    """Build layer-local weight lookup with resolved constants overlay.
+
+    This keeps extraction pure and avoids mutating global analyzer state.
+    Values already resolved by TensorResolver (including compile-time constants)
+    take precedence over analyzer initializers for the current layer.
+    """
+    lookup = dict(analyzer.weights)
+    for tensor in resolved_inputs:
+        if tensor.is_weight and tensor.value is not None:
+            lookup[tensor.name] = tensor.value
+    return lookup
 
 
 def extract_activation_layer(
@@ -78,13 +96,55 @@ def extract_add_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> AddLay
     )
 
 
-def extract_matmul_layer(
-    layer: Dict, layer_id: int, analyzer: ONNXModel
-) -> MatMulLayer:
+def extract_matmul_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> BaseLayer:
     """Extract MatMul layer."""
     inputs = layer["resolved_inputs"]
 
+    if len(inputs) < 2:
+        raise ValueError(f"MatMul layer {layer_id}: requires 2 inputs")
+
     input_shape, output_shape = infer_layer_shapes(layer)
+
+    if not inputs[1].is_weight:
+        rhs_shape = tuple(inputs[1].shape or ())
+        try:
+            contract = validate_runtime_matmul_contract(
+                tuple(input_shape or ()),
+                rhs_shape,
+                context=f"Runtime MatMul layer {layer_id} ({layer['name']})",
+            )
+        except ValueError as exc:
+            semantics = layer.get("_shape_semantics")
+            if semantics is not None and len(inputs) >= 2:
+                lhs_name = inputs[0].name
+                rhs_name = inputs[1].name
+                msg = str(exc)
+                msg += (
+                    f"\nLineage (lhs='{lhs_name}'):\n"
+                    f"{semantics.format_lineage(lhs_name)}"
+                    f"\nLineage (rhs='{rhs_name}'):\n"
+                    f"{semantics.format_lineage(rhs_name)}"
+                )
+                raise ValueError(msg) from exc
+            raise
+        output_shape = contract.output_shape
+        input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+        return RuntimeMatMulLayer(
+            layer_id=layer_id,
+            name=layer["name"],
+            op_type=layer["op_type"],
+            input_size=input_size,
+            output_size=output_size,
+            inputs=(inputs[0].name, inputs[1].name),
+            outputs=tuple(t.name for t in layer["resolved_outputs"]),
+            input_shape=input_shape,
+            output_shape=output_shape,
+            input_type=inputs[0].dtype,
+            output_type=layer["resolved_outputs"][0].dtype,
+            rhs_shape=rhs_shape,
+        )
+
     input_size, output_size = get_feature_sizes(input_shape, output_shape)
 
     validate_inferred_shapes(
@@ -92,7 +152,9 @@ def extract_matmul_layer(
     )
 
     weights, scale, zero_point = extract_quantized_weight(
-        inputs[1].name, analyzer.layers, analyzer.weights
+        inputs[1].name,
+        analyzer.layers,
+        _build_weight_lookup(inputs, analyzer),
     )
 
     validate_weight_quantization(weights, scale, zero_point, input_size, output_size)
@@ -128,7 +190,9 @@ def extract_gemm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> GemmL
     )
 
     weights, scale, zero_point = extract_quantized_weight(
-        inputs[1].name, analyzer.layers, analyzer.weights
+        inputs[1].name,
+        analyzer.layers,
+        _build_weight_lookup(inputs, analyzer),
     )
 
     validate_weight_quantization(weights, scale, zero_point, input_size, output_size)
@@ -171,7 +235,9 @@ def extract_fused_gemm_layer(
     )
 
     weights, scale, zero_point = extract_quantized_weight(
-        inputs[1].name, analyzer.layers, analyzer.weights
+        inputs[1].name,
+        analyzer.layers,
+        _build_weight_lookup(inputs, analyzer),
     )
 
     validate_weight_quantization(weights, scale, zero_point, input_size, output_size)
@@ -206,11 +272,30 @@ def extract_reshape_layer(
     """Extract Reshape layer."""
     inputs = layer["resolved_inputs"]
 
-    if not inputs[1].is_weight or inputs[1].value is None:
-        raise ValueError(f"Reshape layer {layer_id}: Target shape must be constant")
+    target_shape = None
+    if len(inputs) > 1 and inputs[1].is_weight and inputs[1].value is not None:
+        target_shape = tuple(int(dim) for dim in inputs[1].value)
+    elif layer.get("resolved_outputs") and layer["resolved_outputs"][0].shape:
+        # Fallback: if shape tensor is not constant but output shape is already
+        # statically known from ONNX/inference, use that static output shape.
+        target_shape = tuple(int(dim) for dim in layer["resolved_outputs"][0].shape)
+        logger.debug(
+            f"Reshape layer {layer_id}: using inferred static output shape "
+            f"as target_shape={target_shape}"
+        )
+    else:
+        raise ValueError(
+            f"Reshape layer {layer_id}: Target shape must be constant or "
+            f"statically inferable"
+        )
 
-    target_shape = tuple(int(dim) for dim in inputs[1].value)
     input_size = inputs[0].size
+    input_shape = inputs[0].shape
+
+    logger.info(
+        f"Reshape '{layer['name']}': input_shape={input_shape} (size={input_size}), "
+        f"target_shape={target_shape}"
+    )
 
     # Handle -1 in target shape
     if -1 in target_shape:
@@ -218,6 +303,10 @@ def extract_reshape_layer(
         known_prod = int(np.prod(known_dims)) if known_dims else 1
         inferred = input_size // known_prod
         target_shape = tuple(inferred if d == -1 else d for d in target_shape)
+        logger.info(
+            f"Reshape '{layer['name']}': resolved -1, "
+            f"target_shape now {target_shape}"
+        )
 
     output_size = int(np.prod(target_shape))
 
@@ -1427,6 +1516,232 @@ def _extract_shape_layer(enriched_layer: Dict, layer_id: int, analyzer) -> "Shap
     )
 
 
+def _extract_reduce_mean_layer(
+    enriched_layer: Dict, layer_id: int, analyzer
+) -> ReduceMeanLayer:
+    """Extract ReduceMean layer with static axes/keepdims."""
+    inputs = enriched_layer["resolved_inputs"]
+    attrs = enriched_layer.get("attributes", {})
+
+    axes = tuple(int(a) for a in attrs.get("axes", ()))
+    if (
+        not axes
+        and len(inputs) > 1
+        and inputs[1].is_weight
+        and inputs[1].value is not None
+    ):
+        axes = tuple(int(a) for a in np.asarray(inputs[1].value).flatten().tolist())
+
+    keepdims = bool(attrs.get("keepdims", 1))
+
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
+
+    return ReduceMeanLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"reduce_mean_{layer_id}",
+        op_type="ReduceMean",
+        input_size=input_size,
+        output_size=output_size,
+        inputs=runtime_inputs,
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype if inputs else None,
+        output_type=enriched_layer["resolved_outputs"][0].dtype,
+        axes=axes,
+        keepdims=keepdims,
+    )
+
+
+def _extract_reduce_prod_layer(
+    enriched_layer: Dict, layer_id: int, analyzer
+) -> ReduceProdLayer:
+    """Extract ReduceProd layer with static axes/keepdims."""
+    inputs = enriched_layer["resolved_inputs"]
+    attrs = enriched_layer.get("attributes", {})
+
+    axes = tuple(int(a) for a in attrs.get("axes", ()))
+    if (
+        not axes
+        and len(inputs) > 1
+        and inputs[1].is_weight
+        and inputs[1].value is not None
+    ):
+        axes = tuple(int(a) for a in np.asarray(inputs[1].value).flatten().tolist())
+
+    keepdims = bool(attrs.get("keepdims", 1))
+
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    runtime_inputs = (enriched_layer["inputs"][0],) if enriched_layer["inputs"] else ()
+
+    return ReduceProdLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"reduce_prod_{layer_id}",
+        op_type="ReduceProd",
+        input_size=input_size,
+        output_size=output_size,
+        inputs=runtime_inputs,
+        outputs=tuple(enriched_layer["outputs"]),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype if inputs else None,
+        output_type=enriched_layer["resolved_outputs"][0].dtype,
+        axes=axes,
+        keepdims=keepdims,
+    )
+
+
+def _extract_binary_elementwise_layer(
+    enriched_layer: Dict, layer_id: int, analyzer, operation: str
+) -> BinaryElementwiseLayer:
+    """Extract binary elementwise layer (Sub/Mul/Max)."""
+    inputs = enriched_layer["resolved_inputs"]
+    outputs = enriched_layer["resolved_outputs"]
+
+    if len(inputs) < 2:
+        raise ValueError(
+            f"{operation} layer {layer_id}: requires 2 inputs, got {len(inputs)}"
+        )
+
+    rhs_const = (
+        inputs[1].value if inputs[1].is_weight and inputs[1].value is not None else None
+    )
+    rhs_shape = tuple(inputs[1].shape) if inputs[1].shape else None
+    rhs_runtime_size = None if rhs_const is not None else inputs[1].size
+
+    runtime_inputs = (
+        (inputs[0].name,) if rhs_const is not None else (inputs[0].name, inputs[1].name)
+    )
+
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    return BinaryElementwiseLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"{operation.lower()}_{layer_id}",
+        op_type=operation,
+        input_size=input_size,
+        output_size=output_size,
+        inputs=runtime_inputs,
+        outputs=tuple(t.name for t in outputs),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=outputs[0].dtype,
+        operation=operation,
+        rhs_const=rhs_const,
+        rhs_shape=rhs_shape,
+        rhs_runtime_size=rhs_runtime_size,
+    )
+
+
+def _extract_unary_elementwise_layer(
+    enriched_layer: Dict, layer_id: int, analyzer, operation: str
+) -> UnaryElementwiseLayer:
+    """Extract unary elementwise layer (Sqrt/Reciprocal)."""
+    inputs = enriched_layer["resolved_inputs"]
+    outputs = enriched_layer["resolved_outputs"]
+
+    input_shape, output_shape = infer_layer_shapes(enriched_layer)
+    input_size, output_size = get_feature_sizes(input_shape, output_shape)
+
+    return UnaryElementwiseLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"{operation.lower()}_{layer_id}",
+        op_type=operation,
+        input_size=input_size,
+        output_size=output_size,
+        inputs=(inputs[0].name,),
+        outputs=tuple(t.name for t in outputs),
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype,
+        output_type=outputs[0].dtype,
+        operation=operation,
+    )
+
+
+def _extract_einsum_layer(enriched_layer: Dict, layer_id: int, analyzer) -> EinsumLayer:
+    """Extract supported Einsum equations into a first-class IR layer."""
+    inputs = enriched_layer["resolved_inputs"]
+    outputs = enriched_layer["resolved_outputs"]
+    attrs = enriched_layer.get("attributes", {})
+    equation = str(attrs.get("equation", ""))
+
+    if equation != "abcd,cde->abe":
+        raise NotImplementedError(
+            f"Einsum layer {layer_id}: unsupported equation '{equation}'"
+        )
+
+    if len(inputs) < 2:
+        raise ValueError(f"Einsum layer {layer_id}: requires 2 inputs")
+
+    rhs = inputs[1]
+    if not rhs.is_weight or rhs.value is None:
+        raise ValueError(
+            f"Einsum layer {layer_id}: rhs must be constant for equation {equation}"
+        )
+
+    rhs_const = np.asarray(rhs.value)
+    if rhs_const.ndim != 3:
+        raise ValueError(
+            f"Einsum layer {layer_id}: expected rhs rank 3, got {rhs_const.shape}"
+        )
+
+    c_dim, d_dim, e_dim = tuple(int(v) for v in rhs_const.shape)
+
+    lhs_shape = tuple(inputs[0].shape) if inputs and inputs[0].shape else ()
+    output_shape = tuple(outputs[0].shape) if outputs and outputs[0].shape else ()
+
+    if len(output_shape) == 3:
+        a_dim, b_dim, out_e = (int(v) for v in output_shape)
+        if out_e != e_dim:
+            logger.warning(
+                "Einsum layer %s output shape %s inconsistent with rhs e=%s; "
+                "using rhs e dimension",
+                layer_id,
+                output_shape,
+                e_dim,
+            )
+            output_shape = (a_dim, b_dim, e_dim)
+    elif len(lhs_shape) == 4 and lhs_shape[2] == c_dim and lhs_shape[3] == d_dim:
+        output_shape = (int(lhs_shape[0]), int(lhs_shape[1]), e_dim)
+    else:
+        lhs_size = int(inputs[0].size) if inputs else 0
+        contract = c_dim * d_dim
+        if contract <= 0:
+            raise ValueError(
+                f"Einsum layer {layer_id}: invalid rhs contract dims {rhs_const.shape}"
+            )
+        ab = max(1, int(np.ceil(lhs_size / contract))) if lhs_size > 0 else 1
+        output_shape = (1, ab, e_dim)
+
+    input_size = int(inputs[0].size) if inputs else 0
+    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    return EinsumLayer(
+        layer_id=layer_id,
+        name=enriched_layer.get("name") or f"einsum_{layer_id}",
+        op_type="Einsum",
+        input_size=input_size,
+        output_size=output_size,
+        inputs=(inputs[0].name,),
+        outputs=tuple(t.name for t in outputs),
+        input_shape=lhs_shape,
+        output_shape=output_shape,
+        input_type=inputs[0].dtype if inputs else None,
+        output_type=outputs[0].dtype if outputs else None,
+        equation=equation,
+        rhs_const=rhs_const.reshape(-1),
+        rhs_shape=(c_dim, d_dim, e_dim),
+    )
+
+
 # ============================================================================
 # Layer Extractor Registry
 # ============================================================================
@@ -1470,4 +1785,14 @@ LAYER_EXTRACTORS = {
     "Unsqueeze": _extract_unsqueeze_layer,
     "Expand": _extract_expand_layer,
     "Gather": _extract_gather_layer,
+    "ReduceMean": _extract_reduce_mean_layer,
+    "ReduceProd": _extract_reduce_prod_layer,
+    "Einsum": _extract_einsum_layer,
+    "Sub": lambda l, i, a: _extract_binary_elementwise_layer(l, i, a, "Sub"),
+    "Mul": lambda l, i, a: _extract_binary_elementwise_layer(l, i, a, "Mul"),
+    "Max": lambda l, i, a: _extract_binary_elementwise_layer(l, i, a, "Max"),
+    "Sqrt": lambda l, i, a: _extract_unary_elementwise_layer(l, i, a, "Sqrt"),
+    "Reciprocal": lambda l, i, a: _extract_unary_elementwise_layer(
+        l, i, a, "Reciprocal"
+    ),
 }

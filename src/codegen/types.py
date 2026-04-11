@@ -152,6 +152,22 @@ class MatMulLayer(LinearLayer):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RuntimeMatMulLayer(BaseLayer):
+    """MatMul where RHS is provided at runtime (non-constant tensor)."""
+
+    rhs_shape: Optional[Tuple[int, ...]] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class EinsumLayer(BaseLayer):
+    """First-class Einsum support for selected static equations."""
+
+    equation: str
+    rhs_const: np.ndarray
+    rhs_shape: Tuple[int, ...]
+
+
+@dataclass(frozen=True, kw_only=True)
 class GemmLayer(LinearLayer):
     """Y = alpha * X * W + beta * B"""
 
@@ -188,6 +204,39 @@ class AddLayer(BaseLayer):
     """Represents an ONNX Add layer"""
 
     bias: np.ndarray
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReduceMeanLayer(BaseLayer):
+    """Represents ONNX ReduceMean with static axes/keepdims."""
+
+    axes: Tuple[int, ...] = ()
+    keepdims: bool = True
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReduceProdLayer(BaseLayer):
+    """Represents ONNX ReduceProd with static axes/keepdims."""
+
+    axes: Tuple[int, ...] = ()
+    keepdims: bool = True
+
+
+@dataclass(frozen=True, kw_only=True)
+class BinaryElementwiseLayer(BaseLayer):
+    """Represents binary elementwise ops (Sub, Mul, Max, Add variants)."""
+
+    operation: str
+    rhs_const: Optional[np.ndarray] = None
+    rhs_shape: Optional[Tuple[int, ...]] = None
+    rhs_runtime_size: Optional[int] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnaryElementwiseLayer(BaseLayer):
+    """Represents unary elementwise ops (Sqrt, Reciprocal, etc.)."""
+
+    operation: str
 
 
 @dataclass(frozen=True, kw_only=True)

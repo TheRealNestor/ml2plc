@@ -28,6 +28,12 @@ from .data_movement import (
     generate_expand_code,
     generate_shape_code,
     generate_gather_code,
+    generate_reduce_mean_code,
+    generate_reduce_prod_code,
+    generate_binary_elementwise_code,
+    generate_unary_elementwise_code,
+    generate_runtime_matmul_code,
+    generate_einsum_code,
 )
 
 __all__ = [
@@ -53,4 +59,10 @@ __all__ = [
     "generate_expand_code",
     "generate_shape_code",
     "generate_gather_code",
+    "generate_reduce_mean_code",
+    "generate_reduce_prod_code",
+    "generate_binary_elementwise_code",
+    "generate_unary_elementwise_code",
+    "generate_runtime_matmul_code",
+    "generate_einsum_code",
 ]

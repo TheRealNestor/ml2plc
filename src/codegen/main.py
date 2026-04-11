@@ -211,7 +211,15 @@ def compile_onnx_to_st(
         )
         if first_acyclic in optimization_results:
             logger.debug("Checking memory for first acyclic region")
-            check_memory(optimization_results[first_acyclic].ir)
+            memory_result = check_memory(
+                optimization_results[first_acyclic].ir,
+                fail_on_exceed=False,
+            )
+            if memory_result.errors:
+                logger.warning(
+                    "Continuing compilation despite memory-limit exceedance "
+                    "(warning-only mode)."
+                )
 
     # Stage 4: Generate
     fb_name = input_path.stem

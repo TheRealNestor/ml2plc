@@ -26,7 +26,14 @@ from ...types import (
     CastLayer,
     SliceLayer,
     ConcatLayer,
+    ReduceMeanLayer,
+    ReduceProdLayer,
+    BinaryElementwiseLayer,
+    UnaryElementwiseLayer,
+    RuntimeMatMulLayer,
+    EinsumLayer,
 )
+from ...matmul_contract import validate_runtime_matmul_contract
 from ..st_code import STCode, STCodeBuilder
 from ..type_conversion import (
     plc_type_from_onnx_dtype,
@@ -457,3 +464,318 @@ def generate_gather_code(layer: GatherLayer, input_var: str, output_var: str) ->
             layer.output_size,
             f"Layer {layer.layer_id}: Gather axis={layer.gather_axis} (dynamic/large indices)",
         )
+
+
+def generate_reduce_mean_code(
+    layer: ReduceMeanLayer, input_var: str, output_var: str
+) -> STCode:
+    """Generate ReduceMean code for suffix-axis reductions on flattened buffers."""
+    if not layer.input_shape or not layer.output_shape:
+        raise ValueError(
+            f"ReduceMean layer {layer.layer_id}: static input/output shapes are required"
+        )
+
+    ndim = len(layer.input_shape)
+    if ndim == 0:
+        return generate_simple_copy(
+            input_var,
+            output_var,
+            layer.output_size,
+            f"Layer {layer.layer_id}: ReduceMean scalar passthrough",
+        )
+
+    axes = layer.axes if layer.axes else tuple(range(ndim))
+    normalized_axes = tuple(sorted(a if a >= 0 else a + ndim for a in axes))
+    expected_suffix_axes = tuple(range(ndim - len(normalized_axes), ndim))
+
+    if normalized_axes != expected_suffix_axes:
+        raise NotImplementedError(
+            f"ReduceMean layer {layer.layer_id}: only contiguous suffix-axis reductions are "
+            f"supported (got axes={normalized_axes}, ndim={ndim})"
+        )
+
+    reduction_factor = int(np.prod([layer.input_shape[a] for a in normalized_axes]))
+    if reduction_factor <= 0 or layer.input_size % reduction_factor != 0:
+        raise ValueError(
+            f"ReduceMean layer {layer.layer_id}: invalid reduction_factor={reduction_factor} "
+            f"for input_size={layer.input_size}"
+        )
+
+    builder = STCodeBuilder()
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: ReduceMean axes={normalized_axes} keepdims={layer.keepdims} *)"
+    )
+    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+    with builder.indent():
+        builder.add_line("sum := 0.0;")
+        builder.add_line(f"FOR j := 0 TO {reduction_factor - 1} DO")
+        with builder.indent():
+            builder.add_line(f"sum := sum + {input_var}[i * {reduction_factor} + j];")
+        builder.add_line("END_FOR;")
+        builder.add_line(f"{output_var}[i] := sum / {float(reduction_factor)};")
+    builder.add_line("END_FOR;")
+    return builder.build()
+
+
+def generate_reduce_prod_code(
+    layer: ReduceProdLayer, input_var: str, output_var: str
+) -> STCode:
+    """Generate ReduceProd code for suffix-axis reductions on flattened buffers."""
+    if not layer.input_shape or not layer.output_shape:
+        raise ValueError(
+            f"ReduceProd layer {layer.layer_id}: static input/output shapes are required"
+        )
+
+    ndim = len(layer.input_shape)
+    if ndim == 0:
+        return generate_simple_copy(
+            input_var,
+            output_var,
+            layer.output_size,
+            f"Layer {layer.layer_id}: ReduceProd scalar passthrough",
+        )
+
+    axes = layer.axes if layer.axes else tuple(range(ndim))
+    normalized_axes = tuple(sorted(a if a >= 0 else a + ndim for a in axes))
+    expected_suffix_axes = tuple(range(ndim - len(normalized_axes), ndim))
+
+    if normalized_axes != expected_suffix_axes:
+        raise NotImplementedError(
+            f"ReduceProd layer {layer.layer_id}: only contiguous suffix-axis reductions are "
+            f"supported (got axes={normalized_axes}, ndim={ndim})"
+        )
+
+    reduction_factor = int(np.prod([layer.input_shape[a] for a in normalized_axes]))
+    if reduction_factor <= 0 or layer.input_size % reduction_factor != 0:
+        raise ValueError(
+            f"ReduceProd layer {layer.layer_id}: invalid reduction_factor={reduction_factor} "
+            f"for input_size={layer.input_size}"
+        )
+
+    builder = STCodeBuilder()
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: ReduceProd axes={normalized_axes} keepdims={layer.keepdims} *)"
+    )
+    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+    with builder.indent():
+        builder.add_line("sum := 1.0;")
+        builder.add_line(f"FOR j := 0 TO {reduction_factor - 1} DO")
+        with builder.indent():
+            builder.add_line(f"sum := sum * {input_var}[i * {reduction_factor} + j];")
+        builder.add_line("END_FOR;")
+        builder.add_line(f"{output_var}[i] := sum;")
+    builder.add_line("END_FOR;")
+    return builder.build()
+
+
+def generate_runtime_matmul_code(
+    layer: RuntimeMatMulLayer, input_vars: List[str], output_var: str
+) -> STCode:
+    """Generate runtime MatMul code for non-constant RHS tensors."""
+    if len(input_vars) != 2:
+        raise ValueError(
+            f"Runtime MatMul layer {layer.layer_id}: expected 2 inputs, got {len(input_vars)}"
+        )
+
+    lhs, rhs = input_vars
+    contract = validate_runtime_matmul_contract(
+        tuple(layer.input_shape or ()),
+        tuple(layer.rhs_shape or ()),
+        context=f"Runtime MatMul layer {layer.layer_id}",
+    )
+    lhs_shape = contract.lhs_shape
+    rhs_shape = contract.rhs_shape
+
+    builder = STCodeBuilder()
+    builder.add_line(f"(* Layer {layer.layer_id}: Runtime MatMul *)")
+
+    # Vector dot: (K,) @ (K,) -> (1,)
+    if len(lhs_shape) == 1 and len(rhs_shape) == 1:
+        builder.add_line("sum := 0.0;")
+        builder.add_line(f"FOR i := 0 TO {lhs_shape[0] - 1} DO")
+        with builder.indent():
+            builder.add_line(f"sum := sum + {lhs}[i] * {rhs}[i];")
+        builder.add_line("END_FOR;")
+        builder.add_line(f"{output_var}[0] := sum;")
+        return builder.build()
+
+    # Matrix-matrix: (M,K) @ (K,N) -> (M,N)
+    if len(lhs_shape) == 2 and len(rhs_shape) == 2:
+        m, k = lhs_shape
+        _, n = rhs_shape
+
+        builder.add_line(f"FOR j := 0 TO {layer.output_size - 1} DO")
+        with builder.indent():
+            builder.add_line("sum := 0.0;")
+            builder.add_line(f"FOR i := 0 TO {k - 1} DO")
+            with builder.indent():
+                builder.add_line(
+                    f"sum := sum + {lhs}[(j / {n}) * {k} + i] * {rhs}[i * {n} + (j MOD {n})];"
+                )
+            builder.add_line("END_FOR;")
+            builder.add_line(f"{output_var}[j] := sum;")
+        builder.add_line("END_FOR;")
+        return builder.build()
+
+    # Vector-matrix: (K,) @ (K,N) -> (N,)
+    if len(lhs_shape) == 1 and len(rhs_shape) == 2:
+        k, n = rhs_shape
+
+        builder.add_line(f"FOR j := 0 TO {n - 1} DO")
+        with builder.indent():
+            builder.add_line("sum := 0.0;")
+            builder.add_line(f"FOR i := 0 TO {k - 1} DO")
+            with builder.indent():
+                builder.add_line(f"sum := sum + {lhs}[i] * {rhs}[i * {n} + j];")
+            builder.add_line("END_FOR;")
+            builder.add_line(f"{output_var}[j] := sum;")
+        builder.add_line("END_FOR;")
+        return builder.build()
+
+    # Matrix-vector: (M,K) @ (K,) -> (M,)
+    if len(lhs_shape) == 2 and len(rhs_shape) == 1:
+        m, k = lhs_shape
+
+        builder.add_line(f"FOR j := 0 TO {m - 1} DO")
+        with builder.indent():
+            builder.add_line("sum := 0.0;")
+            builder.add_line(f"FOR i := 0 TO {k - 1} DO")
+            with builder.indent():
+                builder.add_line(f"sum := sum + {lhs}[j * {k} + i] * {rhs}[i];")
+            builder.add_line("END_FOR;")
+            builder.add_line(f"{output_var}[j] := sum;")
+        builder.add_line("END_FOR;")
+        return builder.build()
+
+    raise NotImplementedError(
+        f"Runtime MatMul layer {layer.layer_id}: unsupported rank combination "
+        f"lhs={lhs_shape}, rhs={rhs_shape}"
+    )
+
+
+def generate_einsum_code(layer: EinsumLayer, input_var: str, output_var: str) -> STCode:
+    """Generate Einsum code for equation ``abcd,cde->abe`` with constant RHS."""
+    if layer.equation != "abcd,cde->abe":
+        raise NotImplementedError(
+            f"Einsum layer {layer.layer_id}: unsupported equation {layer.equation}"
+        )
+    if not layer.output_shape or len(layer.output_shape) != 3:
+        raise ValueError(
+            f"Einsum layer {layer.layer_id}: expected 3D output shape, got {layer.output_shape}"
+        )
+
+    a_dim, b_dim, e_dim = layer.output_shape
+    c_dim, d_dim, e_rhs = layer.rhs_shape
+    if e_dim != e_rhs:
+        raise ValueError(
+            f"Einsum layer {layer.layer_id}: output/rhs mismatch e={e_dim} vs {e_rhs}"
+        )
+
+    lhs_size = int(layer.input_size)
+
+    builder = STCodeBuilder()
+    builder.add_line(
+        f"(* Layer {layer.layer_id}: Einsum {layer.equation} {layer.input_shape} -> {layer.output_shape} *)"
+    )
+    builder.add_line(f"FOR i := 0 TO {a_dim - 1} DO")
+    with builder.indent():
+        builder.add_line(f"FOR j := 0 TO {b_dim - 1} DO")
+        with builder.indent():
+            builder.add_line(f"FOR k := 0 TO {e_dim - 1} DO")
+            with builder.indent():
+                builder.add_line("sum := 0.0;")
+                builder.add_line(f"FOR l := 0 TO {c_dim - 1} DO")
+                with builder.indent():
+                    builder.add_line(f"FOR m := 0 TO {d_dim - 1} DO")
+                    with builder.indent():
+                        builder.add_line(
+                            f"tmp_idx := (((i * {b_dim} + j) * {c_dim} + l) * {d_dim} + m);"
+                        )
+                        builder.add_line(f"IF tmp_idx < {lhs_size} THEN")
+                        with builder.indent():
+                            builder.add_line(
+                                f"sum := sum + {input_var}[tmp_idx] * einsum_rhs_{layer.layer_id}[((l * {d_dim} + m) * {e_dim} + k)];"
+                            )
+                        builder.add_line("END_IF;")
+                    builder.add_line("END_FOR;")
+                builder.add_line("END_FOR;")
+                builder.add_line(
+                    f"{output_var}[((i * {b_dim} + j) * {e_dim} + k)] := sum;"
+                )
+            builder.add_line("END_FOR;")
+        builder.add_line("END_FOR;")
+    builder.add_line("END_FOR;")
+    return builder.build()
+
+
+def generate_binary_elementwise_code(
+    layer: BinaryElementwiseLayer, input_vars: List[str], output_var: str
+) -> STCode:
+    """Generate binary elementwise code for Sub/Mul/Max with optional const RHS."""
+    op = layer.operation
+    if op not in {"Sub", "Mul", "Max"}:
+        raise NotImplementedError(
+            f"Binary elementwise op '{op}' is not supported in ST generator"
+        )
+
+    builder = STCodeBuilder()
+    builder.add_line(f"(* Layer {layer.layer_id}: {op} (Element-wise) *)")
+
+    if layer.rhs_const is not None:
+        rhs_size = int(layer.rhs_const.size)
+        if rhs_size <= 0:
+            raise ValueError(f"{op} layer {layer.layer_id}: empty RHS constant")
+
+        rhs_expr = (
+            f"rhs_const_{layer.layer_id}[i]"
+            if rhs_size == layer.output_size
+            else f"rhs_const_{layer.layer_id}[i MOD {rhs_size}]"
+        )
+        lhs_expr = f"{input_vars[0]}[i]"
+    else:
+        if len(input_vars) != 2:
+            raise ValueError(
+                f"{op} layer {layer.layer_id}: expected 2 runtime inputs, got {len(input_vars)}"
+            )
+        lhs_expr = f"{input_vars[0]}[i]"
+        rhs_runtime_size = layer.rhs_runtime_size or layer.output_size
+        rhs_expr = (
+            f"{input_vars[1]}[i]"
+            if rhs_runtime_size == layer.output_size
+            else f"{input_vars[1]}[i MOD {rhs_runtime_size}]"
+        )
+
+    if op == "Sub":
+        expr = f"{lhs_expr} - {rhs_expr}"
+    elif op == "Mul":
+        expr = f"{lhs_expr} * {rhs_expr}"
+    else:  # Max
+        expr = f"MAX({lhs_expr}, {rhs_expr})"
+
+    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+    with builder.indent():
+        builder.add_line(f"{output_var}[i] := {expr};")
+    builder.add_line("END_FOR;")
+    return builder.build()
+
+
+def generate_unary_elementwise_code(
+    layer: UnaryElementwiseLayer, input_var: str, output_var: str
+) -> STCode:
+    """Generate unary elementwise code for Sqrt/Reciprocal."""
+    op = layer.operation
+    if op not in {"Sqrt", "Reciprocal"}:
+        raise NotImplementedError(
+            f"Unary elementwise op '{op}' is not supported in ST generator"
+        )
+
+    builder = STCodeBuilder()
+    builder.add_line(f"(* Layer {layer.layer_id}: {op} (Element-wise) *)")
+    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+    with builder.indent():
+        if op == "Sqrt":
+            builder.add_line(f"{output_var}[i] := SQRT({input_var}[i]);")
+        else:
+            builder.add_line(f"{output_var}[i] := 1.0 / {input_var}[i];")
+    builder.add_line("END_FOR;")
+    return builder.build()
