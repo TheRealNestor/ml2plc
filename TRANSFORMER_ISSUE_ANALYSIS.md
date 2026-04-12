@@ -10,7 +10,7 @@
 
 The project direction is now explicitly **architectural** rather than patch-oriented.
 
-The most important recent work (shape-inference overhaul) is a strong example of the target design style:
+The most important recent work (shape-inference overhaul + workspace-wide consistency sweeps) is a strong example of the target design style:
 
 - clear module boundaries,
 - low coupling,
@@ -60,13 +60,17 @@ We are intentionally optimizing for:
 - Shape logic has been split into focused components (public API, engine orchestration, primitive math, registry/dispatch, validation).
 - Runtime matmul contract handling is centralized and validated earlier.
 - Better regression coverage exists around shape strictness and runtime matmul behavior.
+- Graph analysis now follows a cleaner single-source approach (`LayerGraph`) with reduced duplicate edge-construction logic.
+- Transitional/deprecation-oriented noise has been removed from core graph APIs to keep pre-release design intent explicit.
+- Removed-shim modules and shape API messaging are now more consistent across the workspace.
 - The code now reflects a cleaner foundation for future compiler passes.
 
 ### Validation status
 
 Latest full-suite verification result:
 
-- **111 passed, 2 skipped**
+- **113 passed, 2 skipped**
+- **0 warnings**
 
 This confirms the current refactor state is stable and test-backed.
 
@@ -126,6 +130,7 @@ With this, each pass has:
 2. **Remove duplication around shape and operator semantics**
    - Single source of truth for shape role/shape math rules.
    - No duplicate compatibility shims.
+   - No duplicate graph-construction paths for the same analysis concept.
 
 3. **Modularize extractor responsibilities**
    - Keep extraction pure and context-driven.
@@ -133,6 +138,7 @@ With this, each pass has:
 
 4. **Standardize diagnostics**
    - Consistent error format with node/layer context and lineage when available.
+   - Keep error/warning policy intentional (do not rely on migration-era warning noise during pre-release).
 
 5. **Keep files intentionally small**
    - Split on responsibility boundaries, not arbitrary size.
@@ -162,13 +168,20 @@ If a change increases complexity without improving pass boundaries, readability,
 ### Short-term (next cycle)
 
 - Continue workspace-level modular cleanup (not only Transformer path).
-- Remove remaining duplicated or legacy shape-related paths where safe.
+- Remove remaining duplicated or shim-style paths where safe.
+- Convert remaining wildcard imports to explicit imports in core modules for readability and API clarity.
 - Add pass-level invariant tests where gaps still exist.
 
 ### Mid-term
 
 - Introduce/finish canonical pass directory organization.
 - Keep model-specific stress fixtures (Transformer/RNN/etc.) to verify architecture robustness.
+
+### Current baseline to preserve
+
+- Full suite remains green after each non-trivial structural sweep.
+- New refactors are accepted only when they reduce coupling/duplication or improve pass-boundary clarity.
+- Regression tests should remain stable and not require churn for internal refactors.
 
 ### Ongoing quality gate
 

@@ -255,7 +255,7 @@ def test_expand_on_shape_tensor_fails_on_incompatible_broadcast():
         infer_layer_shapes(layer)
 
 
-def test_unsqueeze_on_value_tensor_keeps_backward_compatible_fallback_without_axes():
+def test_unsqueeze_on_value_tensor_requires_axes_in_strict_mode():
     semantics = ShapeSemanticsTracker()
     layer = {
         "name": "Unsqueeze__value_no_axes",
@@ -277,6 +277,5 @@ def test_unsqueeze_on_value_tensor_keeps_backward_compatible_fallback_without_ax
         "_shape_semantics": semantics,
     }
 
-    in_shape, out_shape = infer_layer_shapes(layer)
-    assert in_shape == (3,)
-    assert out_shape == (3,)
+    with pytest.raises(ValueError, match=r"Unsqueeze 'Unsqueeze__value_no_axes':"):
+        infer_layer_shapes(layer)

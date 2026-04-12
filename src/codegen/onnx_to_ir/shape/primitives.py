@@ -61,7 +61,16 @@ def infer_gemm_output_shape(
         return ()
 
     output_features = weight_shape[0] if transB else weight_shape[1]
-    return (output_features,)
+
+    # Preserve leading dimensions for rank>1 inputs.
+    # Example: (N, K) @ (K, M) -> (N, M), (B, T, K) @ (K, M) -> (B, T, M)
+    if not input_shape:
+        return (output_features,)
+
+    if len(input_shape) == 1:
+        return (output_features,)
+
+    return (*input_shape[:-1], output_features)
 
 
 def infer_add_output_shape(
@@ -190,9 +199,9 @@ def infer_squeeze_output_shape(
         if 0 <= ax < len(result) and result[ax] == 1:
             result.pop(ax)
         else:
-            logger.warning(
+            raise ValueError(
                 f"Squeeze axis {ax} is out of range or dim != 1 "
-                f"(shape={input_shape}), skipping"
+                f"(shape={input_shape})"
             )
     return tuple(result) if result else (1,)
 
@@ -410,24 +419,51 @@ def infer_reduce_mean_output_shape(
 
 
 def infer_reshape_output_shape(
-    input_shape: Tuple[int, ...], target_shape: Optional[Tuple[int, ...]]
+    input_shape: Tuple[int, ...],
+    target_shape: Optional[Tuple[int, ...]],
+    *,
+    allowzero: bool = False,
 ) -> Tuple[int, ...]:
     if not target_shape:
         return input_shape
 
-    if -1 in target_shape:
-        input_size = int(np.prod(input_shape)) if input_shape else 0
-        known_dims = [d for d in target_shape if d > 0]
-        known_prod = int(np.prod(known_dims)) if known_dims else 1
+    resolved: List[int] = []
+    minus_one_idx = -1
 
-        if known_prod == 0:
-            logger.warning(f"Invalid target shape {target_shape}")
-            return ()
+    for idx, dim in enumerate(target_shape):
+        d = int(dim)
+        if d == -1:
+            if minus_one_idx != -1:
+                logger.warning(f"Invalid target shape {target_shape}: multiple -1")
+                return ()
+            minus_one_idx = idx
+            resolved.append(-1)
+            continue
 
-        inferred_dim = input_size // known_prod
-        return tuple(inferred_dim if d == -1 else d for d in target_shape)
+        if d == 0 and not allowzero:
+            if idx >= len(input_shape):
+                logger.warning(
+                    f"Invalid target shape {target_shape}: 0 at axis {idx} has no matching input axis for {input_shape}"
+                )
+                return ()
+            resolved.append(int(input_shape[idx]))
+            continue
 
-    return target_shape
+        resolved.append(d)
+
+    if minus_one_idx == -1:
+        return tuple(resolved)
+
+    input_size = int(np.prod(input_shape)) if input_shape else 0
+    known_prod = int(np.prod([d for d in resolved if d != -1])) if resolved else 1
+    if known_prod == 0 or input_size % known_prod != 0:
+        logger.warning(
+            f"Invalid target shape {target_shape}: cannot infer -1 with input_size={input_size} and known_prod={known_prod}"
+        )
+        return ()
+
+    resolved[minus_one_idx] = input_size // known_prod
+    return tuple(resolved)
 
 
 def infer_einsum_output_shape(

@@ -40,7 +40,7 @@ def extract_reshape_target_shape(
     if not shape_tensor.is_weight or shape_tensor.value is None:
         return None
 
-    return tuple(int(d) for d in shape_tensor.value if int(d) != 0)
+    return tuple(int(d) for d in shape_tensor.value)
 
 
 def first_resolved_output_shape(resolved_outputs: List[Any]) -> Tuple[int, ...]:
@@ -134,6 +134,7 @@ def _require_shape_role_inputs(
     "Cast",
     "Sqrt",
     "Reciprocal",
+    "Neg",
 )
 def _rule_passthrough(ctx: OpSemanticsContext) -> Tuple[int, ...]:
     return ctx.input_shape
@@ -181,7 +182,12 @@ def _rule_reshape(ctx: OpSemanticsContext) -> Tuple[int, ...]:
             f"got {resolved_input_role(ctx.layer_dict, 1).value}"
         )
     target_shape = extract_reshape_target_shape(ctx.resolved_inputs)
-    return infer_reshape_output_shape(ctx.input_shape, target_shape)
+    allowzero = bool(ctx.attrs.get("allowzero", 0))
+    return infer_reshape_output_shape(
+        ctx.input_shape,
+        target_shape,
+        allowzero=allowzero,
+    )
 
 
 @register_op_shape_rule("Conv")
@@ -222,11 +228,10 @@ def _rule_flatten(ctx: OpSemanticsContext) -> Tuple[int, ...]:
 @register_op_shape_rule("Transpose")
 def _rule_transpose(ctx: OpSemanticsContext) -> Tuple[int, ...]:
     perm = tuple(ctx.attrs.get("perm", ()))
-    strict = resolved_input_role(ctx.layer_dict, 0) == TensorRole.SHAPE
     return infer_transpose_output_shape(
         ctx.input_shape,
         perm,
-        strict=strict,
+        strict=True,
         context=f"Transpose '{_layer_name(ctx)}'",
     )
 
@@ -243,14 +248,12 @@ def _rule_squeeze(ctx: OpSemanticsContext) -> Tuple[int, ...]:
         axes_val = ctx.resolved_inputs[1].value
         if axes_val is not None:
             axes = tuple(int(a) for a in axes_val)
-    if axes and any(a > 0 for a in axes):
-        axes = tuple(a - 1 for a in axes if a != 0)
     return infer_squeeze_output_shape(ctx.input_shape, axes)
 
 
 @register_op_shape_rule("Unsqueeze")
 def _rule_unsqueeze(ctx: OpSemanticsContext) -> Tuple[int, ...]:
-    strict = resolved_input_role(ctx.layer_dict, 0) == TensorRole.SHAPE
+    strict = True
     if strict:
         _require_shape_role_inputs(ctx, (1,))
     axes = extract_int_tuple_from_input(ctx.resolved_inputs, 1)
@@ -266,7 +269,7 @@ def _rule_unsqueeze(ctx: OpSemanticsContext) -> Tuple[int, ...]:
 
 @register_op_shape_rule("Slice")
 def _rule_slice(ctx: OpSemanticsContext) -> Tuple[int, ...]:
-    strict = resolved_input_role(ctx.layer_dict, 0) == TensorRole.SHAPE
+    strict = True
     if strict:
         _require_shape_role_inputs(ctx, (1, 2, 3, 4))
     starts = extract_int_tuple_from_input(ctx.resolved_inputs, 1)
@@ -286,7 +289,7 @@ def _rule_slice(ctx: OpSemanticsContext) -> Tuple[int, ...]:
 
 @register_op_shape_rule("Expand")
 def _rule_expand(ctx: OpSemanticsContext) -> Tuple[int, ...]:
-    strict = resolved_input_role(ctx.layer_dict, 0) == TensorRole.SHAPE
+    strict = True
     if strict:
         _require_shape_role_inputs(ctx, (1,))
     target_shape = extract_int_tuple_from_input(ctx.resolved_inputs, 1)

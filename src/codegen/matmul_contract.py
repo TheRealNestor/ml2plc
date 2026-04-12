@@ -26,6 +26,7 @@ def validate_runtime_matmul_contract(
       - (M,K)  @ (K,N)  -> (M,N)
       - (K,)   @ (K,N)  -> (N,)
       - (M,K)  @ (K,)   -> (M,)
+            - (...,M,K) @ (...,K,N) -> (...,M,N)  (matching batch prefix)
     """
     lhs = tuple(int(d) for d in lhs_shape)
     rhs = tuple(int(d) for d in rhs_shape)
@@ -52,6 +53,20 @@ def validate_runtime_matmul_contract(
         if lhs[1] != rhs[0]:
             raise ValueError(f"{context}: incompatible shapes {lhs} @ {rhs}")
         return RuntimeMatMulContract(lhs, rhs, (lhs[0],))
+
+    if len(lhs) >= 2 and len(rhs) >= 2:
+        lhs_batch, m, k = lhs[:-2], lhs[-2], lhs[-1]
+        rhs_batch, k2, n = rhs[:-2], rhs[-2], rhs[-1]
+
+        if k != k2:
+            raise ValueError(f"{context}: incompatible shapes {lhs} @ {rhs}")
+
+        if lhs_batch != rhs_batch:
+            raise NotImplementedError(
+                f"{context}: unsupported batch broadcast lhs_batch={lhs_batch}, rhs_batch={rhs_batch}"
+            )
+
+        return RuntimeMatMulContract(lhs, rhs, lhs_batch + (m, n))
 
     raise NotImplementedError(
         f"{context}: unsupported rank combination lhs={lhs}, rhs={rhs}"

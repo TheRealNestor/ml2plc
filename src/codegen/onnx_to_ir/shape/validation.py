@@ -337,7 +337,7 @@ def _find_dynamic_tensors(model: onnx.ModelProto) -> Dict[str, Tuple[int, ...]]:
 def _attempt_resolve_dynamic_shapes(
     model: onnx.ModelProto, dynamic_tensors: Dict[str, Tuple[int, ...]]
 ) -> Dict[str, Tuple[int, ...]]:
-    """Backward-compatible shim for old callers."""
+    """Resolve dynamic shape placeholders using configured fallback rules."""
     resolved: Dict[str, Tuple[int, ...]] = {}
     batch_resolutions = _resolve_dynamic_batch_dims(dynamic_tensors)
     for tensor_name, shape in dynamic_tensors.items():

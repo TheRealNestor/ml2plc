@@ -51,7 +51,13 @@ class TensorResolver:
         input_info, _ = analyzer.get_input_output_info()
         for i, inp_name in enumerate(input_info["names"]):
             shape = input_info["shapes"][i]
-            static_shape = tuple(d for d in shape if isinstance(d, int) and d > 0)
+            # Strict contract: graph inputs must be fully static after validation.
+            if any(not (isinstance(d, int) and d > 0) for d in shape):
+                raise ValueError(
+                    f"Input tensor '{inp_name}' has unresolved shape {shape}. "
+                    "All input dimensions must be concrete before ONNX->IR conversion."
+                )
+            static_shape = tuple(int(d) for d in shape)
             if static_shape:
                 self.inferred_shapes[inp_name] = static_shape
                 logger.debug(f"Initialized input shape: {inp_name} -> {static_shape}")
@@ -85,8 +91,17 @@ class TensorResolver:
         """Extract static shape from ONNX tensor_info."""
         tensor_info = self.analyzer.tensor_info.get(tensor_name, {})
         shape_from_onnx = tensor_info.get("shape", ())
-        static_dims = [d for d in shape_from_onnx if isinstance(d, int) and d > 0]
-        return tuple(static_dims) if static_dims else ()
+
+        if not shape_from_onnx:
+            return ()
+
+        # Strict contract: never substitute unknown/symbolic dims with defaults.
+        # If ONNX shape metadata is not fully static, let shape inference resolve
+        # it explicitly downstream rather than inventing dimensions.
+        if any(not (isinstance(d, int) and d > 0) for d in shape_from_onnx):
+            return ()
+
+        return tuple(int(d) for d in shape_from_onnx)
 
     def resolve_tensor(
         self, tensor_name: str, computation_dtype: str, is_output: bool = False

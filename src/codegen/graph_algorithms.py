@@ -17,22 +17,31 @@ from onnx import GraphProto
 logger = logging.getLogger(__name__)
 
 
+def _build_adjacency_from_tensor_dependencies(
+    layers: Dict[str, BaseLayer],
+    tensor_producers: Dict[str, str],
+    input_tensors: tuple,
+) -> Dict[str, Set[str]]:
+    """Build producer->consumer adjacency from layer input dependencies."""
+    adjacency: Dict[str, Set[str]] = {name: set() for name in layers.keys()}
+
+    for layer_name, layer in layers.items():
+        for input_tensor in layer.inputs:
+            if input_tensor in input_tensors:
+                continue
+            producer = tensor_producers.get(input_tensor)
+            if producer and producer in layers and producer != layer_name:
+                adjacency[producer].add(layer_name)
+
+    return adjacency
+
+
 def topological_sort(
     layers: Dict[str, BaseLayer],
     tensor_producers: Dict[str, str],
     input_tensors: tuple,
 ) -> List[str]:
     """
-    [DEPRECATED] Use LayerGraph.get_execution_order() instead.
-
-    This function is kept for backward compatibility only. It rebuilds the
-    adjacency list on every call, which is inefficient compared to LayerGraph's
-    cached properties.
-
-    Migration:
-        Old: execution_order = topological_sort(layers, tensor_producers, input_tensors)
-        New: graph = LayerGraph(ir); execution_order = graph.get_execution_order()
-
     Perform topological sort on the layer graph using Kahn's algorithm.
     Validates that the graph is acyclic. Raises ValueError if a cycle is detected.
 
@@ -47,19 +56,13 @@ def topological_sort(
     Raises:
         ValueError: If a cycle is detected in the graph
     """
-    adj_list = defaultdict(list)
+    adjacency = _build_adjacency_from_tensor_dependencies(
+        layers, tensor_producers, input_tensors
+    )
     in_degree = {name: 0 for name in layers.keys()}
-
-    for layer_name, layer in layers.items():
-        for input_tensor in layer.inputs:
-            if input_tensor in input_tensors:
-                continue
-
-            if input_tensor in tensor_producers:
-                producer = tensor_producers[input_tensor]
-                if producer != layer_name:
-                    adj_list[producer].append(layer_name)
-                    in_degree[layer_name] += 1
+    for consumers in adjacency.values():
+        for consumer in consumers:
+            in_degree[consumer] += 1
 
     queue = deque([name for name, degree in in_degree.items() if degree == 0])
     sorted_order = []
@@ -68,7 +71,7 @@ def topological_sort(
         current = queue.popleft()
         sorted_order.append(current)
 
-        for neighbor in adj_list[current]:
+        for neighbor in adjacency[current]:
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
                 queue.append(neighbor)
@@ -254,16 +257,6 @@ def condensation_execution_order(
     input_tensors: tuple,
 ) -> List[str]:
     """
-    [DEPRECATED] Use LayerGraph.get_execution_order() instead.
-
-    This function is kept for backward compatibility only. It rebuilds the
-    adjacency list and SCCs on every call, which is inefficient compared to
-    LayerGraph's cached properties.
-
-    Migration:
-        Old: execution_order = condensation_execution_order(layers, tensor_producers, input_tensors)
-        New: graph = LayerGraph(ir); execution_order = graph.get_execution_order()
-
     Compute a deterministic execution order that supports cyclic graphs.
 
     Strategy:
@@ -276,15 +269,9 @@ def condensation_execution_order(
     cyclic graphs it returns a best-effort linearization by SCC block order rather
     than raising an exception.
     """
-    adjacency: Dict[str, Set[str]] = {name: set() for name in layers.keys()}
-
-    for layer_name, layer in layers.items():
-        for input_tensor in layer.inputs:
-            if input_tensor in input_tensors:
-                continue
-            producer = tensor_producers.get(input_tensor)
-            if producer and producer != layer_name and producer in layers:
-                adjacency[producer].add(layer_name)
+    adjacency = _build_adjacency_from_tensor_dependencies(
+        layers, tensor_producers, input_tensors
+    )
 
     if not adjacency:
         return []
@@ -317,38 +304,24 @@ def has_cycle(
     input_tensors: tuple,
 ) -> bool:
     """
-    [DEPRECATED] Use LayerGraph.has_cycle() instead.
-
-    This function is kept for backward compatibility only. It rebuilds the
-    adjacency list on every call, which is inefficient compared to LayerGraph's
-    cached properties.
-
-    Migration:
-        Old: has_cycle(layers, tensor_producers, input_tensors)
-        New: graph = LayerGraph(ir); graph.has_cycle()
-
     Return True if the layer dependency graph contains at least one cycle.
 
     Detects:
     - Multi-node cycles (A→B→C→A)
     - Self-loops (A→A)
     """
-    adjacency: Dict[str, Set[str]] = {name: set() for name in layers.keys()}
-
+    # Self-loop: layer depends on its own output
     for layer_name, layer in layers.items():
         for input_tensor in layer.inputs:
             if input_tensor in input_tensors:
                 continue
             producer = tensor_producers.get(input_tensor)
-            if not producer or producer not in layers:
-                continue
-
-            # Self-loop: layer depends on its own output
             if producer == layer_name:
                 return True
 
-            # Add edge from producer to consumer
-            adjacency[producer].add(layer_name)
+    adjacency = _build_adjacency_from_tensor_dependencies(
+        layers, tensor_producers, input_tensors
+    )
 
     # Check for multi-node cycles via SCC detection
     for component in tarjan_scc(adjacency):

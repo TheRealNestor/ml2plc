@@ -20,7 +20,6 @@ from ..types import (
 from ..graph.core import LayerGraph
 from ..ir_utils import (
     TensorMapBuilder,
-    build_tensor_maps,  # Legacy, kept for compatibility
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +50,7 @@ class RegionClassifier:
     Single responsibility: Determine region kind and extract relevant parameters.
 
     This consolidates:
-    - _classify_region_kind(): Determines region kind (Loop, Recurrent, Acyclic)
+    - _determine_kind(): Determines region kind (Loop, Recurrent, Acyclic)
     - _infer_state_tensors(): Extracts state input/output tensors
     - _infer_loop_tensors(): Extracts loop input/output tensors
 
@@ -303,182 +302,6 @@ def _subgraph_for_component(
     )
 
 
-def _classify_region_kind(
-    component_nodes: Set[str],
-    layer_graph: LayerGraph,
-) -> RegionKind:
-    """
-    [DEPRECATED] Use RegionClassifier.classify() instead.
-
-    This function is kept for backward compatibility. The RegionClassifier
-    class consolidates all classification logic in one place.
-
-    Migration:
-        Old: kind = _classify_region_kind(nodes, layer_graph)
-        New: classifier = RegionClassifier(graph, layer_graph)
-             classification = classifier.classify(nodes)
-             kind = classification.kind
-
-    Classify a component as one of: Loop, Recurrent, or Acyclic.
-
-    Classification logic (priority order):
-    1. If contains ONNX Loop/Scan/If operators → LOOP region
-    2. If multiple nodes or self-loop → RECURRENT region
-    3. Otherwise → ACYCLIC region
-    """
-    # Check for explicit control flow operators (highest priority)
-    has_control_flow = any(
-        layer_graph.ir.layers[n].op_type in _CONTROL_FLOW_OPS for n in component_nodes
-    )
-    if has_control_flow:
-        return RegionKind.LOOP
-
-    # Check for multiple nodes (indicating feedback within component)
-    if len(component_nodes) > 1:
-        return RegionKind.RECURRENT
-
-    # Check for self-loop on single node
-    single_node = next(iter(component_nodes))
-    if single_node in layer_graph.adjacency.get(single_node, set()):
-        return RegionKind.RECURRENT
-
-    # No cycles, no control flow → purely acyclic
-    return RegionKind.ACYCLIC
-
-
-def _infer_state_tensors(
-    component_nodes: Set[str],
-    graph: NetworkIR,
-) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """
-    [DEPRECATED] Use RegionClassifier.classify() instead.
-
-    This function is kept for backward compatibility. The RegionClassifier
-    class consolidates all classification logic in one place, including
-    state tensor inference.
-
-    Migration:
-        Old: state_in, state_out = _infer_state_tensors(nodes, graph)
-        New: classifier = RegionClassifier(graph, layer_graph)
-             classification = classifier.classify(nodes)
-             state_in = classification.state_inputs
-             state_out = classification.state_outputs
-
-    Infer state input/output tensors for a recurrent region.
-
-    Strategy: Use detected state tensors (from converter) as ground truth where
-    available, but fall back to topology analysis for cases where state detection
-    wasn't possible (e.g., older ONNX versions without operator annotations).
-
-    State tensors are outputs that:
-    1. Are marked as "state" in the converter (preferred approach)
-    2. Are produced by nodes in the component
-    3. Are consumed by nodes in the component
-    4. Create back-edges (appear as inputs to their own producers)
-
-    Returns:
-        (state_inputs, state_outputs) tensor name tuples
-    """
-    state_inputs: List[str] = []
-    state_outputs: List[str] = []
-
-    # Build builder for component to query state tensors
-    full_builder = TensorMapBuilder.build(graph.layers)
-    component_builder = full_builder.extract_for_nodes(component_nodes)
-
-    # Strategy 1: Use explicitly detected state tensors (from converter)
-    # This is the primary mechanism and is reliable when available
-    annotated_state_tensors = list(
-        component_builder.extract_state_tensors(graph, component_nodes)
-    )
-
-    if annotated_state_tensors:
-        # Use annotated state information
-        state_outputs.extend(annotated_state_tensors)
-        state_inputs.extend(annotated_state_tensors)
-        logger.debug(
-            f"Region {component_nodes}: using {len(annotated_state_tensors)} "
-            f"annotated state tensors: {annotated_state_tensors}"
-        )
-        return (tuple(state_inputs), tuple(state_outputs))
-
-    # Strategy 2: Fall back to topology-based inference for back-edges
-    # This handles cases where state detection wasn't possible
-    logger.debug(
-        f"Region {component_nodes}: no annotated state tensors; "
-        f"falling back to topology analysis"
-    )
-
-    for node_name in component_nodes:
-        layer = graph.layers[node_name]
-
-        for out_tensor in layer.outputs:
-            # Check if this output is consumed by nodes in the same component
-            consumers = graph.tensor_consumers.get(out_tensor, [])
-            component_consumers = [c for c in consumers if c in component_nodes]
-
-            if not component_consumers:
-                continue
-
-            # This is a potential state tensor (internal to component)
-            # It's a state output (produced here)
-            if out_tensor not in state_outputs:
-                state_outputs.append(out_tensor)
-
-            # For each consumer in this component, it's a state input
-            for consumer in component_consumers:
-                if out_tensor not in layer.inputs:
-                    # Only add as state input if it's actually consumed
-                    if out_tensor not in state_inputs:
-                        state_inputs.append(out_tensor)
-
-    return (tuple(state_inputs), tuple(state_outputs))
-
-
-def _infer_loop_tensors(
-    component_nodes: Set[str],
-    graph: NetworkIR,
-) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """
-    [DEPRECATED] Use RegionClassifier.classify() instead.
-
-    This function is kept for backward compatibility. The RegionClassifier
-    class consolidates all classification logic in one place, including
-    loop tensor inference.
-
-    Migration:
-        Old: loop_in, loop_out = _infer_loop_tensors(nodes, graph)
-        New: classifier = RegionClassifier(graph, layer_graph)
-             classification = classifier.classify(nodes)
-             loop_in = classification.loop_inputs
-             loop_out = classification.loop_outputs
-
-    Infer loop input/output tensors for a Loop region.
-
-    For ONNX Loop/Scan operators, identify:
-    - loop_inputs: tensors iterated over or loop state inputs
-    - loop_outputs: tensors produced by loop body
-
-    Returns:
-        (loop_inputs, loop_outputs) tensor name tuples
-    """
-    loop_layer = None
-    for node_name in component_nodes:
-        layer = graph.layers[node_name]
-        if layer.op_type in _CONTROL_FLOW_OPS:
-            loop_layer = layer
-            break
-
-    if not loop_layer:
-        return ((), ())
-
-    # Loop layer inputs and outputs are the loop-related tensors
-    loop_inputs = tuple(t for t in loop_layer.inputs if t not in graph.input_tensors)
-    loop_outputs = tuple(loop_layer.outputs)
-
-    return (loop_inputs, loop_outputs)
-
-
 def _rebuild_merged_graph_structure(
     layers: Dict[str, object],
     execution_order: List[str],
@@ -491,7 +314,7 @@ def _rebuild_merged_graph_structure(
     since the merged region has different boundaries than the originals.
     Delegates to centralized tensor map builder for consistency.
     """
-    tensor_producers, tensor_consumers = build_tensor_maps(layers)
+    tensor_producers, tensor_consumers = TensorMapBuilder.build(layers).as_tuple()
 
     # Compute I/O tensors from tensor boundary sets.
     # Inputs: consumed in this graph but not produced by any layer in this graph.

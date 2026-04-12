@@ -18,7 +18,7 @@ from typing import Dict, Set, List
 from functools import cached_property
 import logging
 
-from ..types import BaseLayer, NetworkIR
+from ..types import NetworkIR
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,17 @@ class LayerGraph:
     # ========== Core Graph Properties (Cached) ==========
 
     @cached_property
+    def _graph_edges(self) -> tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+        """Build and cache both forward and reverse layer graph edges."""
+        from ..graph_algorithms import build_layer_graph
+
+        return build_layer_graph(
+            self.ir.layers,
+            self.ir.tensor_producers,
+            self.ir.tensor_consumers,
+        )
+
+    @cached_property
     def adjacency(self) -> Dict[str, Set[str]]:
         """
         Layer dependency graph: producer -> consumers.
@@ -57,13 +68,7 @@ class LayerGraph:
         Returns:
             Dict[layer_name -> set of successor layer names]
         """
-        from ..graph_algorithms import build_layer_graph
-
-        adj, _ = build_layer_graph(
-            self.ir.layers,
-            self.ir.tensor_producers,
-            self.ir.tensor_consumers,
-        )
+        adj, _ = self._graph_edges
         return adj
 
     @cached_property
@@ -74,13 +79,7 @@ class LayerGraph:
         Returns:
             Dict[layer_name -> set of predecessor layer names]
         """
-        from ..graph_algorithms import build_layer_graph
-
-        _, rev_adj = build_layer_graph(
-            self.ir.layers,
-            self.ir.tensor_producers,
-            self.ir.tensor_consumers,
-        )
+        _, rev_adj = self._graph_edges
         return rev_adj
 
     @cached_property
@@ -188,16 +187,7 @@ class LayerGraph:
         Returns:
             Set of layer names that depend on this layer
         """
-        dependents = set()
-        layer = self.ir.layers.get(layer_name)
-        if not layer:
-            return dependents
-
-        for output_tensor in layer.outputs:
-            consumers = self.ir.tensor_consumers.get(output_tensor, [])
-            dependents.update(consumers)
-
-        return dependents
+        return set(self.adjacency.get(layer_name, set()))
 
     def get_execution_order(self) -> List[str]:
         """
@@ -209,28 +199,14 @@ class LayerGraph:
         Returns:
             List of layer names in execution order
         """
-        from ..graph_algorithms import (
-            topological_sort,
-            condensation_execution_order,
-            has_cycle,
-        )
-
-        # Check if acyclic
-        if not has_cycle(
-            self.ir.layers, self.ir.tensor_producers, self.ir.input_tensors
-        ):
-            return topological_sort(
-                self.ir.layers,
-                self.ir.tensor_producers,
-                self.ir.input_tensors,
-            )
-        else:
-            # Fall back to SCC-based ordering
-            return condensation_execution_order(
-                self.ir.layers,
-                self.ir.tensor_producers,
-                self.ir.input_tensors,
-            )
+        ordered_layers: List[str] = []
+        for scc in self.get_ordered_sccs():
+            if len(scc) == 1:
+                ordered_layers.append(scc[0])
+            else:
+                # Deterministic ordering within cyclic SCC blocks.
+                ordered_layers.extend(sorted(scc))
+        return ordered_layers
 
     # ========== SCC Analysis ==========
 

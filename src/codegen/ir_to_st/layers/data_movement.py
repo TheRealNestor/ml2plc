@@ -469,7 +469,7 @@ def generate_gather_code(layer: GatherLayer, input_var: str, output_var: str) ->
 def generate_reduce_mean_code(
     layer: ReduceMeanLayer, input_var: str, output_var: str
 ) -> STCode:
-    """Generate ReduceMean code for suffix-axis reductions on flattened buffers."""
+    """Generate ReduceMean code for arbitrary static-axis reductions."""
     if not layer.input_shape or not layer.output_shape:
         raise ValueError(
             f"ReduceMean layer {layer.layer_id}: static input/output shapes are required"
@@ -486,13 +486,28 @@ def generate_reduce_mean_code(
 
     axes = layer.axes if layer.axes else tuple(range(ndim))
     normalized_axes = tuple(sorted(a if a >= 0 else a + ndim for a in axes))
-    expected_suffix_axes = tuple(range(ndim - len(normalized_axes), ndim))
+    reduced_set = set(normalized_axes)
+    kept_axes = tuple(a for a in range(ndim) if a not in reduced_set)
 
-    if normalized_axes != expected_suffix_axes:
-        raise NotImplementedError(
-            f"ReduceMean layer {layer.layer_id}: only contiguous suffix-axis reductions are "
-            f"supported (got axes={normalized_axes}, ndim={ndim})"
-        )
+    if layer.keepdims:
+        output_axis_for_input_axis = {a: a for a in kept_axes}
+    else:
+        output_axis_for_input_axis = {a: idx for idx, a in enumerate(kept_axes)}
+
+    in_strides = []
+    run = 1
+    for d in reversed(layer.input_shape):
+        in_strides.append(run)
+        run *= int(d)
+    in_strides = tuple(reversed(in_strides))
+
+    out_shape = layer.output_shape if layer.output_shape else (1,)
+    out_strides = []
+    run = 1
+    for d in reversed(out_shape):
+        out_strides.append(run)
+        run *= int(d)
+    out_strides = tuple(reversed(out_strides))
 
     reduction_factor = int(np.prod([layer.input_shape[a] for a in normalized_axes]))
     if reduction_factor <= 0 or layer.input_size % reduction_factor != 0:
@@ -505,22 +520,39 @@ def generate_reduce_mean_code(
     builder.add_line(
         f"(* Layer {layer.layer_id}: ReduceMean axes={normalized_axes} keepdims={layer.keepdims} *)"
     )
-    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+
+    builder.add_line(f"FOR j := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
-        builder.add_line("sum := 0.0;")
-        builder.add_line(f"FOR j := 0 TO {reduction_factor - 1} DO")
-        with builder.indent():
-            builder.add_line(f"sum := sum + {input_var}[i * {reduction_factor} + j];")
-        builder.add_line("END_FOR;")
-        builder.add_line(f"{output_var}[i] := sum / {float(reduction_factor)};")
+        builder.add_line(f"{output_var}[j] := 0.0;")
     builder.add_line("END_FOR;")
+
+    builder.add_line(f"FOR i := 0 TO {layer.input_size - 1} DO")
+    with builder.indent():
+        builder.add_line("j := 0;")
+        for axis in kept_axes:
+            in_stride = int(in_strides[axis])
+            in_dim = int(layer.input_shape[axis])
+            out_axis = output_axis_for_input_axis[axis]
+            out_stride = int(out_strides[out_axis])
+            builder.add_line(f"k := (i / {in_stride}) MOD {in_dim};")
+            builder.add_line(f"j := j + k * {out_stride};")
+        builder.add_line(f"{output_var}[j] := {output_var}[j] + {input_var}[i];")
+    builder.add_line("END_FOR;")
+
+    builder.add_line(f"FOR j := 0 TO {layer.output_size - 1} DO")
+    with builder.indent():
+        builder.add_line(
+            f"{output_var}[j] := {output_var}[j] / {float(reduction_factor)};"
+        )
+    builder.add_line("END_FOR;")
+
     return builder.build()
 
 
 def generate_reduce_prod_code(
     layer: ReduceProdLayer, input_var: str, output_var: str
 ) -> STCode:
-    """Generate ReduceProd code for suffix-axis reductions on flattened buffers."""
+    """Generate ReduceProd code for arbitrary static-axis reductions."""
     if not layer.input_shape or not layer.output_shape:
         raise ValueError(
             f"ReduceProd layer {layer.layer_id}: static input/output shapes are required"
@@ -537,13 +569,28 @@ def generate_reduce_prod_code(
 
     axes = layer.axes if layer.axes else tuple(range(ndim))
     normalized_axes = tuple(sorted(a if a >= 0 else a + ndim for a in axes))
-    expected_suffix_axes = tuple(range(ndim - len(normalized_axes), ndim))
+    reduced_set = set(normalized_axes)
+    kept_axes = tuple(a for a in range(ndim) if a not in reduced_set)
 
-    if normalized_axes != expected_suffix_axes:
-        raise NotImplementedError(
-            f"ReduceProd layer {layer.layer_id}: only contiguous suffix-axis reductions are "
-            f"supported (got axes={normalized_axes}, ndim={ndim})"
-        )
+    if layer.keepdims:
+        output_axis_for_input_axis = {a: a for a in kept_axes}
+    else:
+        output_axis_for_input_axis = {a: idx for idx, a in enumerate(kept_axes)}
+
+    in_strides = []
+    run = 1
+    for d in reversed(layer.input_shape):
+        in_strides.append(run)
+        run *= int(d)
+    in_strides = tuple(reversed(in_strides))
+
+    out_shape = layer.output_shape if layer.output_shape else (1,)
+    out_strides = []
+    run = 1
+    for d in reversed(out_shape):
+        out_strides.append(run)
+        run *= int(d)
+    out_strides = tuple(reversed(out_strides))
 
     reduction_factor = int(np.prod([layer.input_shape[a] for a in normalized_axes]))
     if reduction_factor <= 0 or layer.input_size % reduction_factor != 0:
@@ -556,15 +603,25 @@ def generate_reduce_prod_code(
     builder.add_line(
         f"(* Layer {layer.layer_id}: ReduceProd axes={normalized_axes} keepdims={layer.keepdims} *)"
     )
-    builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
+
+    builder.add_line(f"FOR j := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
-        builder.add_line("sum := 1.0;")
-        builder.add_line(f"FOR j := 0 TO {reduction_factor - 1} DO")
-        with builder.indent():
-            builder.add_line(f"sum := sum * {input_var}[i * {reduction_factor} + j];")
-        builder.add_line("END_FOR;")
-        builder.add_line(f"{output_var}[i] := sum;")
+        builder.add_line(f"{output_var}[j] := 1.0;")
     builder.add_line("END_FOR;")
+
+    builder.add_line(f"FOR i := 0 TO {layer.input_size - 1} DO")
+    with builder.indent():
+        builder.add_line("j := 0;")
+        for axis in kept_axes:
+            in_stride = int(in_strides[axis])
+            in_dim = int(layer.input_shape[axis])
+            out_axis = output_axis_for_input_axis[axis]
+            out_stride = int(out_strides[out_axis])
+            builder.add_line(f"k := (i / {in_stride}) MOD {in_dim};")
+            builder.add_line(f"j := j + k * {out_stride};")
+        builder.add_line(f"{output_var}[j] := {output_var}[j] * {input_var}[i];")
+    builder.add_line("END_FOR;")
+
     return builder.build()
 
 
@@ -644,6 +701,41 @@ def generate_runtime_matmul_code(
                 builder.add_line(f"sum := sum + {lhs}[j * {k} + i] * {rhs}[i];")
             builder.add_line("END_FOR;")
             builder.add_line(f"{output_var}[j] := sum;")
+        builder.add_line("END_FOR;")
+        return builder.build()
+
+    # Batched matrix-matrix: (..., M, K) @ (..., K, N) -> (..., M, N)
+    if len(lhs_shape) >= 3 and len(rhs_shape) >= 3:
+        lhs_batch = lhs_shape[:-2]
+        rhs_batch = rhs_shape[:-2]
+        if lhs_batch != rhs_batch:
+            raise NotImplementedError(
+                f"Runtime MatMul layer {layer.layer_id}: unsupported batch broadcast "
+                f"lhs_batch={lhs_batch}, rhs_batch={rhs_batch}"
+            )
+
+        m, k = lhs_shape[-2], lhs_shape[-1]
+        _, n = rhs_shape[-2], rhs_shape[-1]
+        batch_count = int(np.prod(lhs_batch)) if lhs_batch else 1
+
+        lhs_batch_stride = m * k
+        rhs_batch_stride = k * n
+        out_batch_stride = m * n
+
+        builder.add_line(f"FOR b := 0 TO {batch_count - 1} DO")
+        with builder.indent():
+            builder.add_line(f"FOR j := 0 TO {out_batch_stride - 1} DO")
+            with builder.indent():
+                builder.add_line("sum := 0.0;")
+                builder.add_line(f"FOR i := 0 TO {k - 1} DO")
+                with builder.indent():
+                    builder.add_line(
+                        f"sum := sum + {lhs}[b * {lhs_batch_stride} + (j / {n}) * {k} + i] * "
+                        f"{rhs}[b * {rhs_batch_stride} + i * {n} + (j MOD {n})];"
+                    )
+                builder.add_line("END_FOR;")
+                builder.add_line(f"{output_var}[b * {out_batch_stride} + j] := sum;")
+            builder.add_line("END_FOR;")
         builder.add_line("END_FOR;")
         return builder.build()
 
@@ -762,9 +854,9 @@ def generate_binary_elementwise_code(
 def generate_unary_elementwise_code(
     layer: UnaryElementwiseLayer, input_var: str, output_var: str
 ) -> STCode:
-    """Generate unary elementwise code for Sqrt/Reciprocal."""
+    """Generate unary elementwise code for Sqrt/Reciprocal/Neg."""
     op = layer.operation
-    if op not in {"Sqrt", "Reciprocal"}:
+    if op not in {"Sqrt", "Reciprocal", "Neg"}:
         raise NotImplementedError(
             f"Unary elementwise op '{op}' is not supported in ST generator"
         )
@@ -775,7 +867,9 @@ def generate_unary_elementwise_code(
     with builder.indent():
         if op == "Sqrt":
             builder.add_line(f"{output_var}[i] := SQRT({input_var}[i]);")
-        else:
+        elif op == "Reciprocal":
             builder.add_line(f"{output_var}[i] := 1.0 / {input_var}[i];")
+        else:
+            builder.add_line(f"{output_var}[i] := -{input_var}[i];")
     builder.add_line("END_FOR;")
     return builder.build()

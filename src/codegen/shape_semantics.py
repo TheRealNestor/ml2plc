@@ -63,6 +63,7 @@ def _shape_rule(
 @register_shape_rule("Unsqueeze")
 @register_shape_rule("Transpose")
 @register_shape_rule("Slice")
+@register_shape_rule("Neg")
 def _passthrough_role_rule(
     op_type: str,
     input_roles: Tuple[TensorRole, ...],
@@ -88,12 +89,18 @@ def _reshape_role_rule(
     input_roles: Tuple[TensorRole, ...],
     layer_dict: Dict,
 ) -> Tuple[TensorRole, ...]:
-    # Reshape consumes a SHAPE tensor but emits a VALUE tensor.
+    # Reshape consumes a shape spec at input[1].
     if len(input_roles) > 1 and input_roles[1] != TensorRole.SHAPE:
         raise ValueError(
             f"Reshape '{layer_dict.get('name', '?')}' expects input[1] to be SHAPE, "
             f"got {input_roles[1].value}"
         )
+
+    # Shape-subgraph reshape: SHAPE -> SHAPE.
+    if input_roles and input_roles[0] == TensorRole.SHAPE:
+        return (TensorRole.SHAPE,)
+
+    # Value-path reshape: VALUE -> VALUE.
     return (TensorRole.VALUE,)
 
 
@@ -103,11 +110,21 @@ def _matmul_role_rule(
     input_roles: Tuple[TensorRole, ...],
     layer_dict: Dict,
 ) -> Tuple[TensorRole, ...]:
-    # MatMul should always operate on VALUE tensors.
-    if any(role == TensorRole.SHAPE for role in input_roles[:2]):
+    lhs = input_roles[0] if len(input_roles) > 0 else TensorRole.VALUE
+    rhs = input_roles[1] if len(input_roles) > 1 else TensorRole.VALUE
+
+    # Shape arithmetic path (common in einsum/reshape helper subgraphs).
+    if lhs == TensorRole.SHAPE and rhs == TensorRole.SHAPE:
+        return (TensorRole.SHAPE,)
+
+    # Mixed SHAPE/VALUE inputs are invalid.
+    if lhs != rhs:
         raise ValueError(
-            f"MatMul '{layer_dict.get('name', '?')}' received SHAPE tensor as data input"
+            f"MatMul '{layer_dict.get('name', '?')}' received mixed roles: "
+            f"lhs={lhs.value}, rhs={rhs.value}"
         )
+
+    # Regular value matmul path.
     return (TensorRole.VALUE,)
 
 

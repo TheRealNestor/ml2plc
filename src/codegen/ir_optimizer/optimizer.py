@@ -7,10 +7,9 @@ Only applies passes that declare support for each region type.
 
 import logging
 from typing import List, Optional, Dict
-from collections import defaultdict
 
 from ..graph import LayerGraph
-from ..ir_utils import build_tensor_maps
+from ..ir_utils import TensorMapBuilder
 from ..types import NetworkIR, ModelIR, RegionKind
 from .base_pass import OptimizationPass
 from .result import OptimizationResult
@@ -179,7 +178,7 @@ class IROptimizer:
         Returns:
             (tensor_producers, tensor_consumers) tuple
         """
-        return build_tensor_maps(layers)
+        return TensorMapBuilder.build(layers).as_tuple()
 
     def _renumber_layer_ids(self, layers: dict, execution_order: list) -> dict:
         """Renumber layer IDs to be sequential based on execution order."""

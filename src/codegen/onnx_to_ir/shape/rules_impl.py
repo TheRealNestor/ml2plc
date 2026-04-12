@@ -1,4 +1,4 @@
-"""Legacy module intentionally disabled.
+"""Removed shim module.
 
 Use `codegen.onnx_to_ir.shape.rules` (or `codegen.onnx_to_ir.shape`) directly.
 """

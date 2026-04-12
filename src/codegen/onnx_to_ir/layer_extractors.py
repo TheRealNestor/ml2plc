@@ -9,6 +9,7 @@ from typing import Dict, List
 from ..types import *
 from .shape import (
     infer_layer_shapes,
+    infer_reshape_output_shape,
     get_feature_sizes,
     validate_inferred_shapes,
 )
@@ -275,6 +276,12 @@ def extract_reshape_layer(
     target_shape = None
     if len(inputs) > 1 and inputs[1].is_weight and inputs[1].value is not None:
         target_shape = tuple(int(dim) for dim in inputs[1].value)
+    elif layer.get("_inferred_output_shape"):
+        target_shape = tuple(int(dim) for dim in layer["_inferred_output_shape"])
+        logger.debug(
+            f"Reshape layer {layer_id}: using shape-engine inferred output shape "
+            f"as target_shape={target_shape}"
+        )
     elif layer.get("resolved_outputs") and layer["resolved_outputs"][0].shape:
         # Fallback: if shape tensor is not constant but output shape is already
         # statically known from ONNX/inference, use that static output shape.
@@ -291,21 +298,25 @@ def extract_reshape_layer(
 
     input_size = inputs[0].size
     input_shape = inputs[0].shape
+    attrs = layer.get("attributes", {})
 
     logger.info(
         f"Reshape '{layer['name']}': input_shape={input_shape} (size={input_size}), "
         f"target_shape={target_shape}"
     )
 
-    # Handle -1 in target shape
+    target_shape = infer_reshape_output_shape(
+        input_shape,
+        target_shape,
+        allowzero=bool(attrs.get("allowzero", 0)),
+    )
+
+    if not target_shape:
+        raise ValueError(f"Reshape layer {layer_id}: invalid target shape")
+
     if -1 in target_shape:
-        known_dims = [d for d in target_shape if d > 0]
-        known_prod = int(np.prod(known_dims)) if known_dims else 1
-        inferred = input_size // known_prod
-        target_shape = tuple(inferred if d == -1 else d for d in target_shape)
-        logger.info(
-            f"Reshape '{layer['name']}': resolved -1, "
-            f"target_shape now {target_shape}"
+        raise ValueError(
+            f"Reshape layer {layer_id}: unresolved -1 in target shape {target_shape}"
         )
 
     output_size = int(np.prod(target_shape))
@@ -740,10 +751,6 @@ def extract_squeeze_layer(
             f"input_shape={input_shape}, output_shape={output_shape}. "
             f"This indicates a shape inference failure."
         )
-
-    # Adjust axes for batch-dim-stripped shapes
-    if axes and any(a > 0 for a in axes):
-        axes = tuple(a - 1 for a in axes if a != 0)
 
     return SqueezeLayer(
         layer_id=layer_id,
@@ -1643,7 +1650,7 @@ def _extract_binary_elementwise_layer(
 def _extract_unary_elementwise_layer(
     enriched_layer: Dict, layer_id: int, analyzer, operation: str
 ) -> UnaryElementwiseLayer:
-    """Extract unary elementwise layer (Sqrt/Reciprocal)."""
+    """Extract unary elementwise layer (Sqrt/Reciprocal/Neg)."""
     inputs = enriched_layer["resolved_inputs"]
     outputs = enriched_layer["resolved_outputs"]
 
@@ -1795,4 +1802,5 @@ LAYER_EXTRACTORS = {
     "Reciprocal": lambda l, i, a: _extract_unary_elementwise_layer(
         l, i, a, "Reciprocal"
     ),
+    "Neg": lambda l, i, a: _extract_unary_elementwise_layer(l, i, a, "Neg"),
 }

@@ -4,17 +4,14 @@ Main ONNX to IR conversion orchestration.
 
 import numpy as np
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from collections import defaultdict
-
-import onnx
-from onnx import numpy_helper, TensorProto
 
 from ..types import NetworkIR, BaseLayer
 from ..onnx_model import ONNXModel
-from ..graph_algorithms import condensation_execution_order, topo_sort_onnx_nodes
+from ..graph.core import LayerGraph
 from ..shape_semantics import ShapeSemanticsTracker
-from .tensor_resolution import TensorResolver, ResolvedTensor
+from .tensor_resolution import TensorResolver
 from .shape import (
     infer_layer_shapes,
     validate_model_shapes,
@@ -23,277 +20,9 @@ from .shape import (
 from .layer_extractors import LAYER_EXTRACTORS
 from .state_detection import detect_state_tensors
 from .einsum_lowering import lower_supported_einsum_layers
+from .folding import run_constant_folding, try_fold_enriched_shape_layer
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# Constant Folding
-# ============================================================================
-
-# Operators that can be constant-folded when all inputs are known at compile time
-_FOLDABLE_OPS = {
-    "Shape",
-    "Cast",
-    "Slice",
-    "Concat",
-    "Expand",
-    "Unsqueeze",
-    "Gather",
-    "Reshape",
-    "Squeeze",
-}
-
-
-def _collect_constant_values(model: onnx.ModelProto) -> Dict[str, np.ndarray]:
-    """
-    Pre-collect all constant/initializer tensors for constant folding.
-
-    Gathers values from:
-    - Graph initializers (model weights/parameters)
-    - Constant nodes (embedded constant tensors)
-    - Graph inputs with fully static shapes (treated as shape-only constants
-      for ops like Shape that only inspect the tensor's dimensions)
-
-    Returns:
-        Dict mapping tensor name -> numpy array value
-    """
-    constants: Dict[str, np.ndarray] = {}
-
-    # From initializers
-    for init in model.graph.initializer:
-        constants[init.name] = numpy_helper.to_array(init)
-
-    # From Constant nodes
-    for node in model.graph.node:
-        if node.op_type == "Constant":
-            for attr in node.attribute:
-                if attr.name == "value":
-                    val = numpy_helper.to_array(attr.t)
-                    for out in node.output:
-                        constants[out] = val
-
-    return constants
-
-
-def _collect_static_input_shapes(model: onnx.ModelProto) -> Dict[str, Tuple[int, ...]]:
-    """
-    Collect fully-static shapes for graph inputs (excluding initializers).
-
-    Returns:
-        Dict mapping input tensor name -> static shape tuple.
-        Only includes inputs where every dimension is a concrete integer.
-    """
-    initializer_names = {init.name for init in model.graph.initializer}
-    static_shapes: Dict[str, Tuple[int, ...]] = {}
-
-    for inp in model.graph.input:
-        if inp.name in initializer_names:
-            continue
-        type_proto = inp.type.tensor_type
-        if not type_proto.HasField("shape"):
-            continue
-        dims = []
-        is_static = True
-        for dim in type_proto.shape.dim:
-            if dim.dim_value > 0:
-                dims.append(dim.dim_value)
-            else:
-                is_static = False
-                break
-        if is_static and dims:
-            static_shapes[inp.name] = tuple(dims)
-
-    return static_shapes
-
-
-def _try_constant_fold(
-    node,
-    constant_values: Dict[str, np.ndarray],
-    static_input_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
-) -> bool:
-    """
-    Try to constant-fold a node whose inputs are all known constants.
-
-    If all inputs to the node are available in constant_values, we evaluate the
-    operation using NumPy and store the result back into constant_values for
-    downstream nodes.
-
-    Special case: Shape nodes can be folded if the input has a known static
-    shape, even if the input data is not constant.
-
-    Args:
-        node: ONNX graph node
-        constant_values: Mutable dict of tensor_name -> numpy value
-        static_input_shapes: Optional dict of tensor_name -> static shape tuple
-
-    Returns:
-        True if the node was successfully folded (outputs stored in constant_values),
-        False if it cannot be folded (has runtime inputs or unsupported op).
-    """
-    op = node.op_type
-
-    if op not in _FOLDABLE_OPS:
-        return False
-
-    # Special case: Shape op only needs the input's shape, not its data
-    if op == "Shape" and static_input_shapes is not None:
-        input_name = node.input[0] if node.input else None
-        if input_name:
-            shape = None
-            if input_name in constant_values:
-                shape = constant_values[input_name].shape
-            elif input_name in static_input_shapes:
-                shape = static_input_shapes[input_name]
-
-            if shape is not None:
-                result = np.array(shape, dtype=np.int64)
-                for out in node.output:
-                    if out:
-                        constant_values[out] = result
-                logger.debug(
-                    f"Constant-folded Shape node '{node.name}' via static shape -> {result}"
-                )
-                return True
-
-    # Preserve positional alignment: use None for empty/optional inputs.
-    # This is critical for ops like Slice where inputs[3] means "axes" —
-    # if we compact out empty strings, the index mapping breaks.
-    inputs = [constant_values.get(inp) if inp else None for inp in node.input]
-
-    # All non-optional inputs must be known constants.
-    # An input slot is "required" if its name is a non-empty string.
-    if any(v is None and inp != "" for inp, v in zip(node.input, inputs)):
-        return False
-
-    try:
-        result = _evaluate_constant_op(op, node, inputs)
-    except Exception as e:
-        logger.debug(f"Could not constant-fold {op} '{node.name}': {e}")
-        return False
-
-    # Store folded result for downstream nodes
-    for out in node.output:
-        if out:
-            constant_values[out] = np.array(result)
-
-    logger.debug(
-        f"Constant-folded {op} node '{node.name}' -> "
-        f"shape {np.array(result).shape}, dtype {np.array(result).dtype}"
-    )
-    return True
-
-
-def _evaluate_constant_op(
-    op: str, node, inputs: List[Optional[np.ndarray]]
-) -> np.ndarray:
-    """
-    Evaluate a single ONNX operator on constant numpy inputs.
-
-    inputs is positionally aligned with node.input — optional slots that were
-    empty strings in the ONNX node are represented as None here.
-
-    Args:
-        op: ONNX operator type string
-        node: ONNX node (for reading attributes)
-        inputs: Positionally-aligned list of numpy arrays; None means the slot
-                was an empty/optional input in the ONNX graph.
-
-    Returns:
-        Result numpy array
-
-    Raises:
-        ValueError: If the op is not supported for constant folding
-        Exception: If evaluation fails for any reason
-    """
-
-    def _get(i):
-        """Return inputs[i] if it exists and is not None."""
-        return inputs[i] if i < len(inputs) else None
-
-    if op == "Shape":
-        return np.array(inputs[0].shape, dtype=np.int64)
-
-    elif op == "Cast":
-        to_type = next(a.i for a in node.attribute if a.name == "to")
-        np_dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE.get(to_type, np.float32)
-        return inputs[0].astype(np_dtype)
-
-    elif op == "Slice":
-        data = inputs[0]
-        starts = _get(1).flatten().tolist() if _get(1) is not None else [0]
-        ends = _get(2).flatten().tolist() if _get(2) is not None else [data.shape[0]]
-        axes = (
-            _get(3).flatten().tolist()
-            if _get(3) is not None
-            else list(range(len(starts)))
-        )
-        steps = _get(4).flatten().tolist() if _get(4) is not None else [1] * len(starts)
-        slices = [slice(None)] * data.ndim
-        for a, s, e, st in zip(axes, starts, ends, steps):
-            dim = data.shape[a]
-            s = min(max(s + dim if s < 0 else s, 0), dim)
-            e = min(max(e + dim if e < 0 else e, 0), dim)
-            slices[a] = slice(int(s), int(e), int(st))
-        return data[tuple(slices)]
-
-    elif op == "Concat":
-        axis = next((a.i for a in node.attribute if a.name == "axis"), 0)
-        # Filter out None slots (empty optional inputs are invalid for Concat,
-        # but be defensive)
-        real_inputs = [x for x in inputs if x is not None]
-        return np.concatenate(real_inputs, axis=axis)
-
-    elif op == "Unsqueeze":
-        data = inputs[0]
-        axes_input = _get(1)
-        if axes_input is not None:
-            axes = sorted(axes_input.flatten().tolist())
-        else:
-            axes = sorted(
-                next((list(a.ints) for a in node.attribute if a.name == "axes"), [])
-            )
-        result = data
-        for ax in axes:
-            result = np.expand_dims(result, axis=int(ax))
-        return result
-
-    elif op == "Squeeze":
-        data = inputs[0]
-        axes_input = _get(1)
-        if axes_input is not None:
-            axes = tuple(sorted(axes_input.flatten().tolist(), reverse=True))
-        else:
-            axes = tuple(
-                sorted(
-                    next(
-                        (list(a.ints) for a in node.attribute if a.name == "axes"), []
-                    ),
-                    reverse=True,
-                )
-            )
-        if axes:
-            result = data
-            for ax in axes:
-                result = np.squeeze(result, axis=int(ax))
-            return result
-        else:
-            return np.squeeze(data)
-
-    elif op == "Expand":
-        target_shape = inputs[1].flatten().tolist()
-        return np.broadcast_to(inputs[0], [int(s) for s in target_shape]).copy()
-
-    elif op == "Gather":
-        axis = next((a.i for a in node.attribute if a.name == "axis"), 0)
-        return np.take(inputs[0], inputs[1].astype(np.intp), axis=axis)
-
-    elif op == "Reshape":
-        shape = inputs[1].flatten().tolist()
-        return inputs[0].reshape([int(s) for s in shape])
-
-    else:
-        raise ValueError(f"Unsupported constant-fold op: {op}")
 
 
 # ============================================================================
@@ -328,34 +57,7 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
         raise
 
     # --- Constant-folding pre-pass ---
-    # Collect all known constant tensors (initializers + Constant nodes)
-    constant_values = _collect_constant_values(analyzer.model)
-    logger.debug(
-        f"Constant folding: {len(constant_values)} initial constants collected"
-    )
-
-    # Collect static input shapes so Shape ops on inputs can be folded
-    static_input_shapes = _collect_static_input_shapes(analyzer.model)
-    if static_input_shapes:
-        logger.debug(
-            f"Constant folding: {len(static_input_shapes)} static input shape(s): "
-            + ", ".join(f"{k} -> {v}" for k, v in static_input_shapes.items())
-        )
-
-    # Walk the graph in topological order and fold what we can.
-    # Build a set of node output names that were fully folded so we can skip
-    # them during the main layer-extraction loop.
-    folded_outputs: set = set()
-    for node in topo_sort_onnx_nodes(analyzer.model.graph):
-        if node.op_type == "Constant":
-            # Constant nodes are already in constant_values and will be naturally skipped by the extractor
-            # because they have no layer extractor registered.
-            continue
-
-        if _try_constant_fold(node, constant_values, static_input_shapes):
-            for out in node.output:
-                if out:
-                    folded_outputs.add(out)
+    constant_values, folded_outputs = run_constant_folding(analyzer)
 
     folded_count = len(folded_outputs)
     if folded_count > 0:
@@ -403,24 +105,62 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
         enriched_layer = resolver.resolve_layer_tensors(layer_dict)
         enriched_layer["_shape_semantics"] = shape_semantics
         _, output_shape = infer_layer_shapes(enriched_layer)
+        enriched_layer["_inferred_output_shape"] = output_shape
 
-        for out_name in enriched_layer["outputs"]:
-            resolver.store_inferred_shape(out_name, output_shape)
-
-        if output_shape and enriched_layer["resolved_outputs"]:
-            enriched_layer["resolved_outputs"] = [
-                ResolvedTensor(
-                    name=out.name,
-                    shape=output_shape,
-                    dtype=out.dtype,
-                    size=int(np.prod(output_shape)) if output_shape else 0,
-                    value=out.value,
-                    is_weight=out.is_weight,
+        # Propagate inferred shape conservatively.
+        # IMPORTANT: A single inferred output shape cannot be blindly applied to
+        # all outputs of multi-output operators (or to outputs with already-known
+        # distinct ONNX shapes), as that can corrupt downstream rank semantics.
+        if enriched_layer["outputs"]:
+            if output_shape:
+                # Update primary output shape (index 0) from semantic inference.
+                resolver.store_inferred_shape(
+                    enriched_layer["outputs"][0], output_shape
                 )
-                for out in enriched_layer["resolved_outputs"]
-            ]
+
+            # Preserve any per-output shapes that were already resolved from ONNX
+            # tensor info or compile-time constants.
+            for resolved_out in enriched_layer["resolved_outputs"]:
+                if (
+                    resolved_out.shape
+                    and resolved_out.name not in resolver.inferred_shapes
+                ):
+                    resolver.store_inferred_shape(resolved_out.name, resolved_out.shape)
+
+        output_names = tuple(name for name in enriched_layer.get("outputs", []) if name)
+
+        folded_value = try_fold_enriched_shape_layer(enriched_layer, constant_values)
+        if folded_value is not None:
+            for out_name in output_names:
+                constant_values[out_name] = np.array(folded_value)
+                folded_outputs.add(out_name)
+                resolver.store_inferred_shape(
+                    out_name, tuple(np.array(folded_value).shape)
+                )
+            continue
 
         shape_semantics.record_layer(enriched_layer)
+
+        if output_names and not output_shape:
+            if any(
+                shape_semantics.role_of(name).value == "VALUE" for name in output_names
+            ):
+                raise ValueError(
+                    f"Layer {layer_id} ({enriched_layer.get('name', '?')} / "
+                    f"{enriched_layer.get('op_type', '?')}) has unresolved VALUE output shape. "
+                    "Refuse to lower without fully static runtime shape contracts."
+                )
+
+        if output_names and all(
+            shape_semantics.role_of(name).value == "SHAPE" for name in output_names
+        ):
+            logger.debug(
+                "Skipping SHAPE-only node %d: %s (%s)",
+                layer_id,
+                enriched_layer.get("name", "?"),
+                enriched_layer.get("op_type", "?"),
+            )
+            continue
 
         op_type = enriched_layer["op_type"]
         if op_type in LAYER_EXTRACTORS:
@@ -460,11 +200,17 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
             f"Add extractors to LAYER_EXTRACTORS before converting this model."
         )
 
-    # Execution ordering using SCC-condensation
-    # This automatically handles both cyclic and acyclic graphs gracefully
-    execution_order = condensation_execution_order(
-        layers, tensor_producers, input_tensors
+    # Execution ordering through canonical LayerGraph abstraction
+    temp_ir = NetworkIR(
+        layers=layers,
+        execution_order=[],
+        tensor_producers=tensor_producers,
+        tensor_consumers=tensor_consumers,
+        input_tensors=input_tensors,
+        output_tensors=output_tensors,
+        state_tensors={},
     )
+    execution_order = LayerGraph(temp_ir).get_execution_order()
 
     # Detect state tensors from RNN-family operators (LSTM, GRU, RNN, etc.)
     state_tensors = detect_state_tensors(analyzer, layers)

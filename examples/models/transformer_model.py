@@ -266,23 +266,10 @@ class TransformerTemperatureModel(MLModel):
         return history
 
     def export_to_onnx(self, output_path: str | None = None) -> str:
-        """Export model to ONNX format using tf2onnx.
+        """Export model to ONNX format using tf2onnx with concrete input shape.
 
-        NOTE: For ml2plc Structured Text compilation, the ONNX model MUST have
-        concrete input shapes (no dynamic/None dimensions).
-
-        TensorFlow models typically export with dynamic batch dimensions.
-        To fix this for ST compilation, you have options:
-
-        Option 1 (Recommended): Use tf2onnx with input_signature specifying concrete shapes
-          - Requires modifying the model export pipeline
-          - Best for production use
-
-        Option 2: Use onnx-simplifier to resolve shapes after export
-          - onnx-simplifier --input-shape "temperature_input:1,20,1" model.onnx
-
-        Option 3: Modify model input layer to use concrete shape
-          - keras_input = tf.keras.Input(shape=(20, 1), batch_size=1)
+        We export from the in-memory Keras model with an explicit input signature
+        to keep the ONNX graph deterministic for compiler shape analysis.
         """
         if output_path is None:
             # Save ONNX to examples/models/onnx
@@ -292,41 +279,31 @@ class TransformerTemperatureModel(MLModel):
 
         Path(output_path).parent.mkdir(exist_ok=True)
 
-        # Create temporary SavedModel for tf2onnx conversion
-        saved_model_dir = Path(self.model_path.parent) / ".tmp_saved_model"
-        tf.saved_model.save(self.model, str(saved_model_dir))
+        if self.model is None:
+            self.create_model()
 
         try:
-            cmd = [
-                sys.executable,
-                "-m",
-                "tf2onnx.convert",
-                "--saved-model",
-                str(saved_model_dir),
-                "--output",
-                output_path,
-                "--opset",
-                "13",
+            import tf2onnx
+
+            input_signature = [
+                tf.TensorSpec(
+                    shape=(1, self.sequence_length, 1),
+                    dtype=tf.float32,
+                    name="temperature_input",
+                )
             ]
 
             print(f"Exporting to ONNX: {output_path}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-            # Clean up temporary SavedModel
-            import shutil
-
-            if saved_model_dir.exists():
-                shutil.rmtree(saved_model_dir)
-
-            if result.returncode == 0:
-                print(f"✓ ONNX export successful: {output_path}")
-                return output_path
-            else:
-                print(f"✗ ONNX export failed:\n{result.stderr}")
-                sys.exit(1)
+            tf2onnx.convert.from_keras(
+                self.model,
+                input_signature=input_signature,
+                opset=13,
+                output_path=output_path,
+            )
+            print(f"✓ ONNX export successful: {output_path}")
+            return output_path
         except Exception as e:
-            print(f"Error exporting to ONNX: {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Error exporting to ONNX: {e}") from e
 
     def demo(self, num_samples: int = 5):
         """Print a quick demo of predictions."""

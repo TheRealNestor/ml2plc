@@ -6,7 +6,6 @@ Centralizes common IR operations to avoid duplication across the pipeline.
 
 Key Components:
   - TensorMapBuilder: Unified class for constructing and querying tensor maps
-  - Helper functions: Maintain backward compatibility with legacy code
 """
 
 from typing import Dict, List, Set, Tuple
@@ -196,82 +195,5 @@ class TensorMapBuilder:
         return self.consumers.get(tensor, [])
 
     def as_tuple(self) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
-        """Return maps as tuple for backward compatibility."""
+        """Return producer/consumer maps as plain dictionaries."""
         return (self.producers, dict(self.consumers))
-
-
-# ============================================================================
-# Backward-Compatibility Functions
-# ============================================================================
-
-
-def build_tensor_maps(
-    layers: Dict[str, BaseLayer],
-) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
-    """
-    Legacy function for backward compatibility.
-
-    Use TensorMapBuilder.build().as_tuple() instead in new code.
-    """
-    builder = TensorMapBuilder.build(layers)
-    return builder.as_tuple()
-
-
-def filter_tensor_maps_for_nodes(
-    tensor_producers: Dict[str, str],
-    tensor_consumers: Dict[str, List[str]],
-    component_nodes: Set[str],
-) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
-    """
-    Legacy function for backward compatibility.
-
-    Use TensorMapBuilder.extract_for_nodes() instead in new code.
-    """
-    builder = TensorMapBuilder()
-    builder.producers = tensor_producers
-    builder.consumers = defaultdict(list, tensor_consumers)
-    filtered = builder.extract_for_nodes(component_nodes)
-    return filtered.as_tuple()
-
-
-def extract_component_input_tensors(
-    graph: NetworkIR,
-    component_nodes: Set[str],
-    filtered_producers: Dict[str, str],
-) -> Set[str]:
-    """
-    Legacy function for backward compatibility.
-
-    Use TensorMapBuilder.extract_input_tensors() instead in new code.
-    """
-    builder = TensorMapBuilder()
-    builder.producers = filtered_producers
-    return builder.extract_input_tensors(graph, component_nodes)
-
-
-def extract_component_output_tensors(
-    graph: NetworkIR,
-    component_nodes: Set[str],
-) -> Tuple[str, ...]:
-    """
-    Legacy function for backward compatibility.
-
-    Build a TensorMapBuilder from graph and use extract_output_tensors() instead.
-    """
-    builder = TensorMapBuilder()
-    builder.producers = graph.tensor_producers
-    return builder.extract_output_tensors(graph, component_nodes)
-
-
-def extract_component_state_tensors(
-    graph: NetworkIR,
-    component_nodes: Set[str],
-) -> Tuple[str, ...]:
-    """
-    Legacy function for backward compatibility.
-
-    Build a TensorMapBuilder from graph and use extract_state_tensors() instead.
-    """
-    builder = TensorMapBuilder()
-    builder.producers = graph.tensor_producers
-    return builder.extract_state_tensors(graph, component_nodes)

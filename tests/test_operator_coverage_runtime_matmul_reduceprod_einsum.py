@@ -160,7 +160,8 @@ def test_reduce_prod_extracts_and_generates_st():
 
         st_code = translate_ir_to_st(network_ir, fb_name="ReduceProdModel")
         assert "ReduceProd" in st_code
-        assert "sum := 1.0;" in st_code
+    assert "output_data[j] := 1.0;" in st_code
+    assert "output_data[j] := output_data[j] * input_data[i];" in st_code
 
 
 def test_einsum_extracts_and_generates_st():
