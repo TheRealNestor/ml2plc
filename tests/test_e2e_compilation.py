@@ -3,6 +3,7 @@ End-to-end compilation tests: ONNX model → Structured Text → Validation.
 
 Tests the complete compilation pipeline for different model architectures:
 - LSTM: Recurrent temporal model
+- Bidirectional LSTM: Two-direction temporal context model
 - GRU: Gated recurrent unit (simpler than LSTM)
 - MLP: Multi-layer perceptron (feedforward)
 - CNN: Convolutional neural network
@@ -72,6 +73,7 @@ from translation_validation.validation import (
     translate_and_save,
     load_translated_function,
     compare_inference,
+    run_onnx_inference,
     generate_test_inputs,
 )
 
@@ -202,6 +204,8 @@ def compile_and_validate_functional(
     test_name: str,
     num_samples: int = 3,
     input_shape: tuple = (20,),
+    rtol: float = 1e-3,
+    atol: float = 1e-3,
 ) -> dict:
     """
     MINIMAL FUNCTIONAL VALIDATION - verifies translation doesn't break logic.
@@ -248,8 +252,8 @@ def compile_and_validate_functional(
             translated_func,
             test_inputs,
             model_type="onnx",
-            rtol=1e-3,  # Reasonable for 1-epoch trained model
-            atol=1e-3,
+            rtol=rtol,
+            atol=atol,
             verbose=False,
         )
         results["type"] = "functional"
@@ -319,6 +323,72 @@ class TestLSTMModel:
         )
         logger.info(
             f"LSTM Functional: max_abs_diff={results['max_abs_diff']:.2e}, "
+            f"max_rel_diff={results['max_rel_diff']:.2e}"
+        )
+
+
+class TestBidirectionalLSTMModel:
+    """Bidirectional LSTM model tests: temporal processing in both directions."""
+
+    @pytest.fixture
+    def bilstm_onnx(self, models_dir):
+        """Load cached Bidirectional LSTM ONNX model."""
+        onnx_dir = models_dir / "onnx"
+        candidates = list(onnx_dir.glob("bilstm_model_*.onnx"))
+        assert (
+            candidates
+        ), "Bidirectional LSTM model not found. Models should be cached by conftest."
+        return candidates[0]
+
+    @pytest.mark.fast
+    def test_bilstm_structural(self, bilstm_onnx, tmp_output_dir):
+        """
+        FAST: Test Bidirectional LSTM structural validation (10 samples).
+
+        Catches: recurrent graph conversion/codegen issues with bidirectional topology.
+        Uses: Untrained ONNX (fast caching)
+        """
+        results = compile_and_validate_structural(
+            bilstm_onnx,
+            tmp_output_dir,
+            "bilstm_struct",
+            num_samples=10,
+            input_shape=(20,),
+        )
+        assert results["passed"], f"Structural validation failed: {results}"
+        logger.info(f"BiLSTM Structural: max_abs_diff={results['max_abs_diff']:.2e}")
+
+    @pytest.mark.slow
+    def test_bilstm_functional(
+        self, bilstm_onnx, tmp_output_dir, train_minimal_model, models_dir
+    ):
+        """
+        SLOW: Minimal functional validation.
+
+        Verifies that translation preserves semantic correctness for BiLSTM.
+        Uses: Trained ONNX model (minimal training)
+        """
+        trained_model = train_minimal_model(
+            models_dir / "bidirectional_lstm_model.py",
+            "BidirectionalLSTMTemperatureModel",
+            "bilstm",
+        )
+
+        results = compile_and_validate_functional(
+            trained_model,
+            tmp_output_dir,
+            "bilstm_func",
+            num_samples=3,
+            input_shape=(20,),
+            rtol=5e-2,
+            atol=5e-2,
+        )
+        assert results["passed"], (
+            f"Functional validation failed: max_abs_diff={results.get('max_abs_diff', 'N/A')}, "
+            f"error={results.get('error', 'Unknown')}"
+        )
+        logger.info(
+            f"BiLSTM Functional: max_abs_diff={results['max_abs_diff']:.2e}, "
             f"max_rel_diff={results['max_rel_diff']:.2e}"
         )
 

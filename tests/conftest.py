@@ -115,6 +115,11 @@ def setup_test_models():
 
     models_config = [
         ("lstm_model.py", "LSTMTemperatureModel", "lstm"),
+        (
+            "bidirectional_lstm_model.py",
+            "BidirectionalLSTMTemperatureModel",
+            "bilstm",
+        ),
         ("conv_model.py", "ConvTemperatureModel", "conv"),
         ("gru_model.py", "GRUTemperatureModel", "gru"),
         ("resnet_model.py", "ResNetTemperatureModel", "resnet"),
