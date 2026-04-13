@@ -39,7 +39,14 @@ Example:
     model_ir = regionize_network_ir(network_ir)
 """
 
-from .converter import onnx_to_ir
+from .converter import (
+    onnx_to_ir,
+    canonicalize_model_for_ir,
+    prepare_model_for_ir,
+    extract_typed_ir_graph,
+    schedule_network_ir,
+    CanonicalizedIRInputs,
+)
 from .regionizer import regionize_network_ir
 from .tensor_resolution import TensorResolver, ResolvedTensor
 from .shape import (
@@ -52,6 +59,11 @@ from .layer_extractors import LAYER_EXTRACTORS
 
 __all__ = [
     "onnx_to_ir",
+    "canonicalize_model_for_ir",
+    "prepare_model_for_ir",
+    "extract_typed_ir_graph",
+    "schedule_network_ir",
+    "CanonicalizedIRInputs",
     "regionize_network_ir",
     "TensorResolver",
     "ResolvedTensor",

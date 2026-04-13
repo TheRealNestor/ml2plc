@@ -4,7 +4,7 @@ Main ONNX to IR conversion orchestration.
 
 import numpy as np
 import logging
-from typing import Dict, List
+from typing import Dict, List, Set
 from collections import defaultdict
 
 from ..types import NetworkIR, BaseLayer
@@ -23,6 +23,8 @@ from .einsum_lowering import lower_supported_einsum_layers
 from .folding import run_constant_folding, try_fold_enriched_shape_layer
 
 logger = logging.getLogger(__name__)
+
+CanonicalizedIRInputs = tuple[List[Dict], Dict[str, np.ndarray], Set[str]]
 
 
 def _prepare_working_layers_and_constants(
@@ -67,6 +69,31 @@ def _prepare_working_layers_and_constants(
     return working_layers, constant_values, folded_outputs
 
 
+def canonicalize_model_for_ir(analyzer: ONNXModel) -> CanonicalizedIRInputs:
+    """Pass 1: Canonicalize ONNX model for IR extraction.
+
+    This pass performs shape validation, constant folding, and supported Einsum
+    canonicalization.
+
+    Returns:
+        (working_layers, constant_values, folded_outputs)
+    """
+    try:
+        working_layers, constant_values, folded_outputs = (
+            _prepare_working_layers_and_constants(analyzer)
+        )
+    except ShapeValidationError as e:
+        logger.error(str(e))
+        raise
+
+    return (working_layers, constant_values, folded_outputs)
+
+
+def prepare_model_for_ir(analyzer: ONNXModel) -> CanonicalizedIRInputs:
+    """Backward-compatible alias for ``canonicalize_model_for_ir``."""
+    return canonicalize_model_for_ir(analyzer)
+
+
 def _build_network_ir_unordered(
     *,
     layers: Dict[str, BaseLayer],
@@ -107,37 +134,17 @@ def _finalize_network_ir_execution_order(ir_unordered: NetworkIR) -> NetworkIR:
     )
 
 
-# ============================================================================
-# Main Conversion Entry Point
-# ============================================================================
+def extract_typed_ir_graph(
+    analyzer: ONNXModel,
+    working_layers: List[Dict],
+    constant_values: Dict[str, np.ndarray],
+    folded_outputs: Set[str],
+) -> NetworkIR:
+    """Pass 2: Extract typed IR graph without execution order.
 
-
-def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
+    Produces an unordered ``NetworkIR`` that already contains typed layers,
+    tensor producer/consumer maps, and detected state tensors.
     """
-    Convert ONNX model to intermediate representation (IR).
-
-    This creates a complete, ordered ``NetworkIR`` without optimization.
-    Use ``IROptimizer`` for post-processing.
-
-    High-level phases:
-      1) Prepare/canonicalize ONNX layers (shape validation, constant folding,
-         supported Einsum lowering)
-      2) Extract typed IR layers + tensor maps
-      3) Assemble unordered ``NetworkIR``
-      4) Finalize execution order (topological/SCC-aware)
-    """
-    logger.info("Converting ONNX model to IR...")
-
-    # Phase 1: Prepare canonicalized ONNX layer stream and constants.
-    try:
-        working_layers, constant_values, folded_outputs = (
-            _prepare_working_layers_and_constants(analyzer)
-        )
-    except ShapeValidationError as e:
-        logger.error(str(e))
-        raise
-
-    # Phase 2: Main layer extraction into typed IR layers and tensor maps.
     resolver = TensorResolver(analyzer, compile_time_constants=constant_values)
     shape_semantics = ShapeSemanticsTracker(constant_values)
     input_info, output_info = analyzer.get_input_output_info()
@@ -267,9 +274,7 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
             f"Detected {len(state_tensors)} state tensors: {list(state_tensors.keys())}"
         )
 
-    # Phase 3: Assemble graph IR without execution order.
-    # (Execution ordering is finalized in a dedicated step below.)
-    ir_unordered = _build_network_ir_unordered(
+    return _build_network_ir_unordered(
         layers=layers,
         tensor_producers=tensor_producers,
         tensor_consumers=tensor_consumers,
@@ -278,8 +283,42 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
         state_tensors=state_tensors,
     )
 
-    # Phase 4: Finalize execution order (topological/SCC-aware) on assembled IR.
-    ir_ordered = _finalize_network_ir_execution_order(ir_unordered)
+
+def schedule_network_ir(ir_unordered: NetworkIR) -> NetworkIR:
+    """Pass 3: Compute dependency-respecting execution order on typed IR graph."""
+    return _finalize_network_ir_execution_order(ir_unordered)
+
+
+# ============================================================================
+# Main Conversion Entry Point
+# ============================================================================
+
+
+def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
+    """
+    Convert ONNX model to intermediate representation (IR).
+
+    This creates a complete, ordered ``NetworkIR`` without optimization.
+    Use ``IROptimizer`` for post-processing.
+
+    High-level phases:
+      1) Prepare/canonicalize ONNX layers (shape validation, constant folding,
+         supported Einsum lowering)
+      2) Extract typed IR layers + tensor maps
+      3) Assemble unordered ``NetworkIR``
+      4) Finalize execution order (topological/SCC-aware)
+    """
+    logger.info("Converting ONNX model to IR...")
+    working_layers, constant_values, folded_outputs = canonicalize_model_for_ir(
+        analyzer
+    )
+    ir_unordered = extract_typed_ir_graph(
+        analyzer,
+        working_layers,
+        constant_values,
+        folded_outputs,
+    )
+    ir_ordered = schedule_network_ir(ir_unordered)
 
     logger.info(f"Created IR with {len(ir_ordered.layers)} layers in execution order")
 

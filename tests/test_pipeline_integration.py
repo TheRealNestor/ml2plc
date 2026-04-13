@@ -17,8 +17,8 @@ class MockRegion:
 def test_compile_succeeds_on_multi_region_model():
     """Test that main compiler supports multi-region models."""
 
-    with patch("codegen.main.regionize_network_ir") as mock_regionizer:
-        with patch("codegen.main.ONNXModel"), patch("codegen.main.onnx_to_ir"):
+    with patch("codegen.main.build_model_ir") as mock_build_model_ir:
+        with patch("codegen.main.ONNXModel"):
             # Mock translate_model_to_st to verifying it gets called
             with patch("codegen.main.translate_model_to_st") as mock_translate:
                 with patch("codegen.main.check_memory"):
@@ -29,7 +29,7 @@ def test_compile_succeeds_on_multi_region_model():
                     r0 = MockRegion(RegionKind.ACYCLIC, "r0")
                     r1 = MockRegion(RegionKind.ACYCLIC, "r1")
                     mock_model_ir.regions = [r0, r1]
-                    mock_regionizer.return_value = mock_model_ir
+                    mock_build_model_ir.return_value = mock_model_ir
 
                     output = compile_onnx_to_st(
                         "dummy_path.onnx", output_path="dummy.st"
@@ -44,8 +44,8 @@ def test_compile_succeeds_on_multi_region_model():
 def test_compile_handles_recurrent_region_gracefully():
     """Test that compiler passes recurrent regions to generator."""
 
-    with patch("codegen.main.regionize_network_ir") as mock_regionizer:
-        with patch("codegen.main.ONNXModel"), patch("codegen.main.onnx_to_ir"):
+    with patch("codegen.main.build_model_ir") as mock_build_model_ir:
+        with patch("codegen.main.ONNXModel"):
             with patch("codegen.main.translate_model_to_st") as mock_translate:
                 mock_translate.return_value = "(* Region: r0 [RECURRENT] *)"
 
@@ -53,7 +53,7 @@ def test_compile_handles_recurrent_region_gracefully():
                 mock_model_ir.regions = [
                     MockRegion(RegionKind.RECURRENT, "r0", layer_count=5)
                 ]
-                mock_regionizer.return_value = mock_model_ir
+                mock_build_model_ir.return_value = mock_model_ir
 
                 output = compile_onnx_to_st("dummy_path.onnx", output_path="dummy.st")
 

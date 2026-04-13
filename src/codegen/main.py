@@ -3,9 +3,12 @@ Main entry point for ONNX to Structured Text compiler.
 
 The compilation pipeline is split into explicit, composable stages:
   analyze_model()      → ONNXModel
-  build_model_ir()     → ModelIR
-  optimize_regions()   → Dict[region_id -> OptimizationResult]
-  generate_st()        → ST code string
+        canonicalize_model_for_ir()   → (working_layers, constant_values, folded_outputs)
+    extract_typed_network_ir() → NetworkIR (unordered)
+    schedule_network_ir()    → NetworkIR (ordered)
+    regionize_model_ir()     → ModelIR
+    optimize_regions()       → Dict[region_id -> OptimizationResult]
+    generate_st()            → ST code string
 
 Each stage is pure (input→output with minimal side effects) and can be tested independently.
 """
@@ -17,11 +20,18 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from codegen.onnx_model import ONNXModel
-from codegen.onnx_to_ir import onnx_to_ir, regionize_network_ir
+from codegen.onnx_to_ir import (
+    onnx_to_ir,
+    regionize_network_ir,
+    canonicalize_model_for_ir,
+    extract_typed_ir_graph,
+    schedule_network_ir as schedule_ir_graph,
+    CanonicalizedIRInputs,
+)
 from codegen.ir_optimizer import optimize_model_regions, OptimizationResult
 from codegen.memory_check.memory_analyzer import check_memory
 from codegen.ir_to_st import translate_model_to_st
-from codegen.types import ModelIR, RegionKind
+from codegen.types import ModelIR, RegionKind, NetworkIR
 
 logger = logging.getLogger(__name__)
 
@@ -55,47 +65,103 @@ def analyze_model(model_path: str) -> ONNXModel:
 
 
 # ============================================================================
-# Stage 2: Build Model IR
+# Stage 2: Prepare ONNX for IR Extraction
 # ============================================================================
 
 
-def build_model_ir(analyzer: ONNXModel) -> ModelIR:
+def canonicalize_ir_inputs(analyzer: ONNXModel) -> CanonicalizedIRInputs:
     """
-    Convert ONNX model to regionized ModelIR.
+    Canonicalize ONNX graph for typed IR extraction.
 
-    Stage 2 of the pipeline. Produces the only internal representation used
-    downstream: ModelIR (not NetworkIR).
-
-        Flow:
-            ONNX model → NetworkIR (unordered) → NetworkIR (ordered) → regionize → ModelIR
+    Stage 2 of the pipeline.
 
     Args:
         analyzer: Loaded ONNX model analyzer
 
     Returns:
-        Regionized ModelIR with identified regions by kind (acyclic/recurrent/loop)
+        Prepared artifacts for typed extraction pass
     """
-    logger.info("Stage 2: Building ModelIR")
+    logger.info("Stage 2: Canonicalizing model for IR extraction")
+    working_layers, constant_values, folded_outputs = canonicalize_model_for_ir(
+        analyzer
+    )
+    logger.info(
+        "  Prepared %d working layer(s), %d compile-time constant(s)",
+        len(working_layers),
+        len(constant_values),
+    )
+    return (working_layers, constant_values, folded_outputs)
 
-    # Convert to intermediate NetworkIR
-    logger.info("  Converting ONNX to NetworkIR...")
-    network_ir = onnx_to_ir(analyzer)
-    logger.info(f"    Created IR with {len(network_ir.layers)} layers")
 
-    # Regionize into ModelIR
-    logger.info("  Regionizing into typed regions...")
+# ============================================================================
+# Stage 3: Extract Typed NetworkIR (unordered)
+# ============================================================================
+
+
+def extract_typed_network_ir(
+    analyzer: ONNXModel, prepared: CanonicalizedIRInputs
+) -> NetworkIR:
+    """Extract typed layer/tensor graph without execution order."""
+    logger.info("Stage 3: Extracting typed NetworkIR (unordered)")
+    working_layers, constant_values, folded_outputs = prepared
+    ir_unordered = extract_typed_ir_graph(
+        analyzer,
+        working_layers,
+        constant_values,
+        folded_outputs,
+    )
+    logger.info("  Extracted %d typed layer(s)", len(ir_unordered.layers))
+    return ir_unordered
+
+
+# ============================================================================
+# Stage 4: Schedule Execution Order
+# ============================================================================
+
+
+def schedule_network_ir(ir_unordered: NetworkIR) -> NetworkIR:
+    """Attach execution order to typed graph (topological/SCC-aware)."""
+    logger.info("Stage 4: Scheduling execution order")
+    ir_ordered = schedule_ir_graph(ir_unordered)
+    logger.info(
+        "  Computed execution order with %d entries", len(ir_ordered.execution_order)
+    )
+    return ir_ordered
+
+
+# ============================================================================
+# Stage 5: Regionize NetworkIR into ModelIR
+# ============================================================================
+
+
+def regionize_model_ir(network_ir: NetworkIR) -> ModelIR:
+    """Partition ordered NetworkIR into typed regions."""
+    logger.info("Stage 5: Regionizing ordered graph")
     model_ir = regionize_network_ir(network_ir)
-    logger.info(f"    Created {len(model_ir.regions)} region(s)")
+    logger.info(f"  Created {len(model_ir.regions)} region(s)")
 
     if len(model_ir.regions) > 1:
         region_types = [r.kind.value for r in model_ir.regions]
-        logger.info(f"    Region types: {region_types}")
+        logger.info(f"  Region types: {region_types}")
 
     return model_ir
 
 
 # ============================================================================
-# Stage 3: Optimize Regions
+# Compatibility wrapper: Build Model IR (legacy stage API)
+# ============================================================================
+
+
+def build_model_ir(analyzer: ONNXModel) -> ModelIR:
+    """Backward-compatible wrapper for the explicit Stage 2→5 pipeline."""
+    prepared = canonicalize_ir_inputs(analyzer)
+    ir_unordered = extract_typed_network_ir(analyzer, prepared)
+    ir_ordered = schedule_network_ir(ir_unordered)
+    return regionize_model_ir(ir_ordered)
+
+
+# ============================================================================
+# Stage 6: Optimize Regions
 # ============================================================================
 
 
@@ -103,7 +169,7 @@ def optimize_regions(model_ir: ModelIR) -> Dict[str, OptimizationResult]:
     """
     Apply optimization passes to each region independently.
 
-    Stage 3 of the pipeline. Region-aware: only optimizes supported region kinds.
+    Stage 6 of the pipeline. Region-aware: only optimizes supported region kinds.
 
     Args:
         model_ir: Regionized model
@@ -112,14 +178,14 @@ def optimize_regions(model_ir: ModelIR) -> Dict[str, OptimizationResult]:
         Dictionary mapping region_id to OptimizationResult (containing optimized IR
         and optional buffer allocation hints)
     """
-    logger.info("Stage 3: Optimizing regions")
+    logger.info("Stage 6: Optimizing regions")
     optimization_results = optimize_model_regions(model_ir)
     logger.info(f"  Optimized {len(optimization_results)} region(s)")
     return optimization_results
 
 
 # ============================================================================
-# Stage 4: Generate Structured Text
+# Stage 7: Generate Structured Text
 # ============================================================================
 
 
@@ -132,7 +198,7 @@ def generate_st(
     """
     Generate Structured Text code from optimized ModelIR.
 
-    Stage 4 of the pipeline. Uses region-aware lowering to produce ST.
+    Stage 7 of the pipeline. Uses region-aware lowering to produce ST.
 
     Args:
         model_ir: Regionized model
@@ -143,7 +209,7 @@ def generate_st(
     Returns:
         Generated Structured Text code as string
     """
-    logger.info("Stage 4: Generating Structured Text")
+    logger.info("Stage 7: Generating Structured Text")
 
     logger.info(f"ST generation for {len(model_ir.regions)} region(s)")
     st_code = translate_model_to_st(
@@ -170,16 +236,16 @@ def compile_onnx_to_st(
     fb_name: Optional[str] = None,
 ) -> str:
     """
-        Complete compilation pipeline: ONNX → ModelIR → Optimized regions → ST code.
+                Complete compilation pipeline: ONNX → ModelIR → Optimized regions → ST code.
 
-        Orchestrates four core stages:
-      1. analyze_model()      → load ONNX
-      2. build_model_ir()     → convert to regionized ModelIR
-      3. optimize_regions()   → apply optimization passes
+                Orchestrates four top-level stages:
+            1. analyze_model()      → load ONNX
+            2. build_model_ir()     → canonicalize + extract + schedule + regionize
+            3. optimize_regions()   → apply optimization passes
             4. generate_st()        → produce ST code
 
-        Also performs an advisory memory check for the first acyclic region
-        between stages 3 and 4.
+                Also performs an advisory memory check for the first acyclic region
+                between stages 3 and 4.
 
     Args:
         model_path: Path to ONNX model file
@@ -196,7 +262,7 @@ def compile_onnx_to_st(
     # Stage 1: Analyze
     analyzer = analyze_model(model_path)
 
-    # Stage 2: Build IR
+    # Stage 2: Build IR (internally canonicalize → extract → schedule → regionize)
     model_ir = build_model_ir(analyzer)
 
     # Stage 3: Optimize
