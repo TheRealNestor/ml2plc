@@ -5,7 +5,7 @@ Computes memory requirements and validates against device limits.
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from ..ir_to_st.type_conversion import get_type_size_bytes
 
 from ..types import (
@@ -23,6 +23,37 @@ from ..types import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_ELEMENT_SIZE = 4  # bytes (float32)
+
+DTYPE_BYTE_ALIASES: Dict[str, int] = {
+    "tensor(float)": 4,
+    "float": 4,
+    "float32": 4,
+    "fp32": 4,
+    "tensor(double)": 8,
+    "double": 8,
+    "float64": 8,
+    "fp64": 8,
+    "tensor(float16)": 2,
+    "float16": 2,
+    "fp16": 2,
+    "half": 2,
+}
+
+LAYER_TAG_RULES: Dict[str, Tuple[str, ...]] = {
+    "lstm": ("recurrent", "lstm"),
+    "gru": ("recurrent", "gru"),
+    "rnn": ("recurrent",),
+    "attention": ("attention",),
+    "attn": ("attention",),
+    "einsum": ("attention_like",),
+}
+
+LINEAR_LAYER_TYPES: Tuple[type, ...] = (
+    MatMulLayer,
+    GemmLayer,
+    FusedGemmLayer,
+    FusedLinearLayer,
+)
 
 
 @dataclass
@@ -89,62 +120,151 @@ def _get_element_size(dtype: Optional[str]) -> int:
     if not dtype:
         return DEFAULT_ELEMENT_SIZE
 
-    return get_type_size_bytes(dtype)
+    try:
+        return get_type_size_bytes(dtype)
+    except Exception:
+        normalized = str(dtype).strip().lower()
+        alias_size = DTYPE_BYTE_ALIASES.get(normalized)
+        if alias_size is not None:
+            return alias_size
+
+        logger.debug(
+            "Unknown dtype '%s' in memory analyzer; falling back to %d-byte elements",
+            dtype,
+            DEFAULT_ELEMENT_SIZE,
+        )
+        return DEFAULT_ELEMENT_SIZE
+
+
+def _tensor_bytes(dtype: Optional[str], elements: int) -> int:
+    """Compute tensor byte size from element type and element count."""
+    return _get_element_size(dtype) * max(int(elements), 0)
+
+
+def _safe_nbytes(value: object) -> int:
+    """Best-effort extraction of numpy-like nbytes."""
+    if value is None:
+        return 0
+    nbytes = getattr(value, "nbytes", None)
+    if isinstance(nbytes, (int, float)):
+        return int(nbytes)
+    return 0
+
+
+def _layer_tags(layer: BaseLayer) -> Set[str]:
+    """
+    Infer architecture tags for a layer from stable metadata.
+
+    Tags are intentionally coarse and conservative. They are used only for
+    memory heuristics, not functional behavior.
+    """
+    tags: Set[str] = set()
+    searchable = " ".join(
+        [
+            layer.__class__.__name__.lower(),
+            getattr(layer, "op_type", "").lower(),
+            getattr(layer, "name", "").lower(),
+        ]
+    )
+
+    for token, implied_tags in LAYER_TAG_RULES.items():
+        if token in searchable:
+            tags.update(implied_tags)
+
+    if isinstance(layer, LINEAR_LAYER_TYPES):
+        tags.add("linear")
+
+    return tags
+
+
+def _layer_has_bias(layer: BaseLayer) -> bool:
+    """Robust bias detection across layer variants."""
+    if hasattr(layer, "has_bias"):
+        return bool(getattr(layer, "has_bias"))
+
+    if getattr(layer, "bias", None) is not None:
+        return True
+
+    if getattr(layer, "B", None) is not None:
+        return True
+
+    if getattr(layer, "bias_name", None):
+        return True
+
+    if isinstance(layer, (GemmLayer, FusedGemmLayer)):
+        return True
+
+    if isinstance(layer, FusedLinearLayer):
+        # Typical linear fusion inputs: [X, W, B]
+        return len(layer.inputs) >= 3
+
+    return False
+
+
+def _estimate_input_tensor_bytes(ir: NetworkIR, tensor_name: str) -> int:
+    """
+    Estimate byte size of a named network input tensor.
+
+    Uses first consumer metadata as a best-effort proxy. If unavailable, returns 0.
+    """
+    consumers = ir.tensor_consumers.get(tensor_name)
+    if not consumers:
+        return 0
+
+    estimated = 0
+    for consumer_name in consumers:
+        layer = ir.get_layer(consumer_name)
+        estimated = max(
+            estimated,
+            _tensor_bytes(
+                getattr(layer, "input_type", None), getattr(layer, "input_size", 0)
+            ),
+        )
+    return estimated
 
 
 def _compute_layer_weights(layer: BaseLayer) -> Tuple[int, int]:
-    """Compute weight and bias memory for a layer in bytes."""
+    """
+    Compute weight and bias memory for a layer in bytes.
+
+    Strategy:
+    1) Prefer explicit in-memory tensors (weights/W/R/P/rhs_const, bias/B).
+    2) Fall back to shape/type estimates for compact linear layers.
+    """
     weights_bytes = 0
     biases_bytes = 0
 
-    # Linear layers (MatMul, Gemm, Fused variants)
-    if isinstance(layer, (MatMulLayer, GemmLayer, FusedGemmLayer, FusedLinearLayer)):
-        weight_dtype = getattr(layer, "weight_type", None) or layer.input_type
-        weight_element_size = _get_element_size(weight_dtype)
+    # Prefer explicit tensors where available (robust across new architectures).
+    for weight_attr in ("weights", "W", "R", "P", "rhs_const"):
+        weights_bytes += _safe_nbytes(getattr(layer, weight_attr, None))
 
-        # Weight matrix: input_size x output_size
-        weight_elements = layer.input_size * layer.output_size
-        weights_bytes = weight_elements * weight_element_size
+    for bias_attr in ("bias", "B"):
+        biases_bytes += _safe_nbytes(getattr(layer, bias_attr, None))
 
-        # Bias dtype (often float even for quantized weights)
-        bias_dtype = getattr(layer, "bias_type", None) or layer.output_type
-        bias_element_size = _get_element_size(bias_dtype)
-
-        # Determine if layer has bias
-        # Check multiple ways since different layer types store this differently
-        has_bias = False
-
-        # Method 1: Explicit has_bias attribute
-        if hasattr(layer, "has_bias"):
-            has_bias = layer.has_bias
-        # Method 2: bias attribute is not None
-        elif hasattr(layer, "bias") and layer.bias is not None:
-            has_bias = True
-        # Method 3: bias_name attribute exists and is not empty
-        elif hasattr(layer, "bias_name") and layer.bias_name:
-            has_bias = True
-        # Method 4: Gemm layers typically always have bias
-        elif isinstance(layer, (GemmLayer, FusedGemmLayer)):
-            has_bias = True
-        # Method 5: FusedLinearLayer with activation implies bias was present
-        elif isinstance(layer, FusedLinearLayer):
-            # Check if there's a bias input in the layer's inputs
-            # Typically: input, weight, bias
-            has_bias = len(layer.inputs) >= 3 or getattr(layer, "has_bias", True)
-
-        if has_bias:
-            biases_bytes = layer.output_size * bias_element_size
-
-        logger.debug(
-            f"Layer {layer.name}: weights={weight_elements} ({weights_bytes}B), "
-            f"has_bias={has_bias}, bias_size={biases_bytes}B"
+    # Fallback for compact linear layers that don't carry arrays directly.
+    tags = _layer_tags(layer)
+    if weights_bytes == 0 and "linear" in tags:
+        weights_bytes = _tensor_bytes(
+            getattr(layer, "weight_type", None) or layer.input_type,
+            layer.input_size * layer.output_size,
         )
 
-    # Standalone Add layer used as bias
-    elif isinstance(layer, AddLayer):
-        if getattr(layer, "is_bias", False):
-            element_size = _get_element_size(layer.output_type)
-            biases_bytes = layer.output_size * element_size
+    if biases_bytes == 0 and "linear" in tags and _layer_has_bias(layer):
+        biases_bytes = _tensor_bytes(
+            getattr(layer, "bias_type", None) or layer.output_type,
+            layer.output_size,
+        )
+
+    # Standalone Add layer used as bias (backward compatibility).
+    if isinstance(layer, AddLayer) and getattr(layer, "is_bias", False):
+        biases_bytes = max(
+            biases_bytes,
+            _tensor_bytes(layer.output_type, layer.output_size),
+        )
+
+    logger.debug(
+        f"Layer {layer.name}: weights={weights_bytes}B, bias={biases_bytes}B, tags={sorted(tags)}"
+    )
 
     return weights_bytes, biases_bytes
 
@@ -182,6 +302,8 @@ def _estimate_activation_memory(
     Returns:
         Activation memory in bytes
     """
+    peak_runtime_bytes = _estimate_peak_runtime_memory(ir)
+
     if buffer_allocations:
         # Calculate actual buffer sizes from allocations
         buffer_sizes: Dict[str, int] = {}
@@ -196,64 +318,141 @@ def _estimate_activation_memory(
 
                 buffer_name = buffer_allocations.get(output_tensor)
                 if buffer_name:
-                    tensor_bytes = (
-                        _get_element_size(layer.output_type) * layer.output_size
-                    )
+                    tensor_bytes = _tensor_bytes(layer.output_type, layer.output_size)
                     buffer_sizes[buffer_name] = max(
                         buffer_sizes.get(buffer_name, 0), tensor_bytes
                     )
 
         # Also account for network inputs/outputs (not in buffer pool)
         io_bytes = 0
+        for tensor_name in ir.input_tensors:
+            io_bytes = max(io_bytes, _estimate_input_tensor_bytes(ir, tensor_name))
+
         for layer in ir.layers.values():
-            for inp in layer.inputs:
-                if inp in ir.input_tensors:
-                    io_bytes = max(
-                        io_bytes, _get_element_size(layer.input_type) * layer.input_size
-                    )
             for out in layer.outputs:
                 if out in ir.output_tensors:
                     io_bytes = max(
-                        io_bytes,
-                        _get_element_size(layer.output_type) * layer.output_size,
+                        io_bytes, _tensor_bytes(layer.output_type, layer.output_size)
                     )
 
         total_buffer_bytes = sum(buffer_sizes.values())
+        allocated_bytes = total_buffer_bytes + io_bytes
+        conservative_bytes = max(allocated_bytes, peak_runtime_bytes)
+
         logger.info(
             f"Activation memory (buffer allocation): {len(buffer_sizes)} buffers = {total_buffer_bytes} bytes, "
-            f"I/O = {io_bytes} bytes, total = {total_buffer_bytes + io_bytes} bytes"
+            f"I/O = {io_bytes} bytes, allocated_total = {allocated_bytes} bytes, "
+            f"peak_runtime = {peak_runtime_bytes} bytes, conservative = {conservative_bytes} bytes"
         )
-        return total_buffer_bytes + io_bytes
+        return conservative_bytes
     else:
-        # No buffer allocation: each layer gets its own output variable
-        # Sum all intermediate tensor sizes
-        total_activation_bytes = 0
+        logger.info(
+            f"Activation memory (peak runtime estimate, no buffer allocation): {peak_runtime_bytes} bytes"
+        )
+        return peak_runtime_bytes
 
-        for layer in ir.layers.values():
-            # Each layer's output needs storage
-            output_bytes = _get_element_size(layer.output_type) * layer.output_size
-            total_activation_bytes += output_bytes
 
-        # Network input also needs storage
-        input_bytes = 0
+def _estimate_layer_workspace_bytes(layer: BaseLayer) -> int:
+    """
+    Estimate temporary workspace for a single layer execution.
+
+    This is deliberately conservative and architecture-aware:
+    - Baseline scratch = 1x output tensor
+    - Recurrent layers reserve hidden/cell/gate scratch
+    - Attention-like layers reserve Q/K/V + score/probability-style temporaries
+    """
+    output_bytes = _tensor_bytes(layer.output_type, layer.output_size)
+    workspace = output_bytes
+
+    tags = _layer_tags(layer)
+    hidden_size = int(getattr(layer, "hidden_size", 0) or 0)
+    sequence_length = int(getattr(layer, "sequence_length", 1) or 1)
+    elem_size = _get_element_size(layer.output_type)
+    direction = str(getattr(layer, "direction", "forward") or "forward").lower()
+    num_directions = 2 if direction == "bidirectional" else 1
+
+    if "recurrent" in tags and hidden_size > 0:
+        # Hidden state, plus cell state for LSTM.
+        state_buffers = hidden_size * elem_size * (2 if "lstm" in tags else 1)
+
+        # Gate workspace: 4x hidden (LSTM) or 3x hidden (GRU) at minimum.
+        gate_factor = 4 if "lstm" in tags else 3
+        gate_workspace = hidden_size * gate_factor * elem_size
+
+        # Sequence bookkeeping scratch (conservative upper-bound proxy).
+        seq_scratch = (hidden_size * elem_size) * max(1, min(sequence_length, 4))
+
+        recurrent_workspace = (
+            state_buffers + gate_workspace + seq_scratch
+        ) * num_directions
+        workspace += recurrent_workspace
+
+    if "attention" in tags or "attention_like" in tags:
+        # Coarse conservative proxy for Q/K/V projections and attention maps.
+        workspace += 3 * output_bytes
+
+    return workspace
+
+
+def _estimate_peak_runtime_memory(ir: NetworkIR) -> int:
+    """
+    Estimate peak live activation memory during network execution.
+
+    Combines:
+    - tensor liveness (materialize outputs, free dead intermediates), and
+    - per-layer temporary workspace.
+    """
+    consumers_remaining: Dict[str, int] = {}
+    for tensor_name, consumers in ir.tensor_consumers.items():
+        consumers_remaining[tensor_name] = len(consumers)
+
+    # Fallback if tensor_consumers is not populated.
+    if not consumers_remaining:
         for layer in ir.layers.values():
             for inp in layer.inputs:
-                if inp in ir.input_tensors:
-                    input_bytes = max(
-                        input_bytes,
-                        _get_element_size(layer.input_type) * layer.input_size,
-                    )
-                    break
-            if input_bytes > 0:
-                break
+                consumers_remaining[inp] = consumers_remaining.get(inp, 0) + 1
 
-        total_activation_bytes += input_bytes
+    live_tensors: Dict[str, int] = {}
 
-        logger.info(
-            f"Activation memory (no buffer reuse): {len(ir.layers)} layer outputs + input = "
-            f"{total_activation_bytes} bytes"
-        )
-        return total_activation_bytes
+    # Keep network inputs live conservatively.
+    for tensor_name in ir.input_tensors:
+        bytes_est = _estimate_input_tensor_bytes(ir, tensor_name)
+        if bytes_est > 0:
+            live_tensors[tensor_name] = bytes_est
+
+    live_total = sum(live_tensors.values())
+    peak = live_total
+
+    for layer_name in ir.execution_order:
+        layer = ir.get_layer(layer_name)
+        output_bytes = _tensor_bytes(layer.output_type, layer.output_size)
+
+        # Materialize outputs (multi-output layers are conservatively counted per output tensor).
+        for output_tensor in layer.outputs:
+            existing = live_tensors.get(output_tensor, 0)
+            if output_bytes > existing:
+                live_tensors[output_tensor] = output_bytes
+                live_total += output_bytes - existing
+
+        # Peak includes layer workspace while outputs are live.
+        peak = max(peak, live_total + _estimate_layer_workspace_bytes(layer))
+
+        # Consume layer inputs and free dead intermediates.
+        for input_tensor in layer.inputs:
+            if input_tensor not in consumers_remaining:
+                continue
+
+            consumers_remaining[input_tensor] -= 1
+            can_free = (
+                consumers_remaining[input_tensor] <= 0
+                and input_tensor not in ir.input_tensors
+                and input_tensor not in ir.output_tensors
+            )
+
+            if can_free and input_tensor in live_tensors:
+                live_total -= live_tensors.pop(input_tensor)
+
+    return peak
 
 
 def analyze_memory(

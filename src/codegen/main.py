@@ -22,7 +22,6 @@ from codegen.ir_optimizer import optimize_model_regions, OptimizationResult
 from codegen.memory_check.memory_analyzer import check_memory
 from codegen.ir_to_st import translate_model_to_st
 from codegen.types import ModelIR, RegionKind
-from codegen.backends import default_st_backend_capabilities
 
 logger = logging.getLogger(__name__)
 
