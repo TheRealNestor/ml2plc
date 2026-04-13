@@ -26,9 +26,9 @@ Key Design Principles:
 Pipeline:
 ----------
 1. ONNXModel.load_model() → Loads and validates ONNX file
-2. onnx_to_ir() → Converts to NetworkIR with detected state tensors
-3. regionize_network_ir() → Partitions into typed regions (acyclic/recurrent/loop)
-4. Each region can then be lowered to PLC code
+2. onnx_to_ir() → Builds unordered NetworkIR, then finalizes execution order
+3. regionize_network_ir() → Partitions ordered NetworkIR into typed regions
+4. Each region can then be optimized/lowered to PLC code and assembled
 
 Example:
 --------

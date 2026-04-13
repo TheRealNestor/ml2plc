@@ -25,47 +25,34 @@ from .folding import run_constant_folding, try_fold_enriched_shape_layer
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Main Conversion Entry Point
-# ============================================================================
+def _prepare_working_layers_and_constants(
+    analyzer: ONNXModel,
+) -> tuple[List[Dict], Dict[str, np.ndarray], set[str]]:
+    """Prepare canonicalized layer stream and compile-time constants.
 
+    Phase responsibilities:
+      1) Validate/resolve model shapes (fail-fast on unresolved runtime shapes)
+      2) Constant-fold compile-time subgraphs
+      3) Canonicalize supported Einsum patterns
 
-def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
+    Returns:
+        (working_layers, constant_values, folded_outputs)
     """
-    Convert ONNX model to intermediate representation (IR).
-
-    This creates a complete IR without optimization.
-    Use IROptimizer for post-processing.
-
-    The conversion includes a constant-folding pre-pass that resolves
-    shape-manipulation operators (Shape, Cast, Slice, Concat, Expand,
-    Unsqueeze, Gather, Reshape, Squeeze) when all their inputs are
-    compile-time constants. This eliminates the auxiliary graph nodes
-    that commonly surround LSTM and other RNN operators.
-    """
-    logger.info("Converting ONNX model to IR...")
-
-    # ✅ LAYER 1: GROUND TRUTH EXTRACTION & VALIDATION
     # Run shape validation BEFORE any layer extraction to fail fast if model
     # has unresolvable dynamic dimensions (e.g., dynamic batch size)
-    try:
-        resolution_report = validate_model_shapes(analyzer.model)
-        if resolution_report.modified:
-            analyzer.refresh_after_model_mutation()
-    except ShapeValidationError as e:
-        logger.error(str(e))
-        raise
+    resolution_report = validate_model_shapes(analyzer.model)
+    if resolution_report.modified:
+        analyzer.refresh_after_model_mutation()
 
-    # --- Constant-folding pre-pass ---
+    # Constant-folding pre-pass
     constant_values, folded_outputs = run_constant_folding(analyzer)
-
-    folded_count = len(folded_outputs)
-    if folded_count > 0:
+    if folded_outputs:
         logger.info(
-            f"Constant folding: resolved {folded_count} tensor(s) at compile time"
+            "Constant folding: resolved %d tensor(s) at compile time",
+            len(folded_outputs),
         )
 
-    # --- Einsum lowering pass (pattern-driven canonicalization) ---
+    # Einsum canonicalization pass
     working_layers, einsum_report = lower_supported_einsum_layers(
         analyzer.layers,
         analyzer,
@@ -77,7 +64,80 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
             einsum_report.lowered_count,
         )
 
-    # --- Main layer extraction ---
+    return working_layers, constant_values, folded_outputs
+
+
+def _build_network_ir_unordered(
+    *,
+    layers: Dict[str, BaseLayer],
+    tensor_producers: Dict[str, str],
+    tensor_consumers: Dict[str, List[str]],
+    input_tensors: tuple,
+    output_tensors: tuple,
+    state_tensors: Dict[str, str],
+) -> NetworkIR:
+    """Assemble a structurally complete ``NetworkIR`` before execution ordering.
+
+    This makes phase boundaries explicit:
+      1) graph assembly (layers/tensor maps/state)
+      2) execution-order finalization (topological/SCC-aware ordering)
+    """
+    return NetworkIR(
+        layers=layers,
+        execution_order=[],
+        tensor_producers=tensor_producers,
+        tensor_consumers=tensor_consumers,
+        input_tensors=input_tensors,
+        output_tensors=output_tensors,
+        state_tensors=state_tensors,
+    )
+
+
+def _finalize_network_ir_execution_order(ir_unordered: NetworkIR) -> NetworkIR:
+    """Finalize ``NetworkIR`` by computing and attaching execution order."""
+    execution_order = LayerGraph(ir_unordered).get_execution_order()
+    return NetworkIR(
+        layers=ir_unordered.layers,
+        execution_order=execution_order,
+        tensor_producers=ir_unordered.tensor_producers,
+        tensor_consumers=ir_unordered.tensor_consumers,
+        input_tensors=ir_unordered.input_tensors,
+        output_tensors=ir_unordered.output_tensors,
+        state_tensors=ir_unordered.state_tensors,
+    )
+
+
+# ============================================================================
+# Main Conversion Entry Point
+# ============================================================================
+
+
+def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
+    """
+    Convert ONNX model to intermediate representation (IR).
+
+    This creates a complete, ordered ``NetworkIR`` without optimization.
+    Use ``IROptimizer`` for post-processing.
+
+    High-level phases:
+      1) Prepare/canonicalize ONNX layers (shape validation, constant folding,
+         supported Einsum lowering)
+      2) Extract typed IR layers + tensor maps
+      3) Assemble unordered ``NetworkIR``
+      4) Finalize execution order (topological/SCC-aware)
+    """
+    logger.info("Converting ONNX model to IR...")
+
+    # Phase 1: Prepare canonicalized ONNX layer stream and constants.
+    try:
+        working_layers, constant_values, folded_outputs = (
+            _prepare_working_layers_and_constants(analyzer)
+        )
+    except ShapeValidationError as e:
+        logger.error(str(e))
+        raise
+
+    # Phase 2: Main layer extraction into typed IR layers and tensor maps.
     resolver = TensorResolver(analyzer, compile_time_constants=constant_values)
     shape_semantics = ShapeSemanticsTracker(constant_values)
     input_info, output_info = analyzer.get_input_output_info()
@@ -200,18 +260,6 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
             f"Add extractors to LAYER_EXTRACTORS before converting this model."
         )
 
-    # Execution ordering through canonical LayerGraph abstraction
-    temp_ir = NetworkIR(
-        layers=layers,
-        execution_order=[],
-        tensor_producers=tensor_producers,
-        tensor_consumers=tensor_consumers,
-        input_tensors=input_tensors,
-        output_tensors=output_tensors,
-        state_tensors={},
-    )
-    execution_order = LayerGraph(temp_ir).get_execution_order()
-
     # Detect state tensors from RNN-family operators (LSTM, GRU, RNN, etc.)
     state_tensors = detect_state_tensors(analyzer, layers)
     if state_tensors:
@@ -219,14 +267,20 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
             f"Detected {len(state_tensors)} state tensors: {list(state_tensors.keys())}"
         )
 
-    logger.info(f"Created IR with {len(layers)} layers in execution order")
-
-    return NetworkIR(
+    # Phase 3: Assemble graph IR without execution order.
+    # (Execution ordering is finalized in a dedicated step below.)
+    ir_unordered = _build_network_ir_unordered(
         layers=layers,
-        execution_order=execution_order,
         tensor_producers=tensor_producers,
         tensor_consumers=tensor_consumers,
         input_tensors=input_tensors,
         output_tensors=output_tensors,
         state_tensors=state_tensors,
     )
+
+    # Phase 4: Finalize execution order (topological/SCC-aware) on assembled IR.
+    ir_ordered = _finalize_network_ir_execution_order(ir_unordered)
+
+    logger.info(f"Created IR with {len(ir_ordered.layers)} layers in execution order")
+
+    return ir_ordered

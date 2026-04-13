@@ -66,8 +66,8 @@ def build_model_ir(analyzer: ONNXModel) -> ModelIR:
     Stage 2 of the pipeline. Produces the only internal representation used
     downstream: ModelIR (not NetworkIR).
 
-    Flow:
-      ONNX model → NetworkIR (unoptimized) → regionize → ModelIR
+        Flow:
+            ONNX model → NetworkIR (unordered) → NetworkIR (ordered) → regionize → ModelIR
 
     Args:
         analyzer: Loaded ONNX model analyzer
@@ -170,7 +170,7 @@ def compile_onnx_to_st(
     fb_name: Optional[str] = None,
 ) -> str:
     """
-    Complete compilation pipeline: ONNX → IR → Optimized IR → ST Code
+        Complete compilation pipeline: ONNX → ModelIR → Optimized regions → ST code.
 
         Orchestrates four core stages:
       1. analyze_model()      → load ONNX
