@@ -11,7 +11,7 @@ flowchart LR
     Output{{ST program}}:::rep
 
     %% --- IR construction ---
-    Canon("Canonicalization"):::action
+    Canon("Normalization"):::action
     Infer("Shape + type inference"):::action
     Extract("Layer extraction"):::action
     Order("Dependency scheduling\n(SCC-ordered)"):::action

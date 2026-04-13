@@ -3,7 +3,7 @@ Main entry point for ONNX to Structured Text compiler.
 
 The compilation pipeline is split into explicit, composable stages:
   analyze_model()      → ONNXModel
-        canonicalize_model_for_ir()   → (working_layers, constant_values, folded_outputs)
+    normalize_model_for_ir()   → (working_layers, constant_values, folded_outputs)
     extract_typed_network_ir() → NetworkIR (unordered)
     schedule_network_ir()    → NetworkIR (ordered)
     regionize_model_ir()     → ModelIR
@@ -23,10 +23,10 @@ from codegen.onnx_model import ONNXModel
 from codegen.onnx_to_ir import (
     onnx_to_ir,
     regionize_network_ir,
-    canonicalize_model_for_ir,
+    normalize_model_for_ir,
     extract_typed_ir_graph,
     schedule_network_ir as schedule_ir_graph,
-    CanonicalizedIRInputs,
+    NormalizedIRInputs,
 )
 from codegen.ir_optimizer import optimize_model_regions, OptimizationResult
 from codegen.memory_check.memory_analyzer import check_memory
@@ -69,9 +69,9 @@ def analyze_model(model_path: str) -> ONNXModel:
 # ============================================================================
 
 
-def canonicalize_ir_inputs(analyzer: ONNXModel) -> CanonicalizedIRInputs:
+def normalize_ir_inputs(analyzer: ONNXModel) -> NormalizedIRInputs:
     """
-    Canonicalize ONNX graph for typed IR extraction.
+    Normalize ONNX graph for typed IR extraction.
 
     Stage 2 of the pipeline.
 
@@ -81,8 +81,8 @@ def canonicalize_ir_inputs(analyzer: ONNXModel) -> CanonicalizedIRInputs:
     Returns:
         Prepared artifacts for typed extraction pass
     """
-    logger.info("Stage 2: Canonicalizing model for IR extraction")
-    working_layers, constant_values, folded_outputs = canonicalize_model_for_ir(
+    logger.info("Stage 2: Normalizing model for IR extraction")
+    working_layers, constant_values, folded_outputs = normalize_model_for_ir(
         analyzer
     )
     logger.info(
@@ -99,7 +99,7 @@ def canonicalize_ir_inputs(analyzer: ONNXModel) -> CanonicalizedIRInputs:
 
 
 def extract_typed_network_ir(
-    analyzer: ONNXModel, prepared: CanonicalizedIRInputs
+    analyzer: ONNXModel, prepared: NormalizedIRInputs
 ) -> NetworkIR:
     """Extract typed layer/tensor graph without execution order."""
     logger.info("Stage 3: Extracting typed NetworkIR (unordered)")
@@ -154,7 +154,7 @@ def regionize_model_ir(network_ir: NetworkIR) -> ModelIR:
 
 def build_model_ir(analyzer: ONNXModel) -> ModelIR:
     """Backward-compatible wrapper for the explicit Stage 2→5 pipeline."""
-    prepared = canonicalize_ir_inputs(analyzer)
+    prepared = normalize_ir_inputs(analyzer)
     ir_unordered = extract_typed_network_ir(analyzer, prepared)
     ir_ordered = schedule_network_ir(ir_unordered)
     return regionize_model_ir(ir_ordered)
@@ -240,7 +240,7 @@ def compile_onnx_to_st(
 
                 Orchestrates four top-level stages:
             1. analyze_model()      → load ONNX
-            2. build_model_ir()     → canonicalize + extract + schedule + regionize
+            2. build_model_ir()     → normalize + extract + schedule + regionize
             3. optimize_regions()   → apply optimization passes
             4. generate_st()        → produce ST code
 
@@ -262,7 +262,7 @@ def compile_onnx_to_st(
     # Stage 1: Analyze
     analyzer = analyze_model(model_path)
 
-    # Stage 2: Build IR (internally canonicalize → extract → schedule → regionize)
+    # Stage 2: Build IR (internally normalize → extract → schedule → regionize)
     model_ir = build_model_ir(analyzer)
 
     # Stage 3: Optimize

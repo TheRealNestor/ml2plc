@@ -24,18 +24,18 @@ from .folding import run_constant_folding, try_fold_enriched_shape_layer
 
 logger = logging.getLogger(__name__)
 
-CanonicalizedIRInputs = tuple[List[Dict], Dict[str, np.ndarray], Set[str]]
+NormalizedIRInputs = tuple[List[Dict], Dict[str, np.ndarray], Set[str]]
 
 
-def _prepare_working_layers_and_constants(
+def _normalize_working_layers_and_constants(
     analyzer: ONNXModel,
 ) -> tuple[List[Dict], Dict[str, np.ndarray], set[str]]:
-    """Prepare canonicalized layer stream and compile-time constants.
+    """Prepare normalized layer stream and compile-time constants.
 
     Phase responsibilities:
       1) Validate/resolve model shapes (fail-fast on unresolved runtime shapes)
       2) Constant-fold compile-time subgraphs
-      3) Canonicalize supported Einsum patterns
+    3) Normalize supported Einsum patterns
 
     Returns:
         (working_layers, constant_values, folded_outputs)
@@ -54,7 +54,7 @@ def _prepare_working_layers_and_constants(
             len(folded_outputs),
         )
 
-    # Einsum canonicalization pass
+    # Einsum normalization pass
     working_layers, einsum_report = lower_supported_einsum_layers(
         analyzer.layers,
         analyzer,
@@ -69,18 +69,18 @@ def _prepare_working_layers_and_constants(
     return working_layers, constant_values, folded_outputs
 
 
-def canonicalize_model_for_ir(analyzer: ONNXModel) -> CanonicalizedIRInputs:
-    """Pass 1: Canonicalize ONNX model for IR extraction.
+def normalize_model_for_ir(analyzer: ONNXModel) -> NormalizedIRInputs:
+    """Pass 1: Normalize ONNX model for IR extraction.
 
     This pass performs shape validation, constant folding, and supported Einsum
-    canonicalization.
+    normalization.
 
     Returns:
         (working_layers, constant_values, folded_outputs)
     """
     try:
         working_layers, constant_values, folded_outputs = (
-            _prepare_working_layers_and_constants(analyzer)
+            _normalize_working_layers_and_constants(analyzer)
         )
     except ShapeValidationError as e:
         logger.error(str(e))
@@ -89,9 +89,14 @@ def canonicalize_model_for_ir(analyzer: ONNXModel) -> CanonicalizedIRInputs:
     return (working_layers, constant_values, folded_outputs)
 
 
-def prepare_model_for_ir(analyzer: ONNXModel) -> CanonicalizedIRInputs:
-    """Backward-compatible alias for ``canonicalize_model_for_ir``."""
-    return canonicalize_model_for_ir(analyzer)
+def canonicalize_model_for_ir(analyzer: ONNXModel) -> NormalizedIRInputs:
+    """Backward-compatible alias for ``normalize_model_for_ir``."""
+    return normalize_model_for_ir(analyzer)
+
+
+def prepare_model_for_ir(analyzer: ONNXModel) -> NormalizedIRInputs:
+    """Backward-compatible alias for ``normalize_model_for_ir``."""
+    return normalize_model_for_ir(analyzer)
 
 
 def _build_network_ir_unordered(
@@ -302,14 +307,14 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
     Use ``IROptimizer`` for post-processing.
 
     High-level phases:
-      1) Prepare/canonicalize ONNX layers (shape validation, constant folding,
+    1) Prepare/normalize ONNX layers (shape validation, constant folding,
          supported Einsum lowering)
       2) Extract typed IR layers + tensor maps
       3) Assemble unordered ``NetworkIR``
       4) Finalize execution order (topological/SCC-aware)
     """
     logger.info("Converting ONNX model to IR...")
-    working_layers, constant_values, folded_outputs = canonicalize_model_for_ir(
+    working_layers, constant_values, folded_outputs = normalize_model_for_ir(
         analyzer
     )
     ir_unordered = extract_typed_ir_graph(
