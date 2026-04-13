@@ -164,22 +164,28 @@ def generate_st(
 
 
 def compile_onnx_to_st(
-    model_path: str, optimize: bool = True, output_path: str = None
+    model_path: str,
+    optimize: bool = True,
+    output_path: str = None,
+    fb_name: Optional[str] = None,
 ) -> str:
     """
     Complete compilation pipeline: ONNX → IR → Optimized IR → ST Code
 
-    Orchestrates all five stages:
+        Orchestrates four core stages:
       1. analyze_model()      → load ONNX
       2. build_model_ir()     → convert to regionized ModelIR
       3. optimize_regions()   → apply optimization passes
-      4. plan_execution()     → validate backend capabilities
-      5. generate_st()        → produce ST code
+            4. generate_st()        → produce ST code
+
+        Also performs an advisory memory check for the first acyclic region
+        between stages 3 and 4.
 
     Args:
         model_path: Path to ONNX model file
         optimize: Whether to apply optimization passes in Stage 3
         output_path: Optional path to save generated ST code
+        fb_name: Optional function block name. If None, defaults to input filename stem.
 
     Returns:
         Generated Structured Text code as string
@@ -203,7 +209,7 @@ def compile_onnx_to_st(
         for region in model_ir.regions:
             optimization_results[region.region_id] = OptimizationResult(ir=region.graph)
 
-    # Step 3.5: Check memory consumption (TODO: integrate into planning)
+    # Advisory memory check for first acyclic region (warning-only)
     if any(r.kind == RegionKind.ACYCLIC for r in model_ir.regions):
         first_acyclic = next(
             r.region_id for r in model_ir.regions if r.kind == RegionKind.ACYCLIC
@@ -221,7 +227,7 @@ def compile_onnx_to_st(
                 )
 
     # Stage 4: Generate
-    fb_name = input_path.stem
+    fb_name = fb_name or input_path.stem
     st_code = generate_st(
         model_ir, optimization_results, output_path=output_path, fb_name=fb_name
     )
@@ -264,8 +270,8 @@ def parse_args():
     parser.add_argument(
         "--fb-name",
         type=str,
-        default="NeuralNetworkFB",
-        help="Name for the generated function block (default: NeuralNetworkFB)",
+        default=None,
+        help="Name for the generated function block (default: input model filename)",
     )
 
     parser.add_argument(
@@ -308,6 +314,7 @@ def main():
             model_path=str(input_path),
             optimize=not args.no_optimize,
             output_path=str(output_path),
+            fb_name=args.fb_name,
         )
 
         logger.info(f"Successfully compiled {input_path.name}")

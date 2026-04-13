@@ -215,7 +215,7 @@ class TemperaturePredictionModel(MLModel):
         generate_new_data=False,
         samples=10000,
     ):
-        """DEPRECATED: Use train() method instead. Kept for backwards compatibility."""
+        """Compatibility wrapper around ``train`` for older scripts."""
         return self.train(
             epochs=150, csv_path=csv_file_path, generate_new=generate_new_data
         )

@@ -252,7 +252,7 @@ class ConvTemperatureModel(MLModel):
         generate_new: bool = False,
         samples: int = 10000,
     ):
-        """DEPRECATED: Use train(epochs=N) instead. Kept for backwards compatibility."""
+        """Compatibility wrapper around ``train`` for older scripts."""
         return self.train(
             epochs=100, csv_path=csv_path, generate_new=generate_new, samples=samples
         )

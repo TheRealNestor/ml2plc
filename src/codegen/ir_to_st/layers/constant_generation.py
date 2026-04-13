@@ -82,7 +82,7 @@ def generate_recurrent_weight_constants(
                 Wb = B[: 3 * hidden_size]
                 Rb = B[3 * hidden_size :]
             else:
-                # Legacy format
+                # Compatibility path for older single-bias exports
                 Wb = B
                 Rb = np.zeros_like(B)
 

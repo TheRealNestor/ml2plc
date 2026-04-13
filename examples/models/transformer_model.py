@@ -25,14 +25,14 @@ Architecture:
 
 Transformer Operations in ONNX:
     - MultiHeadAttention: Einsum operations for Q, K, V projections
-    - LayerNormalization: Uses ReduceMean, ReduceProd (may not be supported yet)
+    - LayerNormalization: Uses ReduceMean and ReduceProd
     - Positional Encoding: Add operation
     - Attention: MatMul, Softmax, Dropout
     - FeedForward: Dense (Gemm/MatMul) with activation
 
 Testing Purpose:
     This model is used to test ml2plc compiler support for Transformer
-    architectures. It will identify which operations need to be implemented.
+    architectures and surface remaining operator-pattern gaps.
 
 Usage:
     python examples/models/transformer_model.py [--model-name name] [--epochs N]
@@ -41,9 +41,9 @@ This will:
     1. Create & train the Transformer model
     2. Save it as .keras + .weights.h5
     3. Export to ONNX via tf2onnx
-    4. Attempt to compile with ml2plc (may show unsupported ops)
+    4. Attempt to compile with ml2plc and report any unsupported ops/patterns
     5. Print a short demo with sample predictions
-    6. Document any missing compiler operations
+    6. Print a short compatibility summary for the exported graph
 """
 
 import tensorflow as tf
@@ -85,23 +85,23 @@ class TransformerTemperatureModel(MLModel):
     def create_model(self) -> tf.keras.Model:
         """Build a Transformer model for sequence classification.
 
-        Architecture:
-            Input (seq_len, 1)
-              → Dense (embed_dim=32)
-              → Positional Encoding
-              → TransformerEncoder Block:
-                  - MultiHeadAttention (4 heads)
-                  - LayerNormalization
-                  - FeedForward (Dense 64 → Dense 32)
-                  - LayerNormalization
-              → GlobalAveragePooling1D
-              → Dense(16, relu)
-              → Dropout(0.2)
-              → Dense(3, softmax)
+            Architecture:
+                Input (seq_len, 1)
+                  → Dense (embed_dim=32)
+                  → Positional Encoding
+                  → TransformerEncoder Block:
+                      - MultiHeadAttention (4 heads)
+                      - LayerNormalization
+                      - FeedForward (Dense 64 → Dense 32)
+                      - LayerNormalization
+                  → GlobalAveragePooling1D
+                  → Dense(16, relu)
+                  → Dropout(0.2)
+                  → Dense(3, softmax)
 
-        Note: This is a full Transformer with all standard operations.
-        Some operations (ReduceProd for LayerNorm, etc.) may not yet be
-        supported by ml2plc - these will be identified during compilation.
+        Note: This is a full Transformer with standard components.
+        Compilation success depends on the exact exported ONNX operator
+        patterns and static shape contracts.
         """
         inputs = tf.keras.Input(
             shape=(self.sequence_length, 1), name="temperature_input"
@@ -401,31 +401,25 @@ def main():
                 print(result.stdout)
                 print("✓ Compilation successful!")
             except subprocess.CalledProcessError as e:
-                print(
-                    f"\n⚠ Compilation encountered errors (expected for full Transformer):"
-                )
+                print(f"\n⚠ Compilation encountered errors:")
                 print(f"stderr:\n{e.stderr}")
                 print("\n" + "=" * 70)
-                print("MISSING OPERATIONS FOR ml2plc COMPILER:")
+                print("COMPATIBILITY NOTES FOR THIS EXPORTED GRAPH:")
                 print("=" * 70)
 
-                # Parse stderr for unsupported operations
+                # Parse stderr for common compatibility signals
                 stderr = e.stderr
                 if "ReduceProd" in stderr:
                     print(
-                        "  ✗ ReduceProd - Used in LayerNormalization (variance calculation)"
+                        "  - ReduceProd appears in failure path (check shape/contracts)"
                     )
                 if "Unsupported op" in stderr:
-                    print("  ✗ Other unsupported operations detected")
+                    print("  - Unsupported operator(s) detected")
                 if "Dimension mismatch" in stderr:
-                    print(
-                        "  ✗ Dimension tracking issues (may be related to unsupported ops)"
-                    )
+                    print("  - Dimension/shape mismatch detected")
 
-                print("\nThese operations need to be implemented in ml2plc to support")
-                print(
-                    "full Transformer models. See src/codegen/onnx_to_ir/layer_extractors.py"
-                )
+                print("\nCheck extractor and shape-rule coverage for this export path:")
+                print("  src/codegen/onnx_to_ir/layer_extractors.py")
                 print("=" * 70 + "\n")
 
 
