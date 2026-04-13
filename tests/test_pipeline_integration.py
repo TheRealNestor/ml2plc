@@ -31,9 +31,7 @@ def test_compile_succeeds_on_multi_region_model():
                     mock_model_ir.regions = [r0, r1]
                     mock_build_model_ir.return_value = mock_model_ir
 
-                    output = compile_onnx_to_st(
-                        "dummy_path.onnx", output_path="dummy.st"
-                    )
+                    output = compile_onnx_to_st("dummy_path.onnx")
 
                     assert "FUNCTION_BLOCK NeuralNetwork" in output
                     mock_translate.assert_called_once()
@@ -55,7 +53,7 @@ def test_compile_handles_recurrent_region_gracefully():
                 ]
                 mock_build_model_ir.return_value = mock_model_ir
 
-                output = compile_onnx_to_st("dummy_path.onnx", output_path="dummy.st")
+                output = compile_onnx_to_st("dummy_path.onnx")
 
                 assert "RECURRENT" in output
                 mock_translate.assert_called_once()

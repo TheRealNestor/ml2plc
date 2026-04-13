@@ -82,9 +82,7 @@ def normalize_ir_inputs(analyzer: ONNXModel) -> NormalizedIRInputs:
         Prepared artifacts for typed extraction pass
     """
     logger.info("Stage 2: Normalizing model for IR extraction")
-    working_layers, constant_values, folded_outputs = normalize_model_for_ir(
-        analyzer
-    )
+    working_layers, constant_values, folded_outputs = normalize_model_for_ir(analyzer)
     logger.info(
         "  Prepared %d working layer(s), %d compile-time constant(s)",
         len(working_layers),

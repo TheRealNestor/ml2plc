@@ -314,9 +314,7 @@ def onnx_to_ir(analyzer: ONNXModel) -> NetworkIR:
       4) Finalize execution order (topological/SCC-aware)
     """
     logger.info("Converting ONNX model to IR...")
-    working_layers, constant_values, folded_outputs = normalize_model_for_ir(
-        analyzer
-    )
+    working_layers, constant_values, folded_outputs = normalize_model_for_ir(analyzer)
     ir_unordered = extract_typed_ir_graph(
         analyzer,
         working_layers,
