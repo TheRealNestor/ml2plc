@@ -1,5 +1,3 @@
-# Compilation pipeline
-
 ```mermaid
 %%{init: {'look': 'handDrawn', 'theme': 'default'}}%%
 flowchart LR
