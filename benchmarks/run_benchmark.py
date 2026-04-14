@@ -156,7 +156,6 @@ def main():
         # --- ResNet (deployable <=64KB) ---
         ("ResNet1", "ResNet", "1 skip block, width 16", build_resnet(1, 16)),
         ("ResNet2", "ResNet", "2 skip blocks, width 32", build_resnet(2, 32)),
-
         # --- Non-deployable models (>100KB) ---
         ("MLP9", "MLP", "2 layers, 128/96", build_mlp([128, 96])),  # >100KB
         ("LSTM3", "LSTM", "2 layers, 64 units", build_lstm(64, stacked=True)),  # >100KB
@@ -212,7 +211,6 @@ def main():
             max_err = None
             status = "ST Compile Failed"
             print(f"[{name}] Compile error: {e}")
-
 
         deployable = "Yes" if st_size > 0 and st_size <= 96.0 else "No"
         print(
