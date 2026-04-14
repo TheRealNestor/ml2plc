@@ -262,26 +262,41 @@ def generate_test_inputs(
     input_size: int = 5,
     seed: int = 42,
     include_edge_cases: bool = True,
+    mean: float = 0.0,
+    std: float = 1.0,
 ) -> np.ndarray:
     """
     Generate synthetic test inputs for translation validation.
+    The inputs are drawn from a normal distribution N(mean, std^2).
     """
     np.random.seed(seed)
 
     inputs = []
 
-    # Normal range inputs (most common case)
-    inputs.append(np.random.randn(num_samples - 10, input_size).astype(np.float32))
+    # Normal range inputs scaled to the model's domain
+    n_normal = num_samples - 10 if include_edge_cases else num_samples
+    base_samples = np.random.randn(n_normal, input_size)
+    inputs.append((base_samples * std + mean).astype(np.float32))
 
     if include_edge_cases:
         inputs.append(np.zeros((1, input_size), dtype=np.float32))
         inputs.append(np.ones((1, input_size), dtype=np.float32))
         inputs.append(-np.ones((1, input_size), dtype=np.float32))
-        inputs.append(np.full((1, input_size), 0.5, dtype=np.float32))
-        inputs.append(np.full((1, input_size), -0.5, dtype=np.float32))
-        inputs.append(np.random.randn(1, input_size).astype(np.float32) * 10)
-        inputs.append(np.random.randn(1, input_size).astype(np.float32) * 0.01)
-        inputs.append(np.random.uniform(-5, 5, (3, input_size)).astype(np.float32))
+        # Add some edge cases explicitly scaled to the domain
+        inputs.append(np.full((1, input_size), mean, dtype=np.float32))
+        inputs.append(np.full((1, input_size), mean + 3 * std, dtype=np.float32))
+        inputs.append(np.full((1, input_size), mean - 3 * std, dtype=np.float32))
+        inputs.append(
+            (np.random.randn(1, input_size) * std * 10 + mean).astype(np.float32)
+        )
+        inputs.append(
+            (np.random.randn(1, input_size) * std * 0.01 + mean).astype(np.float32)
+        )
+        inputs.append(
+            (np.random.uniform(-1, 1, (2, input_size)) * std * 2 + mean).astype(
+                np.float32
+            )
+        )
 
     return np.vstack(inputs)
 
@@ -369,6 +384,18 @@ def main():
         action="store_true",
         help="Print all sample comparisons, not just the first 3.",
     )
+    parser.add_argument(
+        "--mean",
+        type=float,
+        default=None,
+        help="Mean for the normal distribution (e.g. 20 for temp models).",
+    )
+    parser.add_argument(
+        "--std",
+        type=float,
+        default=None,
+        help="Standard deviation for the normal distribution fallback.",
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -391,9 +418,13 @@ def main():
     input_size = args.input_size or infer_input_size(onnx_model_file)
     print(f"Input size: {input_size}")
 
+    mean = args.mean if args.mean is not None else 0.0
+    std = args.std if args.std is not None else 1.0
+    print(f"Sampling domain: Normal(mean={mean}, std={std})")
+
     # Generate test inputs
     test_inputs = generate_test_inputs(
-        num_samples=args.num_samples, input_size=input_size
+        num_samples=args.num_samples, input_size=input_size, mean=mean, std=std
     )
 
     # Run full pipeline

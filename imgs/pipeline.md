@@ -14,10 +14,10 @@ flowchart LR
     Canon("Normalization"):::action
     Infer("Shape + type inference"):::action
     Extract("Layer extraction"):::action
-    Order("Dependency scheduling\n(SCC-ordered)"):::action
+    Order("Dependency scheduling\n(SCC-aware)"):::action
 
     %% --- Optimization ---
-    Regionize("Regionization"):::action
+    Regionize("Regionization\n(SCC-based)"):::action
     Optimize("Region optimization"):::action
 
     %% --- Codegen ---

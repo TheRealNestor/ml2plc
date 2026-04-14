@@ -4,8 +4,14 @@ End-to-end compilation tests: ONNX model → Structured Text → Validation.
 Tests the complete compilation pipeline for different model architectures:
 - LSTM: Recurrent temporal model
 - Bidirectional LSTM: Two-direction temporal context model
-- GRU: Gated recurrent unit (simpler than LSTM)
-- MLP: Multi-layer perceptron (feedforward)
+- GRU: Gated recurrent unit (simpler than LSTM)           results = compile_and_validate_structural(
+            lstm_onnx, tmp_output_dir, "lstm", num_samples=10, input_shape=(20, 1),
+            data_mean=20.0, data_std=10.0
+        )  results = compile_and_validate_structural(
+            lstm_onnx, tmp_output_dir, "lstm", num_samples=10, input_shape=(20, 1),
+            data_mean=20.0, data_std=10.0
+        )
+        assert results["passed"], f"Structural validation failed: {results}"MLP: Multi-layer perceptron (feedforward)
 - CNN: Convolutional neural network
 - (Future: RNN, Transformer, etc.)
 
@@ -139,6 +145,8 @@ def compile_and_validate_structural(
     test_name: str,
     num_samples: int = 5,
     input_shape: tuple = (20,),
+    data_mean: float = 0.0,
+    data_std: float = 1.0,
 ) -> dict:
     """
     FAST STRUCTURAL VALIDATION using untrained ONNX model.
@@ -174,7 +182,9 @@ def compile_and_validate_structural(
         translated_func = load_translated_function(py_path, func_name)
 
         # 4. Generate minimal test inputs (just check it runs)
-        test_inputs = np.random.randn(num_samples, *input_shape).astype(np.float32)
+        test_inputs = (
+            np.random.randn(num_samples, *input_shape) * data_std + data_mean
+        ).astype(np.float32)
 
         # 5. Validate structure (very loose tolerances - just check it doesn't crash)
         results = compare_inference(
@@ -206,6 +216,8 @@ def compile_and_validate_functional(
     input_shape: tuple = (20,),
     rtol: float = 1e-3,
     atol: float = 1e-3,
+    data_mean: float = 0.0,
+    data_std: float = 1.0,
 ) -> dict:
     """
     MINIMAL FUNCTIONAL VALIDATION - verifies translation doesn't break logic.
@@ -243,7 +255,9 @@ def compile_and_validate_functional(
         translated_func = load_translated_function(py_path, func_name)
 
         # Generate minimal test inputs - just a few to verify correctness
-        test_inputs = np.random.randn(num_samples, *input_shape).astype(np.float32)
+        test_inputs = (
+            np.random.randn(num_samples, *input_shape) * data_std + data_mean
+        ).astype(np.float32)
 
         # Validate with reasonable tolerances
         # Not too tight (it's only 1 epoch) but not too loose (should still work)
