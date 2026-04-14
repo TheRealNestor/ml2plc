@@ -17,15 +17,16 @@ from translation_validation.validation import (
 )
 
 
-def build_mlp_4(input_shape):
-    return tf.keras.Sequential(
-        [
-            tf.keras.layers.Flatten(input_shape=input_shape),
-            tf.keras.layers.Dense(1024, activation="relu"),
-            tf.keras.layers.Dense(512, activation="relu"),
-            tf.keras.layers.Dense(3, activation="softmax"),
-        ]
-    )
+def build_mlp(units_list):
+    def builder(input_shape):
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Flatten(input_shape=input_shape))
+        for u in units_list:
+            model.add(tf.keras.layers.Dense(u, activation="relu"))
+        model.add(tf.keras.layers.Dense(3, activation="softmax"))
+        return model
+
+    return builder
 
 
 def build_lstm(units, stacked=False):
@@ -134,101 +135,54 @@ def main():
     input_shape = (20, 1)  # Like the temperature classifier (20 timesteps, 1 feature)
 
     suite = [
-        ("MLP_Model_4", "MLP", "Model 4 rerun from report", build_mlp_4),
-        # Targets ~1,000 params
-        ("LSTM_Small", "LSTM", "1 layer, 14 units", build_lstm(14)),  # ~1,025 params
-        ("GRU_Small", "GRU", "1 layer, 16 units", build_gru(16)),  # ~963 params
-        (
-            "CNN_Small",
-            "CNN",
-            "1 layer, 6 filters",
-            build_cnn(6, layers=1),
-        ),  # ~987 params
-        (
-            "ResNet_Small",
-            "ResNet",
-            "1 skip block, width 16",
-            build_resnet(1, 16),
-        ),  # ~931 params
-        # Targets ~4,500 params
-        ("LSTM_Medium", "LSTM", "1 layer, 32 units", build_lstm(32)),  # ~4,451 params
-        ("GRU_Medium", "GRU", "1 layer, 36 units", build_gru(36)),  # ~4,359 params
-        (
-            "CNN_Medium",
-            "CNN",
-            "2 layers, 10 filters",
-            build_cnn(10, layers=2),
-        ),  # ~4,503 params
-        (
-            "ResNet_Medium",
-            "ResNet",
-            "2 skip blocks, width 32",
-            build_resnet(2, 32),
-        ),  # ~4,995 params
-        # Targets ~7,500 params (Safely fits code footprint limit < 96 KB)
-        (
-            "LSTM_Large",
-            "LSTM",
-            "2 layers, 24 units",
-            build_lstm(24, stacked=True),
-        ),  # ~7,275 params
-        (
-            "GRU_Large",
-            "GRU",
-            "2 layers, 26 units",
-            build_gru(26, stacked=True),
-        ),  # ~6,477 params
-        (
-            "CNN_Large",
-            "CNN",
-            "2 layers, 16 filters",
-            build_cnn(16, layers=2),
-        ),  # ~6,035 params
-        (
-            "ResNet_Large",
-            "ResNet",
-            "3 skip blocks, width 32",
-            build_resnet(3, 32),
-        ),  # ~7,139 params
+        # --- MLPs (deployable <=64KB) ---
+        ("MLP1", "MLP", "2 layers, 8/8", build_mlp([8, 8])),
+        ("MLP2", "MLP", "2 layers, 16/12", build_mlp([16, 12])),
+        ("MLP3", "MLP", "3 layers, 16/12/8", build_mlp([16, 12, 8])),
+        ("MLP4", "MLP", "5 layers, 12", build_mlp([12] * 5)),
+        ("MLP5", "MLP", "11 layers, 8", build_mlp([8] * 11)),
+        ("MLP6", "MLP", "2 layers, 32/24", build_mlp([32, 24])),
+        ("MLP7", "MLP", "5 layers, 24", build_mlp([24] * 5)),
+        ("MLP8", "MLP", "2 layers, 64/48", build_mlp([64, 48])),
+        # --- LSTM (deployable <=64KB) ---
+        ("LSTM1", "LSTM", "1 layer, 14 units", build_lstm(14)),
+        ("LSTM2", "LSTM", "1 layer, 32 units", build_lstm(32)),
+        # --- GRU (deployable <=64KB) ---
+        ("GRU1", "GRU", "1 layer, 16 units", build_gru(16)),
+        ("GRU2", "GRU", "1 layer, 36 units", build_gru(36)),
+        # --- CNN (deployable <=64KB) ---
+        ("CNN1", "CNN", "1 layer, 6 filters", build_cnn(6, layers=1)),
+        ("CNN2", "CNN", "2 layers, 10 filters", build_cnn(10, layers=2)),
+        # --- ResNet (deployable <=64KB) ---
+        ("ResNet1", "ResNet", "1 skip block, width 16", build_resnet(1, 16)),
+        ("ResNet2", "ResNet", "2 skip blocks, width 32", build_resnet(2, 32)),
+
+        # --- Non-deployable models (>100KB) ---
+        ("MLP9", "MLP", "2 layers, 128/96", build_mlp([128, 96])),  # >100KB
+        ("LSTM3", "LSTM", "2 layers, 64 units", build_lstm(64, stacked=True)),  # >100KB
+        ("GRU3", "GRU", "2 layers, 64 units", build_gru(64, stacked=True)),  # >100KB
+        ("CNN3", "CNN", "3 layers, 32 filters", build_cnn(32, layers=3)),  # >100KB
+        ("ResNet3", "ResNet", "3 skip blocks, width 64", build_resnet(3, 64)),  # >100KB
     ]
 
     results = []
-
-    print(
-        f"{'Model Name':<15} | {'Params':<8} | {'ONNX (KB)':<10} | {'ST (KB)':<10} | {'Max Err':<10} | Status"
-    )
-    print("-" * 85)
-
     for name, kind, desc, builder in suite:
+        # Build and save Keras model
         model = builder(input_shape)
+        keras_path = keras_dir / f"{name}.keras"
+        model.save(keras_path, save_format="keras")
+
+        # Convert to ONNX
+        onnx_path = onnx_dir / f"{name}.onnx"
+        spec = (tf.TensorSpec((None,) + input_shape, tf.float32, name="input"),)
+        model_proto, _ = tf2onnx.convert.from_keras(
+            model, input_signature=spec, opset=13, output_path=str(onnx_path)
+        )
+        onnx_size = get_file_size_kb(onnx_path)
         param_count = model.count_params()
 
-        keras_path = keras_dir / f"{name}.keras"
-        onnx_path = onnx_dir / f"{name}.onnx"
-        st_path = st_dir / f"{name}.st"
-
-        max_err = None
-
-        # Save keras
-        model.save(keras_path)
-
-        # Export to ONNX
-        try:
-            spec = (tf.TensorSpec((None, *input_shape), tf.float32, name="input"),)
-            onnx_model, _ = tf2onnx.convert.from_keras(
-                model, input_signature=spec, opset=13
-            )
-            with open(onnx_path, "wb") as f:
-                f.write(onnx_model.SerializeToString())
-
-            onnx_size = get_file_size_kb(onnx_path)
-        except Exception as e:
-            print(
-                f"{name:<15} | {param_count:<8} | ERROR      |            | ONNX Export Failed: {str(e)}"
-            )
-            continue
-
         # Compile to ST
+        st_path = st_dir / f"{name}.st"
         try:
             compile_onnx_to_st(
                 model_path=str(onnx_path),
@@ -241,27 +195,28 @@ def main():
             # Validation
             try:
                 flat_input_size = infer_input_size(onnx_path)
-                test_inputs = generate_test_inputs(
-                    num_samples=100, input_size=flat_input_size, mean=20.0, std=10.0
-                )
+                test_inputs = generate_test_inputs(100, flat_input_size)
                 val_res = validate_translation(st_path, onnx_path, test_inputs)
-                max_err = val_res.get("max_abs_diff", None)
-                status = (
-                    "Success" if val_res.get("passed", False) else "Validation Failed"
+                max_err = (
+                    val_res["max_abs_err"]
+                    if "max_abs_err" in val_res
+                    else val_res.get("max_abs_diff", None)
                 )
+                status = "OK" if val_res.get("passed", True) else "Validation Failed"
             except Exception as ve:
                 max_err = None
-                status = f"Validation Error"
+                status = "Validation Error"
                 print(f"[{name}] Validation error: {ve}")
-
         except Exception as e:
             st_size = 0.0
             max_err = None
-            status = f"ST Compile Failed"
+            status = "ST Compile Failed"
             print(f"[{name}] Compile error: {e}")
 
+
+        deployable = "Yes" if st_size > 0 and st_size <= 96.0 else "No"
         print(
-            f"{name:<15} | {param_count:<8} | {onnx_size:<10.1f} | {st_size:<10.1f} | {max_err if max_err is not None else 'N/A':<10} | {status}"
+            f"{name:<15} | {param_count:<8} | {onnx_size:<10.1f} | {st_size:<10.1f} | {deployable:<12} | {max_err if max_err is not None else 0.0:<10} | {status}"
         )
 
         results.append(
@@ -272,6 +227,7 @@ def main():
                 "Parameters": param_count,
                 "ONNX Size (KB)": round(onnx_size, 2),
                 "ST Size (KB)": round(st_size, 2),
+                "Deployable": deployable,
                 "Max Abs Error": max_err,
                 "Status": status,
             }
