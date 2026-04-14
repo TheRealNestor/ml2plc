@@ -132,7 +132,7 @@ def main():
     for d in [keras_dir, onnx_dir, st_dir, results_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    input_shape = (20, 1)  # Like the temperature classifier (20 timesteps, 1 feature)
+    input_shape = (20, 1)
 
     suite = [
         # --- MLPs (deployable <=64KB) ---
@@ -157,30 +157,38 @@ def main():
         ("ResNet1", "ResNet", "1 skip block, width 16", build_resnet(1, 16)),
         ("ResNet2", "ResNet", "2 skip blocks, width 32", build_resnet(2, 32)),
         # --- Non-deployable models (>100KB) ---
-        ("MLP9", "MLP", "2 layers, 128/96", build_mlp([128, 96])),  # >100KB
-        ("LSTM3", "LSTM", "2 layers, 64 units", build_lstm(64, stacked=True)),  # >100KB
-        ("GRU3", "GRU", "2 layers, 64 units", build_gru(64, stacked=True)),  # >100KB
-        ("CNN3", "CNN", "3 layers, 32 filters", build_cnn(32, layers=3)),  # >100KB
-        ("ResNet3", "ResNet", "3 skip blocks, width 64", build_resnet(3, 64)),  # >100KB
+        ("MLP9", "MLP", "2 layers, 128/96", build_mlp([128, 96])),
+        ("LSTM3", "LSTM", "2 layers, 64 units", build_lstm(64, stacked=True)),
+        ("GRU3", "GRU", "2 layers, 64 units", build_gru(64, stacked=True)),
+        ("CNN3", "CNN", "3 layers, 32 filters", build_cnn(32, layers=3)),
+        ("ResNet3", "ResNet", "3 skip blocks, width 64", build_resnet(3, 64)),
     ]
 
     results = []
+    print(
+        f"{'Name':<15} | {'Params':<8} | {'ONNX (KB)':<10} | {'ST (KB)':<10} | {'Deployable':<12} | {'Max Err':<10} | {'Status'}"
+    )
+    print("-" * 100)
+
     for name, kind, desc, builder in suite:
-        # Build and save Keras model
+        # 1. Build Model
         model = builder(input_shape)
+
+        # 2. Get the ground-truth parameter count directly from Keras
+        param_count = model.count_params()
+
+        # 3. Save and Convert
         keras_path = keras_dir / f"{name}.keras"
         model.save(keras_path, save_format="keras")
 
-        # Convert to ONNX
         onnx_path = onnx_dir / f"{name}.onnx"
         spec = (tf.TensorSpec((None,) + input_shape, tf.float32, name="input"),)
         model_proto, _ = tf2onnx.convert.from_keras(
             model, input_signature=spec, opset=13, output_path=str(onnx_path)
         )
         onnx_size = get_file_size_kb(onnx_path)
-        param_count = model.count_params()
 
-        # Compile to ST
+        # 4. Compile to ST
         st_path = st_dir / f"{name}.st"
         try:
             compile_onnx_to_st(
@@ -191,16 +199,12 @@ def main():
             )
             st_size = get_file_size_kb(st_path)
 
-            # Validation
+            # 5. Validation
             try:
                 flat_input_size = infer_input_size(onnx_path)
                 test_inputs = generate_test_inputs(100, flat_input_size)
                 val_res = validate_translation(st_path, onnx_path, test_inputs)
-                max_err = (
-                    val_res["max_abs_err"]
-                    if "max_abs_err" in val_res
-                    else val_res.get("max_abs_diff", None)
-                )
+                max_err = val_res.get("max_abs_err", val_res.get("max_abs_diff", 0.0))
                 status = "OK" if val_res.get("passed", True) else "Validation Failed"
             except Exception as ve:
                 max_err = None
@@ -212,9 +216,11 @@ def main():
             status = "ST Compile Failed"
             print(f"[{name}] Compile error: {e}")
 
-        deployable = "Yes" if st_size > 0 and st_size <= 96.0 else "No"
+        deployable = "Yes" if 0 < st_size <= 96.0 else "No"
+
+        # Log to console
         print(
-            f"{name:<15} | {param_count:<8} | {onnx_size:<10.1f} | {st_size:<10.1f} | {deployable:<12} | {max_err if max_err is not None else 0.0:<10} | {status}"
+            f"{name:<15} | {param_count:<8} | {onnx_size:<10.1f} | {st_size:<10.1f} | {deployable:<12} | {max_err if max_err is not None else 0.0:<10.4e} | {status}"
         )
 
         results.append(
@@ -232,7 +238,7 @@ def main():
         )
 
     df = pd.DataFrame(results)
-    csv_path = results_dir / "benchmark_models.csv"
+    csv_path = results_dir / "benchmark_results.csv"
     df.to_csv(csv_path, index=False)
     print(f"\nSaved benchmark results to {csv_path}")
 
