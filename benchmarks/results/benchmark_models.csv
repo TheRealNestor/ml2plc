@@ -1,0 +1,14 @@
+Model Name,Type,Description,Parameters,ONNX Size (KB),ST Size (KB),Max Abs Error,Status
+MLP_Model_4,MLP,Model 4 rerun from report,547843,2135.1,7771.82,8.658798362759512e-07,Success
+LSTM_Small,LSTM,"1 layer, 14 units",941,6.24,17.43,8.40256800804795e-08,Success
+GRU_Small,GRU,"1 layer, 16 units",963,6.1,16.62,1.5486217674887115e-07,Success
+CNN_Small,CNN,"1 layer, 6 filters",2011,9.33,30.13,6.958897503239747e-07,Success
+ResNet_Small,ResNet,"1 skip block, width 16",931,4.74,14.4,1.2268563019390832e-06,Success
+LSTM_Medium,LSTM,"1 layer, 32 units",4451,20.36,65.58,7.72537888660274e-08,Success
+GRU_Medium,GRU,"1 layer, 36 units",4323,19.3,61.77,1.2166903540222762e-07,Success
+CNN_Medium,CNN,"2 layers, 10 filters",3617,15.99,53.07,5.570232548546272e-07,Success
+ResNet_Medium,ResNet,"2 skip blocks, width 32",4995,20.9,68.37,1.875837391029922e-06,Success
+LSTM_Large,LSTM,"2 layers, 24 units",7275,32.49,106.82,7.253269607154778e-08,Success
+GRU_Large,GRU,"2 layers, 26 units",6555,28.96,93.84,1.4358951005988274e-07,Success
+CNN_Large,CNN,"2 layers, 16 filters",6035,25.39,86.88,3.3907767760243956e-07,Success
+ResNet_Large,ResNet,"3 skip blocks, width 32",7107,29.5,96.68,2.6476779191320077e-07,Success

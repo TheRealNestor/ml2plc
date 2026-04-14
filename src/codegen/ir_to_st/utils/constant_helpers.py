@@ -48,7 +48,7 @@ def generate_array_constant(
     if is_integer:
         value_str = ", ".join(str(int(val)) for val in flat_values)
     else:
-        value_str = ", ".join(f"{val:.6f}" for val in flat_values)
+        value_str = ", ".join(f"{val:.9g}" for val in flat_values)
 
     return STCode.from_lines(
         f"{name} : ARRAY[0..{flat_values.size - 1}] OF {plc_type} := [{value_str}];"
