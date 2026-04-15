@@ -312,11 +312,10 @@ def generate_var_section(
             if ndim > 0 and layer.input_size > 1:
                 with builder.indent():
                     builder.add_line(
-                        f"(* Transpose layer {layer.layer_id} loop variables *)"
+                        f"(* Transpose loop variables for layer {layer.layer_id} *)"
                     )
                     for d in range(ndim):
                         builder.add_line(f"t{layer.layer_id}_d{d} : DINT;")
-
     # LSTM variables
     has_lstm = any(
         isinstance(network.layers[ln], LSTMLayer) for ln in network.execution_order
@@ -450,7 +449,10 @@ def collect_all_variables_from_regions(
     return all_variables
 
 
-def generate_merged_var_section(all_variables: Dict[str, Tuple[int, str]]) -> STCode:
+def generate_merged_var_section(
+    all_variables: Dict[str, Tuple[int, str]],
+    optimization_results: Optional[Dict[str, "OptimizationResult"]] = None,
+) -> STCode:
     """Generate merged VAR section from all variables."""
     builder = STCodeBuilder()
     builder.add_line("VAR")
@@ -486,6 +488,24 @@ def generate_merged_var_section(all_variables: Dict[str, Tuple[int, str]]) -> ST
         builder.add_line("kw : DINT;")
         builder.add_line("ih : DINT;")
         builder.add_line("iw : DINT;")
+
+    transpose_vars_added = set()
+    for region_id, opt_result in optimization_results.items():
+        network = opt_result.ir
+        for ln in network.execution_order:
+            layer = network.layers[ln]
+            if isinstance(layer, TransposeLayer) and layer.output_shape:
+                ndim = len(layer.output_shape)
+                if ndim > 0 and layer.input_size > 1:
+                    for d in range(ndim):
+                        var_name = f"t{layer.layer_id}_d{d}"
+                        if var_name not in transpose_vars_added:
+                            transpose_vars_added.add(var_name)
+    if transpose_vars_added:
+        with builder.indent():
+            builder.add_line("(* Transpose loop variables *)")
+            for var_name in sorted(transpose_vars_added):
+                builder.add_line(f"{var_name} : DINT;")
 
     builder.add_line("END_VAR")
     builder.add_line("")
@@ -560,7 +580,7 @@ def generate_model_function_block(
     # Merged constants and variables
     code += generate_merged_constants_section(optimization_results)
     all_variables = collect_all_variables_from_regions(optimization_results)
-    code += generate_merged_var_section(all_variables)
+    code += generate_merged_var_section(all_variables, optimization_results)
 
     code += st_comment("Forward pass execution")
 
