@@ -1,9 +1,12 @@
 import os
 import sys
+import argparse
 import pandas as pd
 import tensorflow as tf
 from pathlib import Path
 import tf2onnx
+import numpy as np
+
 
 # Ensure codegen is in path
 workspace_dir = Path(__file__).resolve().parent.parent
@@ -15,6 +18,97 @@ from translation_validation.validation import (
     generate_test_inputs,
     infer_input_size,
 )
+
+
+# =============================================================================
+# Synthetic data generation
+# =============================================================================
+
+
+def generate_synthetic_data(n_samples, input_shape=(20, 1), n_classes=3, seed=42):
+    """Generate synthetic 3-class time series data for training.
+
+    Classes:
+      0 - Sine-like signals
+      1 - Square-like signals
+      2 - Gaussian noise
+    """
+    rng = np.random.RandomState(seed)
+    seq_len = input_shape[0]
+    t = np.linspace(0, 2 * np.pi, seq_len)
+
+    X, y = [], []
+    for _ in range(n_samples):
+        cls = rng.randint(0, n_classes)
+        if cls == 0:  # Sine
+            signal = np.sin(t + rng.uniform(0, 2 * np.pi))
+            signal += rng.normal(0, 0.1, seq_len)
+        elif cls == 1:  # Square
+            signal = np.sign(np.sin(t + rng.uniform(0, 2 * np.pi)))
+            signal += rng.normal(0, 0.15, seq_len)
+        else:  # Noise
+            signal = rng.normal(0, 1.0, seq_len)
+        X.append(signal)
+        y.append(cls)
+
+    X = np.array(X, dtype=np.float32).reshape(-1, *input_shape)
+    y = np.array(y, dtype=np.int32)
+    return X, y
+
+
+def train_model(model, input_shape, epochs, verbose=0):
+    """Train a model on synthetic data. Returns (model, test_accuracy)."""
+    model.compile(
+        optimizer="adam",
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+    X_train, y_train = generate_synthetic_data(3000, input_shape, seed=42)
+    X_test, y_test = generate_synthetic_data(600, input_shape, seed=99)
+
+    model.fit(
+        X_train,
+        y_train,
+        epochs=epochs,
+        batch_size=32,
+        validation_split=0.2,
+        verbose=verbose,
+    )
+
+    _, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    return model, test_acc
+
+
+def run_inference_demo(model, input_shape):
+    """Run inference on representative inputs and print class distributions."""
+    seq_len = input_shape[0]
+    t = np.linspace(0, 2 * np.pi, seq_len)
+    class_names = ["Sine", "Square", "Noise"]
+
+    samples = {
+        "Clean sine": np.sin(t).reshape(1, *input_shape).astype(np.float32),
+        "Clean square": np.sign(np.sin(t)).reshape(1, *input_shape).astype(np.float32),
+        "Pure noise": np.random.RandomState(42)
+        .normal(0, 1, (1, *input_shape))
+        .astype(np.float32),
+        "Noisy sine": (np.sin(t) + np.random.RandomState(7).normal(0, 0.3, seq_len))
+        .reshape(1, *input_shape)
+        .astype(np.float32),
+        "All zeros": np.zeros((1, *input_shape), dtype=np.float32),
+    }
+
+    print("    Inference demo:")
+    for label, x in samples.items():
+        pred = model.predict(x, verbose=0)[0]
+        winner = class_names[np.argmax(pred)]
+        probs = "  ".join(f"{c}: {p:.3f}" for c, p in zip(class_names, pred))
+        print(f"      {label:<14} -> {winner:<7} ({probs})")
+
+
+# =============================================================================
+# Model builders
+# =============================================================================
 
 
 def build_mlp(units_list):
@@ -122,7 +216,62 @@ def get_file_size_kb(filepath):
     return os.path.getsize(filepath) / 1024.0
 
 
+# =============================================================================
+# CLI
+# =============================================================================
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="ml2plc benchmark suite",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  python run_benchmark.py                        # random weights (fast, default)
+  python run_benchmark.py --train                # train 30 epochs then compile
+  python run_benchmark.py --train --epochs 50    # train 50 epochs
+  python run_benchmark.py --infer                # train + show inference demo
+  python run_benchmark.py --infer --verbose 1    # train with progress bars
+""",
+    )
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="Train models on synthetic data before conversion (default: random weights)",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Number of training epochs when --train is set (default: 30)",
+    )
+    parser.add_argument(
+        "--infer",
+        action="store_true",
+        help="Run inference demo on sample inputs after each model (implies --train)",
+    )
+    parser.add_argument(
+        "--verbose",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        help="Training verbosity: 0=silent, 1=progress bar, 2=one line/epoch (default: 0)",
+    )
+    return parser.parse_args()
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
 def main():
+    args = parse_args()
+
+    # --infer implies --train
+    if args.infer:
+        args.train = True
+
     benchmarks_dir = workspace_dir / "benchmarks"
     keras_dir = benchmarks_dir / "python"
     onnx_dir = benchmarks_dir / "onnx"
@@ -164,11 +313,26 @@ def main():
         ("ResNet3", "ResNet", "3 skip blocks, width 64", build_resnet(3, 64)),
     ]
 
+    if args.train:
+        print(f"Mode: TRAINED models ({args.epochs} epochs on synthetic data)")
+    else:
+        print("Mode: RANDOM weights (compiler correctness only)")
+    print()
+
     results = []
-    print(
-        f"{'Name':<15} | {'Params':<8} | {'ONNX (KB)':<10} | {'ST (KB)':<10} | {'Deployable':<12} | {'Max Err':<10} | {'Status'}"
-    )
-    print("-" * 100)
+
+    # Build header
+    cols = ["Name", "Params"]
+    widths = [15, 8]
+    if args.train:
+        cols.append("Test Acc")
+        widths.append(8)
+    cols += ["ONNX (KB)", "ST (KB)", "Deployable", "Max Err", "Status"]
+    widths += [10, 10, 12, 10, 20]
+
+    header = " | ".join(f"{c:<{w}}" for c, w in zip(cols, widths))
+    print(header)
+    print("-" * len(header))
 
     for name, kind, desc, builder in suite:
         # 1. Build Model
@@ -177,7 +341,19 @@ def main():
         # 2. Get the ground-truth parameter count directly from Keras
         param_count = model.count_params()
 
-        # 3. Save and Convert
+        # 3. Optionally train
+        test_acc = None
+        if args.train:
+            print(f"[{name}] Training {args.epochs} epochs...", end=" ", flush=True)
+            model, test_acc = train_model(
+                model, input_shape, epochs=args.epochs, verbose=args.verbose
+            )
+            print(f"acc={test_acc:.4f}")
+
+            if args.infer:
+                run_inference_demo(model, input_shape)
+
+        # 4. Save and Convert
         keras_path = keras_dir / f"{name}.keras"
         model.save(keras_path, save_format="keras")
 
@@ -188,7 +364,7 @@ def main():
         )
         onnx_size = get_file_size_kb(onnx_path)
 
-        # 4. Compile to ST
+        # 5. Compile to ST
         st_path = st_dir / f"{name}.st"
         try:
             compile_onnx_to_st(
@@ -199,7 +375,7 @@ def main():
             )
             st_size = get_file_size_kb(st_path)
 
-            # 5. Validation
+            # 6. Validation
             try:
                 flat_input_size = infer_input_size(onnx_path)
                 test_inputs = generate_test_inputs(100, flat_input_size)
@@ -218,24 +394,36 @@ def main():
 
         deployable = "Yes" if 0 < st_size <= 96.0 else "No"
 
-        # Log to console
-        print(
-            f"{name:<15} | {param_count:<8} | {onnx_size:<10.1f} | {st_size:<10.1f} | {deployable:<12} | {max_err if max_err is not None else 0.0:<10.4e} | {status}"
-        )
+        # Build result row
+        err_str = f"{max_err:<10.4e}" if max_err is not None else f"{0.0:<10.4e}"
+        row_vals = [f"{name:<15}", f"{param_count:<8}"]
+        if args.train:
+            row_vals.append(f"{test_acc:.4f}  " if test_acc is not None else "N/A     ")
+        row_vals += [
+            f"{onnx_size:<10.1f}",
+            f"{st_size:<10.1f}",
+            f"{deployable:<12}",
+            err_str,
+            status,
+        ]
+        print(" | ".join(row_vals))
 
-        results.append(
-            {
-                "Model Name": name,
-                "Type": kind,
-                "Description": desc,
-                "Parameters": param_count,
-                "ONNX Size (KB)": round(onnx_size, 2),
-                "ST Size (KB)": round(st_size, 2),
-                "Deployable": deployable,
-                "Max Abs Error": max_err,
-                "Status": status,
-            }
-        )
+        result_entry = {
+            "Model Name": name,
+            "Type": kind,
+            "Description": desc,
+            "Parameters": param_count,
+            "ONNX Size (KB)": round(onnx_size, 2),
+            "ST Size (KB)": round(st_size, 2),
+            "Deployable": deployable,
+            "Max Abs Error": max_err,
+            "Status": status,
+        }
+        if args.train:
+            result_entry["Test Accuracy"] = (
+                round(test_acc, 4) if test_acc is not None else None
+            )
+        results.append(result_entry)
 
     df = pd.DataFrame(results)
     csv_path = results_dir / "benchmark_results.csv"
