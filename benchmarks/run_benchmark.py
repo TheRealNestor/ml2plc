@@ -31,7 +31,7 @@ LABEL_NAMES = ["Cold", "Normal", "Hot"]
 
 # Fixed normalization range covering the full dataset
 TEMP_MIN = -50.0
-TEMP_MAX = 170.0
+TEMP_MAX = 200.0
 
 
 def normalize(t):
