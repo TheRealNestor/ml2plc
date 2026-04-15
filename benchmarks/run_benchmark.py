@@ -21,94 +21,138 @@ from translation_validation.validation import (
 
 
 # =============================================================================
-# Synthetic data generation
+# Temperature data constants
+# =============================================================================
+
+WINDOW = 20
+NUM_CLASSES = 3
+LABEL_MAP = {"cold": 0, "normal": 1, "hot": 2}
+LABEL_NAMES = ["Cold", "Normal", "Hot"]
+
+# Fixed normalization range covering the full dataset
+TEMP_MIN = -50.0
+TEMP_MAX = 170.0
+
+
+def normalize(t):
+    return (t - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
+
+
+# =============================================================================
+# Temperature data loading
 # =============================================================================
 
 
-def generate_synthetic_data(n_samples, input_shape=(20, 1), n_classes=3, seed=42):
-    """Generate synthetic 3-class time series data for training.
+def load_temperature_data():
+    """Load temperature_data.csv and build sliding-window dataset."""
+    data_paths = [
+        workspace_dir / "data" / "temperature_data.csv",
+        workspace_dir / "examples" / "data" / "temperature_data.csv",
+    ]
+    data_path = None
+    for p in data_paths:
+        if p.exists():
+            data_path = p
+            break
+    if data_path is None:
+        raise FileNotFoundError(
+            f"temperature_data.csv not found. Searched:\n"
+            + "\n".join(f"  {p}" for p in data_paths)
+        )
 
-    Classes:
-      0 - Sine-like signals
-      1 - Square-like signals
-      2 - Gaussian noise
-    """
-    rng = np.random.RandomState(seed)
-    seq_len = input_shape[0]
-    t = np.linspace(0, 2 * np.pi, seq_len)
+    df = pd.read_csv(data_path)
+    temperatures = df["temperature"].values.astype(np.float32)
+    labels = df["label"].map(LABEL_MAP).values.astype(np.int32)
+
+    temps_norm = normalize(temperatures)
 
     X, y = [], []
-    for _ in range(n_samples):
-        cls = rng.randint(0, n_classes)
-        if cls == 0:  # Sine
-            signal = np.sin(t + rng.uniform(0, 2 * np.pi))
-            signal += rng.normal(0, 0.1, seq_len)
-        elif cls == 1:  # Square
-            signal = np.sign(np.sin(t + rng.uniform(0, 2 * np.pi)))
-            signal += rng.normal(0, 0.15, seq_len)
-        else:  # Noise
-            signal = rng.normal(0, 1.0, seq_len)
-        X.append(signal)
-        y.append(cls)
+    for i in range(len(temps_norm) - WINDOW + 1):
+        window_labels = labels[i : i + WINDOW]
+        X.append(temps_norm[i : i + WINDOW])
+        y.append(window_labels[-1])
 
-    X = np.array(X, dtype=np.float32).reshape(-1, *input_shape)
+    X = np.array(X, dtype=np.float32).reshape(-1, WINDOW, 1)
     y = np.array(y, dtype=np.int32)
     return X, y
 
 
-def train_model(model, input_shape, epochs, verbose=0):
-    """Train a model on synthetic data. Returns (model, test_accuracy)."""
+def compute_class_weights(y):
+    """Compute balanced class weights."""
+    classes = np.array([0, 1, 2])
+    counts = np.bincount(y, minlength=3).astype(np.float32)
+    total = len(y)
+    weights = {}
+    for c in classes:
+        if counts[c] > 0:
+            weights[int(c)] = total / (len(classes) * counts[c])
+        else:
+            weights[int(c)] = 1.0
+    return weights
+
+
+# =============================================================================
+# Training
+# =============================================================================
+
+
+def train_model(model, epochs, verbose=0):
+    """Train a model on temperature data. Returns (model, test_accuracy)."""
+    from sklearn.model_selection import train_test_split
+
+    X, y = load_temperature_data()
+    class_weights = compute_class_weights(y)
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
     model.compile(
-        optimizer="adam",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
 
-    X_train, y_train = generate_synthetic_data(3000, input_shape, seed=42)
-    X_test, y_test = generate_synthetic_data(600, input_shape, seed=99)
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor="val_accuracy", patience=15, restore_best_weights=True
+    )
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6
+    )
 
     model.fit(
         X_train,
         y_train,
+        validation_data=(X_val, y_val),
         epochs=epochs,
-        batch_size=32,
-        validation_split=0.2,
+        batch_size=64,
+        class_weight=class_weights,
+        callbacks=[early_stop, reduce_lr],
         verbose=verbose,
     )
 
-    _, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    _, test_acc = model.evaluate(X_val, y_val, verbose=0)
     return model, test_acc
 
 
-def run_inference_demo(model, input_shape):
-    """Run inference on representative inputs and print class distributions."""
-    seq_len = input_shape[0]
-    t = np.linspace(0, 2 * np.pi, seq_len)
-    class_names = ["Sine", "Square", "Noise"]
-
-    samples = {
-        "Clean sine": np.sin(t).reshape(1, *input_shape).astype(np.float32),
-        "Clean square": np.sign(np.sin(t)).reshape(1, *input_shape).astype(np.float32),
-        "Pure noise": np.random.RandomState(42)
-        .normal(0, 1, (1, *input_shape))
-        .astype(np.float32),
-        "Noisy sine": (np.sin(t) + np.random.RandomState(7).normal(0, 0.3, seq_len))
-        .reshape(1, *input_shape)
-        .astype(np.float32),
-        "All zeros": np.zeros((1, *input_shape), dtype=np.float32),
-    }
+def run_inference_demo(model):
+    """Run inference on representative temperature values."""
+    test_temps = [-30.0, -10.0, 0.0, 5.0, 15.0, 20.5, 25.0, 35.0, 60.0, 100.0, 150.0]
 
     print("    Inference demo:")
-    for label, x in samples.items():
-        pred = model.predict(x, verbose=0)[0]
-        winner = class_names[np.argmax(pred)]
-        probs = "  ".join(f"{c}: {p:.3f}" for c, p in zip(class_names, pred))
-        print(f"      {label:<14} -> {winner:<7} ({probs})")
+    for temp in test_temps:
+        inp = np.full((1, WINDOW, 1), normalize(temp), dtype=np.float32)
+        pred = model.predict(inp, verbose=0)[0]
+        winner = LABEL_NAMES[np.argmax(pred)]
+        probs = "  ".join(f"{c}: {p:.3f}" for c, p in zip(LABEL_NAMES, pred))
+        print(f"      {temp:>7.1f}°C -> {winner:<7} ({probs})")
 
 
 # =============================================================================
 # Model builders
 # =============================================================================
+
+INPUT_SHAPE = (WINDOW, 1)
 
 
 def build_mlp(units_list):
@@ -117,7 +161,7 @@ def build_mlp(units_list):
         model.add(tf.keras.layers.Flatten(input_shape=input_shape))
         for u in units_list:
             model.add(tf.keras.layers.Dense(u, activation="relu"))
-        model.add(tf.keras.layers.Dense(3, activation="softmax"))
+        model.add(tf.keras.layers.Dense(NUM_CLASSES, activation="softmax"))
         return model
 
     return builder
@@ -129,7 +173,7 @@ def build_lstm(units, stacked=False):
             return tf.keras.Sequential(
                 [
                     tf.keras.layers.LSTM(units, input_shape=input_shape),
-                    tf.keras.layers.Dense(3, activation="softmax"),
+                    tf.keras.layers.Dense(NUM_CLASSES, activation="softmax"),
                 ]
             )
         else:
@@ -139,7 +183,7 @@ def build_lstm(units, stacked=False):
                         units, return_sequences=True, input_shape=input_shape
                     ),
                     tf.keras.layers.LSTM(units),
-                    tf.keras.layers.Dense(3, activation="softmax"),
+                    tf.keras.layers.Dense(NUM_CLASSES, activation="softmax"),
                 ]
             )
 
@@ -152,7 +196,7 @@ def build_gru(units, stacked=False):
             return tf.keras.Sequential(
                 [
                     tf.keras.layers.GRU(units, input_shape=input_shape),
-                    tf.keras.layers.Dense(3, activation="softmax"),
+                    tf.keras.layers.Dense(NUM_CLASSES, activation="softmax"),
                 ]
             )
         else:
@@ -162,7 +206,7 @@ def build_gru(units, stacked=False):
                         units, return_sequences=True, input_shape=input_shape
                     ),
                     tf.keras.layers.GRU(units),
-                    tf.keras.layers.Dense(3, activation="softmax"),
+                    tf.keras.layers.Dense(NUM_CLASSES, activation="softmax"),
                 ]
             )
 
@@ -172,7 +216,6 @@ def build_gru(units, stacked=False):
 def build_cnn(filters, layers=1):
     def builder(input_shape):
         model = tf.keras.Sequential()
-        # Reshape (20, 1) to (20, 1, 1) for Conv2D to avoid 1D Squeeze ops in ONNX
         model.add(tf.keras.layers.InputLayer(input_shape=input_shape))
         model.add(tf.keras.layers.Reshape((input_shape[0], 1, 1)))
 
@@ -184,7 +227,7 @@ def build_cnn(filters, layers=1):
             )
         model.add(tf.keras.layers.Flatten())
         model.add(tf.keras.layers.Dense(16, activation="relu"))
-        model.add(tf.keras.layers.Dense(3, activation="softmax"))
+        model.add(tf.keras.layers.Dense(NUM_CLASSES, activation="softmax"))
         return model
 
     return builder
@@ -194,7 +237,6 @@ def build_resnet(blocks, width):
     def builder(input_shape):
         inputs = tf.keras.Input(shape=input_shape)
         x = tf.keras.layers.Flatten()(inputs)
-        # Initial projection to width
         x = tf.keras.layers.Dense(width, activation="relu")(x)
 
         for _ in range(blocks):
@@ -204,7 +246,7 @@ def build_resnet(blocks, width):
             x = tf.keras.layers.Add()([x, residual])
             x = tf.keras.layers.ReLU()(x)
 
-        outputs = tf.keras.layers.Dense(3, activation="softmax")(x)
+        outputs = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax")(x)
         return tf.keras.Model(inputs=inputs, outputs=outputs)
 
     return builder
@@ -228,8 +270,8 @@ def parse_args():
         epilog="""\
 examples:
   python run_benchmark.py                        # random weights (fast, default)
-  python run_benchmark.py --train                # train 30 epochs then compile
-  python run_benchmark.py --train --epochs 50    # train 50 epochs
+  python run_benchmark.py --train                # train on temperature data
+  python run_benchmark.py --train --epochs 80    # train 80 epochs
   python run_benchmark.py --infer                # train + show inference demo
   python run_benchmark.py --infer --verbose 1    # train with progress bars
 """,
@@ -237,18 +279,18 @@ examples:
     parser.add_argument(
         "--train",
         action="store_true",
-        help="Train models on synthetic data before conversion (default: random weights)",
+        help="Train models on temperature data before conversion (default: random weights)",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=30,
-        help="Number of training epochs when --train is set (default: 30)",
+        default=80,
+        help="Number of training epochs when --train is set (default: 80)",
     )
     parser.add_argument(
         "--infer",
         action="store_true",
-        help="Run inference demo on sample inputs after each model (implies --train)",
+        help="Run inference demo on sample temperatures after each model (implies --train)",
     )
     parser.add_argument(
         "--verbose",
@@ -281,8 +323,6 @@ def main():
     for d in [keras_dir, onnx_dir, st_dir, results_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    input_shape = (20, 1)
-
     suite = [
         # --- MLPs (deployable <=64KB) ---
         ("MLP1", "MLP", "2 layers, 8/8", build_mlp([8, 8])),
@@ -314,7 +354,9 @@ def main():
     ]
 
     if args.train:
-        print(f"Mode: TRAINED models ({args.epochs} epochs on synthetic data)")
+        print(f"Mode: TRAINED on temperature data ({args.epochs} epochs)")
+        print(f"  Normalization: [{TEMP_MIN}, {TEMP_MAX}] -> [0, 1]")
+        print(f"  Classes: {LABEL_NAMES}")
     else:
         print("Mode: RANDOM weights (compiler correctness only)")
     print()
@@ -336,9 +378,9 @@ def main():
 
     for name, kind, desc, builder in suite:
         # 1. Build Model
-        model = builder(input_shape)
+        model = builder(INPUT_SHAPE)
 
-        # 2. Get the ground-truth parameter count directly from Keras
+        # 2. Parameter count
         param_count = model.count_params()
 
         # 3. Optionally train
@@ -346,19 +388,19 @@ def main():
         if args.train:
             print(f"[{name}] Training {args.epochs} epochs...", end=" ", flush=True)
             model, test_acc = train_model(
-                model, input_shape, epochs=args.epochs, verbose=args.verbose
+                model, epochs=args.epochs, verbose=args.verbose
             )
             print(f"acc={test_acc:.4f}")
 
             if args.infer:
-                run_inference_demo(model, input_shape)
+                run_inference_demo(model)
 
         # 4. Save and Convert
         keras_path = keras_dir / f"{name}.keras"
         model.save(keras_path, save_format="keras")
 
         onnx_path = onnx_dir / f"{name}.onnx"
-        spec = (tf.TensorSpec((None,) + input_shape, tf.float32, name="input"),)
+        spec = (tf.TensorSpec((None,) + INPUT_SHAPE, tf.float32, name="input"),)
         model_proto, _ = tf2onnx.convert.from_keras(
             model, input_signature=spec, opset=13, output_path=str(onnx_path)
         )

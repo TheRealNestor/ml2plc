@@ -9,6 +9,7 @@ dependencies = [
     "numpy==1.24.3",
     "matplotlib",
     "pytest",
+    "scikit-learn",
     "tensorflow==2.15.0",
     "tqdm",
     "pandas",
