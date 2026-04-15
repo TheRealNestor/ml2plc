@@ -24,7 +24,6 @@ from translation_validation.validation import (
 # Temperature data constants
 # =============================================================================
 
-WINDOW = 20
 NUM_CLASSES = 3
 LABEL_MAP = {"cold": 0, "normal": 1, "hot": 2}
 LABEL_NAMES = ["Cold", "Normal", "Hot"]
@@ -44,7 +43,7 @@ def normalize(t):
 
 
 def load_temperature_data():
-    """Load temperature_data.csv and build sliding-window dataset."""
+    """Load temperature_data.csv and build single-value dataset."""
     data_paths = [
         workspace_dir / "data" / "temperature_data.csv",
         workspace_dir / "examples" / "data" / "temperature_data.csv",
@@ -66,14 +65,8 @@ def load_temperature_data():
 
     temps_norm = normalize(temperatures)
 
-    X, y = [], []
-    for i in range(len(temps_norm) - WINDOW + 1):
-        window_labels = labels[i : i + WINDOW]
-        X.append(temps_norm[i : i + WINDOW])
-        y.append(window_labels[-1])
-
-    X = np.array(X, dtype=np.float32).reshape(-1, WINDOW, 1)
-    y = np.array(y, dtype=np.int32)
+    X = temps_norm.reshape(-1, 1, 1).astype(np.float32)
+    y = labels
     return X, y
 
 
@@ -141,7 +134,7 @@ def run_inference_demo(model):
 
     print("    Inference demo:")
     for temp in test_temps:
-        inp = np.full((1, WINDOW, 1), normalize(temp), dtype=np.float32)
+        inp = np.array([[[normalize(temp)]]], dtype=np.float32)
         pred = model.predict(inp, verbose=0)[0]
         winner = LABEL_NAMES[np.argmax(pred)]
         probs = "  ".join(f"{c}: {p:.3f}" for c, p in zip(LABEL_NAMES, pred))
@@ -152,7 +145,7 @@ def run_inference_demo(model):
 # Model builders
 # =============================================================================
 
-INPUT_SHAPE = (WINDOW, 1)
+INPUT_SHAPE = (1, 1)
 
 
 def build_mlp(units_list):
@@ -217,12 +210,13 @@ def build_cnn(filters, layers=1):
     def builder(input_shape):
         model = tf.keras.Sequential()
         model.add(tf.keras.layers.InputLayer(input_shape=input_shape))
+        # Reshape (1, 1) -> (1, 1, 1) for Conv2D
         model.add(tf.keras.layers.Reshape((input_shape[0], 1, 1)))
 
         for _ in range(layers):
             model.add(
                 tf.keras.layers.Conv2D(
-                    filters, kernel_size=(3, 1), activation="relu", padding="same"
+                    filters, kernel_size=(1, 1), activation="relu", padding="same"
                 )
             )
         model.add(tf.keras.layers.Flatten())
