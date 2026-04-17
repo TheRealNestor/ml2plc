@@ -88,7 +88,17 @@ def generate_input_output_vars(network: NetworkIR) -> STCode:
         need_array_for_indexing = True
     # If the first layer type is a conv/reshape/flatten/pool that will index into
     # the input tensor, prefer array semantics
-    if isinstance(first_layer, (Conv2DLayer, FlattenLayer, ReshapeLayer, Pool2DLayer, UnsqueezeLayer, SqueezeLayer)):
+    if isinstance(
+        first_layer,
+        (
+            Conv2DLayer,
+            FlattenLayer,
+            ReshapeLayer,
+            Pool2DLayer,
+            UnsqueezeLayer,
+            SqueezeLayer,
+        ),
+    ):
         need_array_for_indexing = True
 
     if actual_input_size == 1 and not need_array_for_indexing:
@@ -652,6 +662,7 @@ def translate_ir_to_st(
     def _collapse_unused_arrays(s: str) -> str:
         # Find all ARRAY[0..0] declarations like 'name : ARRAY[0..0] OF TYPE;'
         pattern = re.compile(r"^(\s*)(\w+)\s*:\s*ARRAY\[0\.\.0\]\s+OF\s+(\w+);", re.M)
+
         def repl(match):
             indent, name, typ = match.groups()
             # If the variable is indexed elsewhere (name[) keep array form
@@ -682,11 +693,13 @@ def translate_model_to_st(
 
     def _collapse_unused_arrays(s: str) -> str:
         pattern = re.compile(r"^(\s*)(\w+)\s*:\s*ARRAY\[0\.\.0\]\s+OF\s+(\w+);", re.M)
+
         def repl(match):
             indent, name, typ = match.groups()
             if re.search(rf"\b{re.escape(name)}\s*\[", s):
                 return match.group(0)
             return f"{indent}{name} : {typ};"
+
         return pattern.sub(repl, s)
 
     code_str = _collapse_unused_arrays(code_str)

@@ -431,7 +431,9 @@ def main():
         if batch_size is None:
             spec = (tf.TensorSpec((None,) + INPUT_SHAPE, tf.float32, name="input"),)
         else:
-            spec = (tf.TensorSpec((batch_size,) + INPUT_SHAPE, tf.float32, name="input"),)
+            spec = (
+                tf.TensorSpec((batch_size,) + INPUT_SHAPE, tf.float32, name="input"),
+            )
 
         model_proto, _ = tf2onnx.convert.from_keras(
             model, input_signature=spec, opset=13, output_path=None
@@ -485,10 +487,14 @@ def main():
                 if batch_size is not None:
                     is_single_sample_validation = batch_size == 1
                     if is_single_sample_validation:
-                        print(f"Info: explicit export batch_size={batch_size} -> running per-sample validation")
+                        print(
+                            f"Info: explicit export batch_size={batch_size} -> running per-sample validation"
+                        )
                 elif batch_dim_value == 1:
                     is_single_sample_validation = True
-                    print("Info: detected exported ONNX batch dimension == 1 -> running per-sample validation")
+                    print(
+                        "Info: detected exported ONNX batch dimension == 1 -> running per-sample validation"
+                    )
                 if is_single_sample_validation:
                     max_err = 0.0
                     passed = True
@@ -502,8 +508,12 @@ def main():
                     status = "OK" if passed else "Validation Failed"
                 else:
                     val_res = validate_translation(st_path, onnx_path, test_inputs)
-                    max_err = val_res.get("max_abs_err", val_res.get("max_abs_diff", 0.0))
-                    status = "OK" if val_res.get("passed", True) else "Validation Failed"
+                    max_err = val_res.get(
+                        "max_abs_err", val_res.get("max_abs_diff", 0.0)
+                    )
+                    status = (
+                        "OK" if val_res.get("passed", True) else "Validation Failed"
+                    )
             except Exception as ve:
                 max_err = None
                 status = "Validation Error"
