@@ -11,6 +11,7 @@ from ..utils.activation_helpers import (
     generate_activation_inline,
     generate_activation_loop,
 )
+from ..variable import Variable
 from ..utils.constant_helpers import is_uniform_array
 
 
@@ -32,13 +33,15 @@ def get_layer_type_name(layer: LinearLayer, activation: ActivationType) -> str:
 
 
 def generate_weight_access(
-    layer: LinearLayer, input_var: str, layer_id: int, output_size: int
+    layer: LinearLayer, input_var: Variable, layer_id: int, output_size: int
 ) -> str:
     """Generate weight multiplication expression."""
-    weight_expr = f"weights_{layer_id}[i * {output_size} + j]"
+    weight_var = Variable(
+        name=f"weights_{layer_id}", shape=(layer.output_size * layer.input_size,)
+    )
 
     if not layer.is_quantized():
-        return f"{input_var}[i] * {weight_expr}"
+        return f"{input_var.at('i')} * {weight_var.at(f'i * {output_size} + j')}"
 
     cast_func = numpy_to_plc_cast_func(layer.weights.dtype, "REAL")
 
@@ -54,7 +57,7 @@ def generate_weight_access(
         else f"weight_zero_point_{layer_id}[j]"
     )
 
-    return f"{input_var}[i] * ({scale_expr} * {cast_func}({weight_expr} - {zp_expr}))"
+    return f"{input_var.at('i')} * ({scale_expr} * {cast_func}({weight_var.at(f'i * {output_size} + j')} - {zp_expr}))"
 
 
 def build_final_linear_layer_expression(layer: LinearLayer, has_bias: bool) -> str:
@@ -67,7 +70,8 @@ def build_final_linear_layer_expression(layer: LinearLayer, has_bias: bool) -> s
         expr = f"{alpha} * {expr}"
 
     if has_bias:
-        bias_term = f"bias_{layer.layer_id}[j]"
+        bias_var = Variable(name=f"bias_{layer.layer_id}", shape=(layer.output_size,))
+        bias_term = f"{bias_var.at('j')}"
         if beta != 1.0:
             bias_term = f"{beta} * {bias_term}"
         expr = f"{expr} + {bias_term}"
@@ -76,7 +80,7 @@ def build_final_linear_layer_expression(layer: LinearLayer, has_bias: bool) -> s
 
 
 def generate_linear_layer_code(
-    layer: LinearLayer, input_var: str, output_var: str
+    layer: LinearLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate code for linear layer types (MatMul, Gemm, Fused variants)."""
     builder = STCodeBuilder()
@@ -102,7 +106,7 @@ def generate_linear_layer_code(
         final_expr = build_final_linear_layer_expression(layer, layer.bias is not None)
         activated_expr = generate_activation_inline(activation, final_expr)
 
-        builder.add_line(f"{output_var}[j] := {activated_expr};")
+    builder.add_line(f"{output_var.at('j')} := {activated_expr};")
 
     builder.add_line("END_FOR;")
 

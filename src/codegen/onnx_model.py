@@ -7,8 +7,25 @@ import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
 from pathlib import Path
 import logging
+import copy
+import json
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# Import shape validation helpers so we can attempt automated resolution when
+# ONNX shape inference leaves symbolic dimensions.
+# NOTE: imports that would cause a circular dependency with
+# `src.codegen.onnx_to_ir` are performed lazily inside `load_model()` to
+# avoid ImportError during package import time.
+
+# Testing hook: tests can monkeypatch `validate_model_shapes` on this
+# module to force specific behavior. It will be assigned at runtime when
+# `load_model()` runs if not overridden by tests.
+validate_model_shapes = None
+# Expose a ShapeValidationError name for tests to import; the real class is
+# assigned at runtime when available from the validation module.
+ShapeValidationError = Exception
 
 
 class ONNXModel:
@@ -31,7 +48,7 @@ class ONNXModel:
         self.layers = []
         self.tensor_info = {}  # Maps tensor names to their types and shapes
 
-    def load_model(self) -> bool:
+    def load_model(self, allow_heuristics: bool = False) -> bool:
         """
         Load the ONNX model from file.
 
@@ -49,8 +66,128 @@ class ONNXModel:
 
             self.graph = self.model.graph
 
-            # Automatically build tensor info, extract weights, and analyze layers
             self._build_tensor_info()
+
+            # Note: do not fail here on partially-symbolic input shapes. Shape
+            # validation and resolution are performed later in the ONNX->IR
+            # normalization pass (normalize_model_for_ir). We log a warning so
+            # callers are aware that some shapes remain symbolic at load time.
+            input_info, _ = self.get_input_output_info()
+
+            # Allow a single symbolic 'batch' dimension (common pattern).
+            # Otherwise fail fast on unresolved/partially-symbolic input shapes
+            # to avoid silently emitting incorrect ARRAY sizes.
+            def _shape_has_illegal_symbolic(shape):
+                for d in shape:
+                    # integers >0 are fine
+                    if isinstance(d, int) and d > 0:
+                        continue
+                    # allow the special 'batch' symbolic token at the leading axis
+                    if isinstance(d, str) and d == "batch":
+                        continue
+                    # anything else (None or other symbolic names) is illegal
+                    return True
+                return False
+
+            shapes = input_info.get("shapes", [])
+            if any(_shape_has_illegal_symbolic(shape) for shape in shapes):
+                # Try to resolve dynamic dimensions using the model-level
+                # shape validation pipeline. This can fill common patterns
+                # (e.g., treat batch dims as 1) and run shape inference where
+                # possible. If resolution fails, we still abort and log.
+                # Use a module-level override if tests have monkeypatched
+                # `validate_model_shapes`. Otherwise import it lazily and
+                # bind the real exception class so the except clause below
+                # can catch it.
+                global validate_model_shapes, ShapeValidationError
+                if validate_model_shapes is None:
+                    from .onnx_to_ir.shape.validation import (
+                        validate_model_shapes as _validate_model_shapes,
+                        ShapeValidationError as _ShapeValidationError,
+                    )
+
+                    validate_model_shapes = _validate_model_shapes
+                    ShapeValidationError = _ShapeValidationError
+
+                logger.info(
+                    "Found symbolic input shapes %s — attempting automatic resolution...",
+                    shapes,
+                )
+
+                try:
+                    ok, model_copy, changes, diagnostics = validate_model_shapes(
+                        self.model
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Shape validation raised an exception: %s",
+                        e,
+                    )
+                    ok = False
+                    model_copy = None
+                    changes = []
+                    diagnostics = [str(e)]
+
+                if ok:
+                    if model_copy is not None:
+                        # Adopt the copy produced by validation and refresh
+                        self.model = model_copy
+                        self.refresh_after_model_mutation()
+                    # Rebuild tensor info after potential shape fixes
+                    self._build_tensor_info()
+                else:
+                    logger.warning(
+                        "ONNX model has unresolved/partially-symbolic input shapes: %s. "
+                        "Diagnostics: %s",
+                        shapes,
+                        diagnostics,
+                    )
+
+                    if not allow_heuristics:
+                        logger.error(
+                            "Shape validation failed; aborting load_model(). "
+                            "Run ONNX shape inference or provide concrete input shapes.",
+                        )
+                        return False
+
+                    # Try heuristics on a deep copy so the original ModelProto
+                    # remains unchanged in memory/disk. Record any changes in a
+                    # provenance sidecar JSON next to the model file.
+                    model_copy = copy.deepcopy(self.model)
+                    # Import heuristics lazily to avoid module-level cycles.
+                    from .onnx_model_heuristics import (
+                        heuristically_resolve_symbolic_inputs,
+                    )
+
+                    changes = heuristically_resolve_symbolic_inputs(model_copy)
+                    if not changes:
+                        logger.error(
+                            "Heuristic resolution did not change any dims; aborting load_model()."
+                        )
+                        return False
+
+                    # Heuristics made changes — adopt the copy and record
+                    # provenance.
+                    self.model = model_copy
+                    self.refresh_after_model_mutation()
+
+                    try:
+                        sidecar_path = self.model_path.with_name(
+                            f"{self.model_path.stem}{self.model_path.suffix}.heuristics.json"
+                        )
+                        provenance = {
+                            "model": str(self.model_path.name),
+                            "heuristic": "single_symbolic_axis_to_1",
+                            "changes": changes,
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                        }
+                        with open(sidecar_path, "w", encoding="utf-8") as fh:
+                            json.dump(provenance, fh, indent=2)
+                        logger.info(f"Wrote heuristic provenance to: {sidecar_path}")
+                    except Exception as exc:
+                        logger.warning(f"Failed to write heuristic provenance: {exc}")
+
+            # Automatically extract weights and analyze layers.
             self.extract_weights()
             self.analyze_layers()
 
@@ -279,13 +416,20 @@ class ONNXModel:
                 )
                 input_dtypes.append(dtype)
 
-        # Calculate input size (for first input)
-        input_size = 1
+        # Calculate input size (for first input).
+        # Only compute a non-zero size if all dimensions are statically known
+        # (concrete positive integers). This avoids silently treating a mixed
+        # symbolic/static shape like ['unk', 1, 1] as size=1 which changes
+        # semantics and can lead to ARRAY[0..0] emission downstream.
+        input_size = 0
         if input_shapes:
             first_shape = input_shapes[0]
-            static_dims = [d for d in first_shape if isinstance(d, int) and d > 0]
-            if static_dims:
-                input_size = int(np.prod(static_dims))
+            if all(isinstance(d, int) and d > 0 for d in first_shape):
+                input_size = int(np.prod(first_shape))
+            else:
+                # Ambiguous/partially-symbolic shape: leave size as 0 to signal
+                # that the model input size is unresolved/unknown.
+                input_size = 0
 
         input_info = {
             "names": input_names,
@@ -317,13 +461,14 @@ class ONNXModel:
             )
             output_dtypes.append(dtype)
 
-        # Calculate output size (for first output)
-        output_size = 1
+        # Calculate output size (for first output). See note above for inputs.
+        output_size = 0
         if output_shapes:
             first_shape = output_shapes[0]
-            static_dims = [d for d in first_shape if isinstance(d, int) and d > 0]
-            if static_dims:
-                output_size = int(np.prod(static_dims))
+            if all(isinstance(d, int) and d > 0 for d in first_shape):
+                output_size = int(np.prod(first_shape))
+            else:
+                output_size = 0
 
         output_info = {
             "names": output_names,

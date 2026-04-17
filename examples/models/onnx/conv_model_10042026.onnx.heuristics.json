@@ -1,0 +1,13 @@
+{
+  "model": "conv_model_10042026.onnx",
+  "heuristic": "single_symbolic_axis_to_1",
+  "changes": [
+    {
+      "input": "temperature_input",
+      "axis": 0,
+      "old": "unk__41",
+      "new": 1
+    }
+  ],
+  "timestamp": "2026-04-17T15:57:21.051759Z"
+}

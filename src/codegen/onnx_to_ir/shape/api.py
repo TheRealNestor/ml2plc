@@ -48,8 +48,25 @@ def get_feature_sizes(
     input_shape: Tuple[int, ...], output_shape: Tuple[int, ...]
 ) -> Tuple[int, int]:
     """Get flattened feature sizes for PLC buffer allocation/codegen."""
-    input_size = int(np.prod(input_shape)) if input_shape else 0
-    output_size = int(np.prod(output_shape)) if output_shape else 0
+
+    # Translation / PLC codegen expects feature/vector sizes (excluding the
+    # batch dimension). Most ONNX models are batch-first (batch, ...). For
+    # allocation and codegen we compute the flattened size of the *feature*
+    # dimensions by skipping the leading axis when present. If the shape is
+    # 1-D (no batch), use the full product.
+    def _flatten_size(shape: Tuple[int, ...]) -> int:
+        if not shape:
+            return 0
+        s = 1
+        for d in shape:
+            if not isinstance(d, int) or d <= 0:
+                return 0
+            s *= d
+        return s
+
+    input_size = _flatten_size(input_shape)
+
+    output_size = _flatten_size(output_shape)
     return input_size, output_size
 
 

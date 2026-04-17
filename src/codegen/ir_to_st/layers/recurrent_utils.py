@@ -7,6 +7,7 @@ and state management across different recurrent architectures.
 
 import logging
 from ..st_code import STCode, STCodeBuilder
+from ..variable import Variable
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +32,11 @@ def apply_activation(builder: STCodeBuilder, var_name: str, activation: str) -> 
 def emit_gate_computation(
     builder: STCodeBuilder,
     gate_name: str,
-    gate_var: str,
+    gate_var: Variable,
     layer_id: int,
     hidden_size: int,
     input_size: int,
-    input_var: str,
+    input_var: Variable,
     timestep_var: str,
     weights_suffix: str,
     recurrent_suffix: str,
@@ -73,9 +74,12 @@ def emit_gate_computation(
         # Input contribution
         builder.add_line(f"FOR i := 0 TO {input_size - 1} DO")
         with builder.indent():
+            weights_var = Variable(
+                name=f"weights_{layer_id}_{weights_suffix}",
+                shape=(hidden_size * input_size,),
+            )
             builder.add_line(
-                f"sum := sum + {input_var}[{timestep_var} * {input_size} + i] "
-                f"* weights_{layer_id}_{weights_suffix}[j * {input_size} + i];"
+                f"sum := sum + {input_var.at(f'{timestep_var} * {input_size} + i')} * {weights_var.at(f'j * {input_size} + i')} ;"
             )
         builder.add_line("END_FOR;")
 
@@ -83,15 +87,20 @@ def emit_gate_computation(
         if has_recurrent:
             builder.add_line(f"FOR i := 0 TO {hidden_size - 1} DO")
             with builder.indent():
+                recurrent_var = Variable(
+                    name=f"recurrent_{layer_id}_{recurrent_suffix}",
+                    shape=(hidden_size * hidden_size,),
+                )
+                h_state_var = Variable(name=f"h_state_{layer_id}", shape=(hidden_size,))
                 builder.add_line(
-                    f"sum := sum + h_state_{layer_id}[i] "
-                    f"* recurrent_{layer_id}_{recurrent_suffix}[j * {hidden_size} + i];"
+                    f"sum := sum + {h_state_var.at('i')} * {recurrent_var.at(f'j * {hidden_size} + i')} ;"
                 )
             builder.add_line("END_FOR;")
 
         # Bias and activation
-        builder.add_line(f"sum := sum + bias_{layer_id}_{bias_suffix}[j];")
-        apply_activation(builder, f"{gate_var}[j]", activation)
+    bias_var = Variable(name=f"bias_{layer_id}_{bias_suffix}", shape=(hidden_size,))
+    builder.add_line(f"sum := sum + {bias_var.at('j')};")
+    apply_activation(builder, str(gate_var.at("j")), activation)
 
     builder.add_line("END_FOR;")
 
@@ -121,7 +130,7 @@ def initialize_hidden_states(
 
 def write_output(
     builder: STCodeBuilder,
-    output_var: str,
+    output_var: Variable,
     state_var: str,
     layer_id: int,
     hidden_size: int,
@@ -153,8 +162,7 @@ def write_output(
         builder.add_line(f"FOR j := 0 TO {hidden_size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[{timestep_var} * {hidden_size} + j] := "
-                f"{state_var}_{layer_id}[j];"
+                f"{output_var.at(f'{timestep_var} * {hidden_size} + j')} := {state_var}_{layer_id}[j];"
             )
         builder.add_line("END_FOR;")
 
@@ -165,7 +173,7 @@ def write_output(
         with builder.indent():
             builder.add_line(f"FOR j := 0 TO {hidden_size - 1} DO")
             with builder.indent():
-                builder.add_line(f"{output_var}[j] := {state_var}_{layer_id}[j];")
+                builder.add_line(f"{output_var.at('j')} := {state_var}_{layer_id}[j];")
             builder.add_line("END_FOR;")
         builder.add_line("END_IF;")
 

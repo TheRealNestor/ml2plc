@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 
-def analyze_model(model_path: str) -> ONNXModel:
+def analyze_model(model_path: str, allow_heuristics: bool = False) -> ONNXModel:
     """
     Load and validate ONNX model.
 
@@ -59,7 +59,9 @@ def analyze_model(model_path: str) -> ONNXModel:
     """
     logger.info(f"Stage 1: Analyzing ONNX model from {model_path}")
     analyzer = ONNXModel(model_path)
-    analyzer.load_model()
+    # Respect caller preference whether to enable opt-in heuristics. Heuristics
+    # operate on a deep copy and are opt-in to avoid silent model mutation.
+    analyzer.load_model(allow_heuristics=allow_heuristics)
     logger.info(f"  Loaded model with {len(analyzer.layers)} layers")
     return analyzer
 
@@ -219,6 +221,19 @@ def generate_st(
         with open(output_path, "w") as f:
             f.write(st_code)
 
+        # Also write a copy inside the workspace for easier inspection during tests
+        try:
+            workspace_copy = (
+                Path(__file__).resolve().parents[2] / "build" / "last_generated.st"
+            )
+            workspace_copy.parent.mkdir(parents=True, exist_ok=True)
+            with open(workspace_copy, "w") as wf:
+                wf.write(st_code)
+            logger.debug(f"  Also wrote a workspace copy of ST to {workspace_copy}")
+        except Exception:
+            # Non-fatal: best-effort copy for debugging
+            logger.debug("  Failed to write workspace copy of ST (non-fatal)")
+
     return st_code
 
 
@@ -232,6 +247,7 @@ def compile_onnx_to_st(
     optimize: bool = True,
     output_path: str = None,
     fb_name: Optional[str] = None,
+    allow_heuristics: bool = False,
 ) -> str:
     """
                 Complete compilation pipeline: ONNX → ModelIR → Optimized regions → ST code.
@@ -258,7 +274,7 @@ def compile_onnx_to_st(
     input_path = Path(model_path)
 
     # Stage 1: Analyze
-    analyzer = analyze_model(model_path)
+    analyzer = analyze_model(model_path, allow_heuristics=allow_heuristics)
 
     # Stage 2: Build IR (internally normalize → extract → schedule → regionize)
     model_ir = build_model_ir(analyzer)
@@ -346,6 +362,15 @@ def parse_args():
         "--version", action="version", version="ONNX to ST Compiler v0.1.0"
     )
 
+    parser.add_argument(
+        "--allow-heuristics",
+        action="store_true",
+        help=(
+            "Enable experimental, opt-in heuristics to resolve symbolic dims "
+            "(non-destructive; provenance written next to model)."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -379,6 +404,7 @@ def main():
             optimize=not args.no_optimize,
             output_path=str(output_path),
             fb_name=args.fb_name,
+            allow_heuristics=bool(getattr(args, "allow_heuristics", False)),
         )
 
         logger.info(f"Successfully compiled {input_path.name}")

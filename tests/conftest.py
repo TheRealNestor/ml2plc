@@ -29,10 +29,12 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
 
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+# Ensure the project root is on sys.path so imports like `import src.codegen...`
+# work during test collection. Adding the `src` directory itself would make
+# Python look for `src` under `.../src/src` which breaks imports.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 # ============================================================================

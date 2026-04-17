@@ -5,6 +5,7 @@ import pandas as pd
 import tensorflow as tf
 from pathlib import Path
 import tf2onnx
+import onnx
 import numpy as np
 
 
@@ -271,15 +272,10 @@ examples:
 """,
     )
     parser.add_argument(
-        "--train",
-        action="store_true",
-        help="Train models on temperature data before conversion (default: random weights)",
-    )
-    parser.add_argument(
         "--epochs",
         type=int,
-        default=80,
-        help="Number of training epochs when --train is set (default: 80)",
+        default=0,
+        help="Number of training epochs when provided (default: 0). Pass a positive value to enable training.",
     )
     parser.add_argument(
         "--infer",
@@ -293,6 +289,36 @@ examples:
         choices=[0, 1, 2],
         help="Training verbosity: 0=silent, 1=progress bar, 2=one line/epoch (default: 0)",
     )
+    parser.add_argument(
+        "--allow-heuristics",
+        action="store_true",
+        help=(
+            "Enable experimental, opt-in heuristics when compiling ONNX models to ST. "
+            "These heuristics are non-destructive and will write provenance next to the model."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=str(workspace_dir / "benchmarks" / "out" / "onnx"),
+        help="Directory to write generated ONNX files (default: benchmarks/out/onnx).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Export ONNX models with a fixed batch size N (e.g. --batch-size 1). "
+            "If omitted, exports use a dynamic batch dimension for throughput testing."
+        ),
+    )
+    parser.add_argument(
+        "--single-sample",
+        action="store_true",
+        help=(
+            "Alias for --batch-size 1 (export with fixed batch size 1). Kept for backward compatibility."
+        ),
+    )
+    # (No extra benchmark-specific flags; keep CLI surface small)
     return parser.parse_args()
 
 
@@ -304,17 +330,17 @@ examples:
 def main():
     args = parse_args()
 
-    # --infer implies --train
-    if args.infer:
-        args.train = True
+    # Decide whether to train: epochs>0 or --infer implies training behavior
+    do_train = (args.epochs > 0) or args.infer
 
     benchmarks_dir = workspace_dir / "benchmarks"
     keras_dir = benchmarks_dir / "python"
-    onnx_dir = benchmarks_dir / "onnx"
+    onnx_fixtures_dir = benchmarks_dir / "onnx"  # committed fixtures (read-only)
+    generated_onnx_dir = benchmarks_dir / "out" / "onnx"  # non-destructive output
     st_dir = benchmarks_dir / "st"
     results_dir = benchmarks_dir / "results"
 
-    for d in [keras_dir, onnx_dir, st_dir, results_dir]:
+    for d in [keras_dir, onnx_fixtures_dir, generated_onnx_dir, st_dir, results_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     suite = [
@@ -347,7 +373,7 @@ def main():
         ("ResNet3", "ResNet", "3 skip blocks, width 64", build_resnet(3, 64)),
     ]
 
-    if args.train:
+    if do_train:
         print(f"Mode: TRAINED on temperature data ({args.epochs} epochs)")
         print(f"  Normalization: [{TEMP_MIN}, {TEMP_MAX}] -> [0, 1]")
         print(f"  Classes: {LABEL_NAMES}")
@@ -360,7 +386,7 @@ def main():
     # Build header
     cols = ["Name", "Params"]
     widths = [15, 8]
-    if args.train:
+    if do_train:
         cols.append("Test Acc")
         widths.append(8)
     cols += ["ONNX (KB)", "ST (KB)", "Deployable", "Max Err", "Status"]
@@ -379,7 +405,7 @@ def main():
 
         # 3. Optionally train
         test_acc = None
-        if args.train:
+        if do_train:
             print(f"[{name}] Training {args.epochs} epochs...", end=" ", flush=True)
             model, test_acc = train_model(
                 model, epochs=args.epochs, verbose=args.verbose
@@ -393,12 +419,48 @@ def main():
         keras_path = keras_dir / f"{name}.keras"
         model.save(keras_path, save_format="keras")
 
-        onnx_path = onnx_dir / f"{name}.onnx"
-        spec = (tf.TensorSpec((None,) + INPUT_SHAPE, tf.float32, name="input"),)
+        # Write exported ONNX models to a generated output folder so we do
+        # not accidentally overwrite committed fixtures under benchmarks/onnx/.
+        onnx_path = generated_onnx_dir / f"{name}.onnx"
+
+        # Export: use explicit batch size if provided, otherwise dynamic batch.
+        batch_size = args.batch_size
+        if getattr(args, "single_sample", False):
+            batch_size = 1
+
+        if batch_size is None:
+            spec = (tf.TensorSpec((None,) + INPUT_SHAPE, tf.float32, name="input"),)
+        else:
+            spec = (tf.TensorSpec((batch_size,) + INPUT_SHAPE, tf.float32, name="input"),)
+
         model_proto, _ = tf2onnx.convert.from_keras(
-            model, input_signature=spec, opset=13, output_path=str(onnx_path)
+            model, input_signature=spec, opset=13, output_path=None
         )
+
+        # Run ONNX shape inference to propagate known shapes through the graph
+        # and produce a concrete ModelProto to save. This helps downstream
+        # validation and codegen avoid unresolved symbolic dims.
+        try:
+            inferred = onnx.shape_inference.infer_shapes(model_proto)
+            onnx.save(inferred, str(onnx_path))
+            model_proto = inferred
+        except Exception:
+            # If inference fails for any reason, fall back to saving the raw model
+            onnx.save(model_proto, str(onnx_path))
+
         onnx_size = get_file_size_kb(onnx_path)
+        # Inspect exported ONNX to detect if the batch dimension is concretely 1.
+        # This lets us automatically run per-sample validation when appropriate
+        # even if the user didn't explicitly pass --single-sample / --batch-size.
+        try:
+            onnx_model = onnx.load(str(onnx_path))
+            inp = onnx_model.graph.input[0]
+            first_dim = inp.type.tensor_type.shape.dim[0]
+            batch_dim_value = (
+                first_dim.dim_value if first_dim.HasField("dim_value") else None
+            )
+        except Exception:
+            batch_dim_value = None
 
         # 5. Compile to ST
         st_path = st_dir / f"{name}.st"
@@ -408,6 +470,7 @@ def main():
                 optimize=True,
                 output_path=str(st_path),
                 fb_name=f"{name}_FB",
+                allow_heuristics=bool(getattr(args, "allow_heuristics", False)),
             )
             st_size = get_file_size_kb(st_path)
 
@@ -415,9 +478,32 @@ def main():
             try:
                 flat_input_size = infer_input_size(onnx_path)
                 test_inputs = generate_test_inputs(100, flat_input_size)
-                val_res = validate_translation(st_path, onnx_path, test_inputs)
-                max_err = val_res.get("max_abs_err", val_res.get("max_abs_diff", 0.0))
-                status = "OK" if val_res.get("passed", True) else "Validation Failed"
+                # Decide whether to validate per-sample. Priority:
+                # 1) explicit --batch-size / --single-sample (batch_size variable)
+                # 2) auto-detect concrete batch==1 in exported ONNX
+                is_single_sample_validation = False
+                if batch_size is not None:
+                    is_single_sample_validation = batch_size == 1
+                    if is_single_sample_validation:
+                        print(f"Info: explicit export batch_size={batch_size} -> running per-sample validation")
+                elif batch_dim_value == 1:
+                    is_single_sample_validation = True
+                    print("Info: detected exported ONNX batch dimension == 1 -> running per-sample validation")
+                if is_single_sample_validation:
+                    max_err = 0.0
+                    passed = True
+                    for sample in test_inputs:
+                        # Ensure shape is (1, input_size) for the validator
+                        single = sample.reshape(1, -1)
+                        res = validate_translation(st_path, onnx_path, single)
+                        err = res.get("max_abs_err", res.get("max_abs_diff", 0.0))
+                        max_err = max(max_err, err)
+                        passed = passed and res.get("passed", True)
+                    status = "OK" if passed else "Validation Failed"
+                else:
+                    val_res = validate_translation(st_path, onnx_path, test_inputs)
+                    max_err = val_res.get("max_abs_err", val_res.get("max_abs_diff", 0.0))
+                    status = "OK" if val_res.get("passed", True) else "Validation Failed"
             except Exception as ve:
                 max_err = None
                 status = "Validation Error"
@@ -433,7 +519,7 @@ def main():
         # Build result row
         err_str = f"{max_err:<10.4e}" if max_err is not None else f"{0.0:<10.4e}"
         row_vals = [f"{name:<15}", f"{param_count:<8}"]
-        if args.train:
+        if do_train:
             row_vals.append(f"{test_acc:.4f}  " if test_acc is not None else "N/A     ")
         row_vals += [
             f"{onnx_size:<10.1f}",
@@ -455,7 +541,7 @@ def main():
             "Max Abs Error": max_err,
             "Status": status,
         }
-        if args.train:
+        if do_train:
             result_entry["Test Accuracy"] = (
                 round(test_acc, 4) if test_acc is not None else None
             )

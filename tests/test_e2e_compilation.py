@@ -169,7 +169,9 @@ def compile_and_validate_structural(
     try:
         # 1. Compile ONNX to ST
         st_path = tmp_dir / f"{test_name}_struct.st"
-        st_code = compile_onnx_to_st(str(onnx_path), output_path=str(st_path))
+        st_code = compile_onnx_to_st(
+            str(onnx_path), output_path=str(st_path), allow_heuristics=True
+        )
         assert st_code and st_path.exists(), "Compilation failed"
 
         # 2. Translate ST to Python
@@ -242,7 +244,9 @@ def compile_and_validate_functional(
         st_path = tmp_dir / f"{test_name}_struct.st"
         if not st_path.exists():
             st_path = tmp_dir / f"{test_name}_func.st"
-            st_code = compile_onnx_to_st(str(onnx_path), output_path=str(st_path))
+            st_code = compile_onnx_to_st(
+                str(onnx_path), output_path=str(st_path), allow_heuristics=True
+            )
             assert st_code and st_path.exists(), "Compilation failed"
 
         # Translate ST to Python
@@ -592,7 +596,9 @@ class TestCompilationQuality:
     def test_generated_st_has_valid_syntax(self, any_model, tmp_output_dir):
         """Test generated ST has valid syntax structure."""
         st_path = tmp_output_dir / "syntax_test.st"
-        st_code = compile_onnx_to_st(str(any_model), output_path=str(st_path))
+        st_code = compile_onnx_to_st(
+            str(any_model), output_path=str(st_path), allow_heuristics=True
+        )
 
         # Check basic structure
         assert "FUNCTION_BLOCK" in st_code
@@ -607,7 +613,7 @@ class TestCompilationQuality:
 
     def test_generated_st_has_comments(self, any_model, tmp_output_dir):
         """Test generated ST includes helpful comments."""
-        st_code = compile_onnx_to_st(str(any_model))
+        st_code = compile_onnx_to_st(str(any_model), allow_heuristics=True)
 
         assert "(* " in st_code, "No comments found"
         comment_count = st_code.count("(*")
@@ -616,7 +622,9 @@ class TestCompilationQuality:
     def test_generated_st_output_file_matches_code(self, any_model, tmp_output_dir):
         """Test file output matches returned code."""
         st_path = tmp_output_dir / "file_test.st"
-        st_code = compile_onnx_to_st(str(any_model), output_path=str(st_path))
+        st_code = compile_onnx_to_st(
+            str(any_model), output_path=str(st_path), allow_heuristics=True
+        )
 
         with open(st_path) as f:
             file_content = f.read()

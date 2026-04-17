@@ -12,6 +12,7 @@ This module acts as the bridge between high-level network IR and layer-specific 
 from typing import Dict, Optional, List
 from ..types import BaseLayer, NetworkIR
 from .st_code import STCode
+from .variable import Variable
 
 
 def get_layer_input_vars(
@@ -84,8 +85,23 @@ def generate_forward_pass(
     for layer_name in network.execution_order:
         layer = network.layers[layer_name]
 
-        input_vars = get_layer_input_vars(layer, network, buffer_allocations)
-        output_var = get_layer_output_var(layer, network, buffer_allocations)
+        # Resolve input and output variable names (strings) and convert them
+        # into Variable objects so generators may call .at() / .declare_st().
+        input_var_names = get_layer_input_vars(layer, network, buffer_allocations)
+        output_var_name = get_layer_output_var(layer, network, buffer_allocations)
+
+        # Determine shapes from layer metadata if available, otherwise default to scalar.
+        # For layers with multiple inputs the layer.input_shape may refer to the primary
+        # input; fall back to scalar for unknown shapes.
+        def mk_var(name: str, shape_hint: Optional[tuple[int, ...]] = None) -> Variable:
+            shape = tuple(shape_hint) if shape_hint else (1,)
+            return Variable(name=name, shape=shape)
+
+        # Map input names -> Variable objects. If layer.input_shape is present use it.
+        input_vars = [mk_var(n, layer.input_shape) for n in input_var_names]
+
+        output_var = mk_var(output_var_name, layer.output_shape)
+
         layer_code = registry.generate(layer, input_vars, output_var)
         code += layer_code
         code += STCode.blank_line()

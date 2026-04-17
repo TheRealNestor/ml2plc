@@ -13,6 +13,7 @@ and region-specific lowering to lowerers.py.
 from typing import Dict, Optional, Tuple
 import logging
 
+from .variable import Variable
 from ..types import *
 from ..ir_optimizer import OptimizationResult
 from .st_code import STCode, STCodeBuilder, st_comment
@@ -73,20 +74,53 @@ def generate_input_output_vars(network: NetworkIR) -> STCode:
             break
 
     input_type = plc_type_from_onnx_dtype(first_layer.input_type)
-    code += STCode.from_lines(
-        "VAR_INPUT",
-        f"    input_data : ARRAY[0..{actual_input_size - 1}] OF {input_type};",
-        "END_VAR",
-        "",
-    )
+    # Decide whether to declare input_data as a scalar or an ARRAY.
+    # Default: prefer scalar when actual_input_size == 1 to avoid emitting
+    # ARRAY[0..0]. However, if the model's first layer or input shape
+    # indicates multi-dimensional access (e.g., Conv2D, Flatten, Reshape,
+    # or an input_shape with multiple axes), the generated forward-pass will
+    # index into input_data even when the product of dims == 1. In that
+    # case we must declare an ARRAY (possibly of length 1) to preserve
+    # correct index semantics and avoid runtime "index into scalar" errors.
+    need_array_for_indexing = False
+    # If input_shape has more than one axis, prefer array even if total size == 1
+    if first_layer.input_shape is not None and len(first_layer.input_shape) > 1:
+        need_array_for_indexing = True
+    # If the first layer type is a conv/reshape/flatten/pool that will index into
+    # the input tensor, prefer array semantics
+    if isinstance(first_layer, (Conv2DLayer, FlattenLayer, ReshapeLayer, Pool2DLayer, UnsqueezeLayer, SqueezeLayer)):
+        need_array_for_indexing = True
+
+    if actual_input_size == 1 and not need_array_for_indexing:
+        code += STCode.from_lines(
+            "VAR_INPUT",
+            f"    input_data : {input_type};",
+            "END_VAR",
+            "",
+        )
+    else:
+        code += STCode.from_lines(
+            "VAR_INPUT",
+            f"    input_data : ARRAY[0..{actual_input_size - 1}] OF {input_type};",
+            "END_VAR",
+            "",
+        )
 
     output_type = plc_type_from_onnx_dtype(last_layer.output_type)
-    code += STCode.from_lines(
-        "VAR_OUTPUT",
-        f"    output_data : ARRAY[0..{last_layer.output_size - 1}] OF {output_type};",
-        "END_VAR",
-        "",
-    )
+    if last_layer.output_size == 1:
+        code += STCode.from_lines(
+            "VAR_OUTPUT",
+            f"    output_data : {output_type};",
+            "END_VAR",
+            "",
+        )
+    else:
+        code += STCode.from_lines(
+            "VAR_OUTPUT",
+            f"    output_data : ARRAY[0..{last_layer.output_size - 1}] OF {output_type};",
+            "END_VAR",
+            "",
+        )
 
     return code
 
@@ -250,6 +284,7 @@ def generate_var_section(
     # Buffer allocations or layer outputs
     if buffer_allocations:
         buffer_info = {}
+        logger.debug(f"Buffer allocations mapping: {buffer_allocations}")
         for tensor_name, buffer_name in buffer_allocations.items():
             producer_name = network.tensor_producers[tensor_name]
             layer = network.layers[producer_name]
@@ -264,8 +299,10 @@ def generate_var_section(
 
         builder.add_line("    (* Buffer allocation variables *)")
         with builder.indent():
+            logger.debug(f"Computed buffer_info (name -> (size, type)): {buffer_info}")
             for buffer_name, (size, dtype) in buffer_info.items():
-                builder.add_line(f"{buffer_name} : ARRAY[0..{size - 1}] OF {dtype};")
+                var = Variable(buffer_name, (size,), dtype)
+                builder.add_line(var.declare_st())
         builder.add_line("")
 
     else:
@@ -274,10 +311,11 @@ def generate_var_section(
             if any(network.is_network_output(out) for out in layer.outputs):
                 continue
             plc_type = plc_type_from_onnx_dtype(layer.output_type)
+            var = Variable(
+                f"layer_{layer.layer_id}_output", (layer.output_size,), plc_type
+            )
             with builder.indent():
-                builder.add_line(
-                    f"layer_{layer.layer_id}_output : ARRAY[0..{layer.output_size - 1}] OF {plc_type};"
-                )
+                builder.add_line(var.declare_st())
             builder.add_line("")
 
     # Temporary computation variables
@@ -331,13 +369,11 @@ def generate_var_section(
                     h_size = layer.hidden_size
                     builder.add_line(f"(* Layer {layer.layer_id} gate buffers *)")
                     for gate in ("i_gate", "f_gate", "g_gate", "o_gate"):
-                        builder.add_line(
-                            f"{gate}_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
-                        )
+                        var = Variable(f"{gate}_{layer.layer_id}", (h_size,), "REAL")
+                        builder.add_line(var.declare_st())
                     for state in ("h_state", "c_state"):
-                        builder.add_line(
-                            f"{state}_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
-                        )
+                        var = Variable(f"{state}_{layer.layer_id}", (h_size,), "REAL")
+                        builder.add_line(var.declare_st())
 
     # GRU variables
     has_gru = any(
@@ -354,13 +390,11 @@ def generate_var_section(
                     h_size = layer.hidden_size
                     builder.add_line(f"(* Layer {layer.layer_id} gate buffers *)")
                     for gate in ("r_gate", "u_gate"):
-                        builder.add_line(
-                            f"{gate}_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
-                        )
+                        var = Variable(f"{gate}_{layer.layer_id}", (h_size,), "REAL")
+                        builder.add_line(var.declare_st())
                     for state in ("h_state", "h_new"):
-                        builder.add_line(
-                            f"{state}_{layer.layer_id} : ARRAY[0..{h_size - 1}] OF REAL;"
-                        )
+                        var = Variable(f"{state}_{layer.layer_id}", (h_size,), "REAL")
+                        builder.add_line(var.declare_st())
 
     builder.add_line("")
     builder.add_line("END_VAR")
@@ -378,6 +412,7 @@ def collect_all_variables_from_regions(
     for region_id, opt_result in optimization_results.items():
         network = opt_result.ir
         buffer_allocations = opt_result.buffer_allocations or {}
+        logger.debug(f"Region {region_id} buffer_allocations: {buffer_allocations}")
 
         # Buffer allocations
         for tensor_name, buffer_name in buffer_allocations.items():
@@ -461,7 +496,8 @@ def generate_merged_var_section(
         builder.add_line("    (* Merged variables from all regions *)")
         with builder.indent():
             for var_name, (size, dtype) in sorted(all_variables.items()):
-                builder.add_line(f"{var_name} : ARRAY[0..{size - 1}] OF {dtype};")
+                var = Variable(var_name, (size,), dtype)
+                builder.add_line(var.declare_st())
         builder.add_line("")
 
     # Temporary variables
@@ -490,7 +526,7 @@ def generate_merged_var_section(
         builder.add_line("iw : DINT;")
 
     transpose_vars_added = set()
-    for region_id, opt_result in optimization_results.items():
+    for region_id, opt_result in (optimization_results or {}).items():
         network = opt_result.ir
         for ln in network.execution_order:
             layer = network.layers[ln]
@@ -606,7 +642,28 @@ def translate_ir_to_st(
     """Translate NetworkIR to Structured Text code."""
     builder = STCodeBuilder()
     builder += generate_function_block(ir, fb_name, buffer_allocations)
-    return str(builder.build())
+    code_str = str(builder.build())
+    # Post-process: collapse ARRAY[0..0] declarations to scalar when the
+    # declared variable is never indexed anywhere in the code. This keeps
+    # generated ST tidy (avoids ARRAY[0..0]) while preserving correct
+    # indexing semantics when generators do use element access.
+    import re
+
+    def _collapse_unused_arrays(s: str) -> str:
+        # Find all ARRAY[0..0] declarations like 'name : ARRAY[0..0] OF TYPE;'
+        pattern = re.compile(r"^(\s*)(\w+)\s*:\s*ARRAY\[0\.\.0\]\s+OF\s+(\w+);", re.M)
+        def repl(match):
+            indent, name, typ = match.groups()
+            # If the variable is indexed elsewhere (name[) keep array form
+            if re.search(rf"\b{re.escape(name)}\s*\[", s):
+                return match.group(0)
+            # Otherwise collapse to scalar declaration
+            return f"{indent}{name} : {typ};"
+
+        return pattern.sub(repl, s)
+
+    code_str = _collapse_unused_arrays(code_str)
+    return code_str
 
 
 def translate_model_to_st(
@@ -617,4 +674,20 @@ def translate_model_to_st(
     """Translate multi-region ModelIR to Structured Text code."""
     builder = STCodeBuilder()
     builder += generate_model_function_block(model, optimization_results, fb_name)
-    return str(builder.build())
+    code_str = str(builder.build())
+
+    # Same post-processing as single-network translation: collapse unused
+    # ARRAY[0..0] declarations to scalars when safe.
+    import re
+
+    def _collapse_unused_arrays(s: str) -> str:
+        pattern = re.compile(r"^(\s*)(\w+)\s*:\s*ARRAY\[0\.\.0\]\s+OF\s+(\w+);", re.M)
+        def repl(match):
+            indent, name, typ = match.groups()
+            if re.search(rf"\b{re.escape(name)}\s*\[", s):
+                return match.group(0)
+            return f"{indent}{name} : {typ};"
+        return pattern.sub(repl, s)
+
+    code_str = _collapse_unused_arrays(code_str)
+    return code_str

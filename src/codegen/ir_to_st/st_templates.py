@@ -46,11 +46,24 @@ def st_var_declaration(
         STCode with declaration
     """
     if dimensions is not None:
+        # Prefer scalar declaration when the flattened dimension is 1 to
+        # avoid emitting ARRAY[0..0] which is semantically ambiguous.
         if isinstance(dimensions, int):
-            decl = f"{name} : ARRAY[0..{dimensions-1}] OF {var_type}"
+            if dimensions == 1:
+                decl = f"{name} : {var_type}"
+            else:
+                decl = f"{name} : ARRAY[0..{dimensions-1}] OF {var_type}"
         else:
-            array_dims = ", ".join(f"0..{d-1}" for d in dimensions)
-            decl = f"{name} : ARRAY[{array_dims}] OF {var_type}"
+            # For multi-dimensional arrays, if all dimensions multiply to 1
+            # prefer a scalar declaration; otherwise emit an ARRAY with dims.
+            prod_dims = 1
+            for d in dimensions:
+                prod_dims *= d
+            if prod_dims == 1:
+                decl = f"{name} : {var_type}"
+            else:
+                array_dims = ", ".join(f"0..{d-1}" for d in dimensions)
+                decl = f"{name} : ARRAY[{array_dims}] OF {var_type}"
     else:
         decl = f"{name} : {var_type}"
 
@@ -76,6 +89,13 @@ def st_array_constant(
         STCode with constant declaration
     """
     flat_values = values.flatten()
+
+    # If the array contains exactly one element, emit a scalar constant to
+    # avoid ARRAY[0..0] emission.
+    if flat_values.size == 1:
+        single = float(flat_values.flat[0])
+        return STCode.from_lines(f"{name} : {plc_type} := {single};")
+
     if is_integer:
         value_strs = [str(int(v)) for v in flat_values]
     else:

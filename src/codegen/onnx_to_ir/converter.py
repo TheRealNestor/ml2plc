@@ -41,10 +41,20 @@ def _normalize_working_layers_and_constants(
         (working_layers, constant_values, folded_outputs)
     """
     # Run shape validation BEFORE any layer extraction to fail fast if model
-    # has unresolvable dynamic dimensions (e.g., dynamic batch size)
-    resolution_report = validate_model_shapes(analyzer.model)
-    if resolution_report.modified:
+    # has unresolvable dynamic dimensions (e.g., dynamic batch size).
+    ok, model_copy, changes, diagnostics = validate_model_shapes(analyzer.model)
+    if model_copy is not None:
+        analyzer.model = model_copy
         analyzer.refresh_after_model_mutation()
+    if not ok:
+        # Surface diagnostics as a ShapeValidationError to preserve existing
+        # control flow for callers.
+        raise ShapeValidationError(
+            tensor_name="<unknown>",
+            issue="; ".join(diagnostics or ["validation failed"]),
+            shape=(),
+            suggestions=diagnostics,
+        )
 
     # Constant-folding pre-pass
     constant_values, folded_outputs = run_constant_folding(analyzer)

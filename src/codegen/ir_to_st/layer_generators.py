@@ -91,7 +91,7 @@ class LayerCodeGeneratorRegistry:
         self,
         layer: BaseLayer,
         input_vars: list,
-        output_var: str,
+        output_var,
     ) -> STCode:
         """Generate code for a layer using its registered generator."""
         layer_type = type(layer)

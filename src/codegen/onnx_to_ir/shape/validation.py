@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+import copy
 
 import logging
 import onnx
@@ -56,46 +57,85 @@ class ShapeResolutionReport:
     modified: bool
 
 
-def validate_model_shapes(model: onnx.ModelProto) -> ShapeResolutionReport:
-    """Validate and resolve dynamic dimensions before ONNX->IR extraction."""
-    _run_onnx_shape_inference_inplace(model)
+def validate_model_shapes(
+    model: onnx.ModelProto,
+) -> Tuple[bool, Optional[onnx.ModelProto], List[Dict[str, Any]], List[str]]:
+    """Validate and attempt to resolve dynamic dimensions.
 
-    dynamic_tensors = _find_dynamic_tensors(model)
+    This function is non-destructive: it operates on a deep copy of `model`
+    and returns a tuple:
+
+        (ok, model_copy_or_none, changes, diagnostics)
+
+    - ok: True if shapes are fully resolved after inference and canonicalizers
+          (or no dynamic dims were present).
+    - model_copy_or_none: None if no changes were necessary; otherwise a
+          ModelProto with the applied changes.
+    - changes: list of change records (plain dicts) describing edits applied.
+    - diagnostics: list of human-readable messages explaining failures.
+
+    The function preserves the original ModelProto.
+    """
+    model_copy = copy.deepcopy(model)
+    diagnostics: List[str] = []
+    changes: List[Dict[str, Any]] = []
+
+    _run_onnx_shape_inference_inplace(model_copy)
+
+    dynamic_tensors = _find_dynamic_tensors(model_copy)
     initial_dynamic_tensor_count = len(dynamic_tensors)
 
     if not dynamic_tensors:
         logger.info("✓ All tensor shapes are concrete (no dynamic dims found)")
-        return ShapeResolutionReport(0, 0, False)
+        return True, None, [], ["All shapes concrete"]
 
-    static_hint_resolutions = _resolve_dims_from_provided_shapes(model, dynamic_tensors)
-    modified_dims = _apply_resolved_dimensions(model, static_hint_resolutions)
+    # Try resolutions using available strategies and collect changes.
+    static_hint_resolutions = _resolve_dims_from_provided_shapes(
+        model_copy, dynamic_tensors
+    )
+    modified_count, c = _apply_resolved_dimensions(
+        model_copy, static_hint_resolutions, reason="static_hints"
+    )
+    changes.extend(c)
 
-    dynamic_tensors = _find_dynamic_tensors(model)
+    dynamic_tensors = _find_dynamic_tensors(model_copy)
     batch_resolutions = _resolve_dynamic_batch_dims(dynamic_tensors)
-    modified_dims += _apply_resolved_dimensions(model, batch_resolutions)
+    mc, c2 = _apply_resolved_dimensions(
+        model_copy, batch_resolutions, reason="batch_resolution"
+    )
+    modified_count += mc
+    changes.extend(c2)
 
-    dynamic_tensors = _find_dynamic_tensors(model)
-    recurrent_resolutions = _resolve_recurrent_state_dims(model, dynamic_tensors)
-    modified_dims += _apply_resolved_dimensions(model, recurrent_resolutions)
+    dynamic_tensors = _find_dynamic_tensors(model_copy)
+    recurrent_resolutions = _resolve_recurrent_state_dims(model_copy, dynamic_tensors)
+    mc3, c3 = _apply_resolved_dimensions(
+        model_copy, recurrent_resolutions, reason="recurrent_resolution"
+    )
+    modified_count += mc3
+    changes.extend(c3)
 
-    if modified_dims > 0:
-        _run_onnx_shape_inference_inplace(model)
+    if modified_count > 0:
+        _run_onnx_shape_inference_inplace(model_copy)
 
-    remaining_dynamic = _find_dynamic_tensors(model)
+    remaining_dynamic = _find_dynamic_tensors(model_copy)
     if not remaining_dynamic:
         logger.info(
-            f"✓ Resolved {modified_dims} dynamic dimension(s) "
+            f"✓ Resolved {modified_count} dynamic dimension(s) "
             f"(provided shapes + inferred batch size = 1)"
         )
-        return ShapeResolutionReport(
-            dynamic_tensors_found=initial_dynamic_tensor_count,
-            resolved_dimensions=modified_dims,
-            modified=modified_dims > 0,
+        return (
+            True,
+            (model_copy if changes else None),
+            changes,
+            [f"Resolved {modified_count} dims"],
         )
 
+    # Still unresolved - prepare diagnostics explaining what remains.
     first_tensor = list(remaining_dynamic.keys())[0]
     first_shape = remaining_dynamic[first_tensor]
-    dyn_pos = [i for i, d in enumerate(first_shape) if d == 0]
+    dyn_pos = [
+        i for i, d in enumerate(first_shape) if not (isinstance(d, int) and d > 0)
+    ]
 
     suggestions = [
         "Fix model to use concrete dimension:\n"
@@ -109,12 +149,10 @@ def validate_model_shapes(model: onnx.ModelProto) -> ShapeResolutionReport:
         "    onnxsim model.onnx out.onnx --input-shape 'input:1,20,1'",
     ]
 
-    raise ShapeValidationError(
-        tensor_name=first_tensor,
-        issue=f"Unresolvable dynamic dimension at position {dyn_pos[0]}: {first_shape}",
-        shape=first_shape,
-        suggestions=suggestions,
-    )
+    diag_msg = f"Unresolvable dynamic dimension at position {dyn_pos[0]} for tensor '{first_tensor}': {first_shape}"
+    diagnostics.append(diag_msg)
+    diagnostics.extend(suggestions)
+    return False, None, changes, diagnostics
 
 
 def _run_onnx_shape_inference_inplace(model: onnx.ModelProto) -> None:
@@ -150,7 +188,12 @@ def _resolve_dims_from_provided_shapes(
     for tensor_name, shape in dynamic_tensors.items():
         axis_map = known_by_tensor_and_axis.get(tensor_name, {})
         for idx, dim in enumerate(shape):
-            if dim == 0 and idx in axis_map and axis_map[idx] > 0:
+            # Treat non-positive ints or symbolic names as unresolved
+            if (
+                not (isinstance(dim, int) and dim > 0)
+                and idx in axis_map
+                and axis_map[idx] > 0
+            ):
                 resolved.setdefault(tensor_name, {})[idx] = axis_map[idx]
 
     return resolved
@@ -161,7 +204,10 @@ def _resolve_dynamic_batch_dims(
 ) -> Dict[str, Dict[int, int]]:
     resolved: Dict[str, Dict[int, int]] = {}
     for tensor_name, shape in dynamic_tensors.items():
-        if len(shape) > 0 and shape[0] == 0:
+        # Only auto-resolve leading batch dims if the symbolic token is the
+        # canonical 'batch' identifier. Do not blindly resolve unknown symbols
+        # like 'unk__N' to avoid silently changing model semantics.
+        if len(shape) > 0 and shape[0] == "batch":
             resolved.setdefault(tensor_name, {})[0] = 1
     return resolved
 
@@ -199,7 +245,9 @@ def _resolve_recurrent_state_dims(
     resolved: Dict[str, Dict[int, int]] = {}
 
     for tensor_name, shape in dynamic_tensors.items():
-        zero_axes = [i for i, dim in enumerate(shape) if dim == 0]
+        zero_axes = [
+            i for i, dim in enumerate(shape) if not (isinstance(dim, int) and dim > 0)
+        ]
         if not zero_axes:
             continue
 
@@ -215,7 +263,7 @@ def _resolve_recurrent_state_dims(
 
         hidden_size = next(iter(hidden_sizes))
         hidden_axis: Optional[int] = None
-        if len(shape) > 0 and shape[-1] == 0:
+        if len(shape) > 0 and not (isinstance(shape[-1], int) and shape[-1] > 0):
             hidden_axis = len(shape) - 1
 
         tensor_resolution = resolved.setdefault(tensor_name, {})
@@ -279,11 +327,18 @@ def _find_reachable_recurrent_hidden_sizes(
 def _apply_resolved_dimensions(
     model: onnx.ModelProto,
     resolutions: Dict[str, Dict[int, int]],
-) -> int:
+    *,
+    reason: str = "rule",
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Apply resolved dimensions to `model` and return (count, changes).
+
+    Each change is a dict: {"tensor": <name>, "axis": <idx>, "old": <old>, "new": <target>, "reason": <str>}.
+    """
     if not resolutions:
-        return 0
+        return 0, []
 
     modifications = 0
+    changes: List[Dict[str, Any]] = []
     for value in _iter_tensor_value_infos(model):
         tensor_resolutions = resolutions.get(value.name)
         if not tensor_resolutions:
@@ -295,12 +350,30 @@ def _apply_resolved_dimensions(
                 continue
 
             dim = dims[axis]
-            if dim.dim_value != target or dim.dim_param:
+            # Determine old representation
+            old_val: Optional[Any]
+            if getattr(dim, "dim_value", 0) > 0:
+                old_val = int(dim.dim_value)
+            else:
+                old_val = getattr(dim, "dim_param", None) or None
+
+            if getattr(dim, "dim_value", 0) != target or getattr(
+                dim, "dim_param", None
+            ):
                 dim.ClearField("dim_param")
                 dim.dim_value = target
                 modifications += 1
+                changes.append(
+                    {
+                        "tensor": value.name,
+                        "axis": int(axis),
+                        "old": old_val,
+                        "new": int(target),
+                        "reason": reason,
+                    }
+                )
 
-    return modifications
+    return modifications, changes
 
 
 def _find_dynamic_tensors(model: onnx.ModelProto) -> Dict[str, Tuple[int, ...]]:
@@ -308,27 +381,42 @@ def _find_dynamic_tensors(model: onnx.ModelProto) -> Dict[str, Tuple[int, ...]]:
 
     for inp in model.graph.input:
         shape = tuple(
-            dim.dim_value if dim.dim_value > 0 else 0
+            (
+                dim.dim_value
+                if dim.dim_value > 0
+                else (str(dim.dim_param) if dim.dim_param else 0)
+            )
             for dim in inp.type.tensor_type.shape.dim
         )
-        if 0 in shape:
+        if any(not (isinstance(d, int) and d > 0) for d in shape):
             dynamic_tensors[inp.name] = shape
 
     for output in model.graph.output:
         shape = tuple(
-            dim.dim_value if dim.dim_value > 0 else 0
+            (
+                dim.dim_value
+                if dim.dim_value > 0
+                else (str(dim.dim_param) if dim.dim_param else 0)
+            )
             for dim in output.type.tensor_type.shape.dim
         )
-        if 0 in shape:
+        if any(not (isinstance(d, int) and d > 0) for d in shape):
             dynamic_tensors[output.name] = shape
 
     initializer_names = {init.name for init in model.graph.initializer}
     for vi in model.graph.value_info:
         shape = tuple(
-            dim.dim_value if dim.dim_value > 0 else 0
+            (
+                dim.dim_value
+                if dim.dim_value > 0
+                else (str(dim.dim_param) if dim.dim_param else 0)
+            )
             for dim in vi.type.tensor_type.shape.dim
         )
-        if 0 in shape and vi.name not in initializer_names:
+        if (
+            any(not (isinstance(d, int) and d > 0) for d in shape)
+            and vi.name not in initializer_names
+        ):
             dynamic_tensors[vi.name] = shape
 
     return dynamic_tensors

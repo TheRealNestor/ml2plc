@@ -11,3 +11,6 @@ __pycache__/
 tmp/*
 tmp
 .vscode
+
+# Generated benchmark outputs
+/benchmarks/out/

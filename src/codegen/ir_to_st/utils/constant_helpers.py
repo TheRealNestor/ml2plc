@@ -45,6 +45,12 @@ def generate_array_constant(
             f"(* WARNING: {name} has 0 elements — likely indicates a bug *)"
         )
 
+    # Emit scalar constant when the flattened array has exactly one element to
+    # avoid ARRAY[0..0] emission.
+    if flat_values.size == 1:
+        val = float(flat_values.flat[0])
+        return STCode.from_lines(f"{name} : {plc_type} := {val};")
+
     if is_integer:
         value_str = ", ".join(str(int(val)) for val in flat_values)
     else:

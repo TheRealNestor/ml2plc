@@ -48,18 +48,25 @@ from ..utils.copy_helpers import (
     generate_modulo_broadcast,
     generate_selective_copy,
 )
+from ..variable import Variable
 from ..utils.activation_helpers import generate_activation_loop
 
 logger = logging.getLogger(__name__)
 
 
 def generate_activation_layer_code(
-    layer: ActivationLayer, input_var: str, output_var: str
+    layer: ActivationLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate activation layer code."""
     code = STCode.from_lines(
         f"(* Layer {layer.layer_id}: Activation ({layer.activation.name}) *)"
     )
+    # Accept either Variable or raw names
+    from ..variable import ensure_var
+
+    input_var = ensure_var(input_var, layer.input_shape)
+    output_var = ensure_var(output_var, layer.output_shape)
+
     code += generate_activation_loop(
         layer.activation, input_var, output_var, layer.output_size
     )
@@ -67,18 +74,19 @@ def generate_activation_layer_code(
 
 
 def generate_add_code(
-    layer: AddLayer, input_vars: List[str], output_var: str
+    layer: AddLayer, input_vars: List[Variable], output_var: Variable
 ) -> STCode:
     """Generate Add layer code (bias addition or element-wise)."""
     builder = STCodeBuilder()
 
     if layer.bias is not None:
         # Bias addition: output = input + bias
+        bias_var = Variable(name=f"bias_{layer.layer_id}", shape=(layer.output_size,))
         builder.add_line(f"(* Layer {layer.layer_id}: Add (Bias) *)")
         builder.add_line(f"FOR i := 0 TO {layer.output_size-1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[i] := {input_vars[0]}[i] + bias_{layer.layer_id}[i];"
+                f"{output_var.at('i')} := {input_vars[0].at('i')} + {bias_var.at('i')};"
             )
         builder.add_line("END_FOR;")
     else:
@@ -92,7 +100,7 @@ def generate_add_code(
         builder.add_line(f"FOR i := 0 TO {layer.output_size-1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[i] := {input_vars[0]}[i] + {input_vars[1]}[i];"
+                f"{output_var.at('i')} := {input_vars[0].at('i')} + {input_vars[1].at('i')};"
             )
         builder.add_line("END_FOR;")
 
@@ -100,22 +108,20 @@ def generate_add_code(
 
 
 def generate_reshape_code(
-    layer: ReshapeLayer, input_var: str, output_var: str
+    layer: ReshapeLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate Reshape layer code."""
     if layer.input_size != layer.output_size:
         raise NotImplementedError("Reshape with different sizes not implemented.")
-
     return generate_simple_copy(
         input_var,
         output_var,
-        layer.output_size,
         f"Layer {layer.layer_id}: Reshape (copy input to output)",
     )
 
 
 def generate_quantize_linear_code(
-    layer: QuantizeLinearLayer, input_var: str, output_var: str
+    layer: QuantizeLinearLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate QuantizeLinear code: quantized = clip(round(input/scale) + zero_point)."""
     builder = STCodeBuilder()
@@ -135,17 +141,22 @@ def generate_quantize_linear_code(
         builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[i] := LIMIT({min_val}, "
-                f"{cast_func}(ROUND({input_var}[i] / {scale_val}) + {zero_point_val}), "
+                f"{output_var.at('i')} := LIMIT({min_val}, "
+                f"{cast_func}(ROUND({input_var.at('i')} / {scale_val}) + {zero_point_val}), "
                 f"{max_val});"
             )
         builder.add_line("END_FOR;")
     else:
+        scale_var = Variable(name=f"scale_{layer.layer_id}", shape=(layer.output_size,))
+        zero_point_var = Variable(
+            name=f"zero_point_{layer.layer_id}", shape=(layer.output_size,)
+        )
+
         builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[i] := LIMIT({min_val}, "
-                f"{cast_func}(ROUND({input_var}[i] / scale_{layer.layer_id}[i]) + zero_point_{layer.layer_id}[i]), "
+                f"{output_var.at('i')} := LIMIT({min_val}, "
+                f"{cast_func}(ROUND({input_var.at('i')} / {scale_var.at('i')}) + {zero_point_var.at('i')}), "
                 f"{max_val});"
             )
         builder.add_line("END_FOR;")
@@ -154,7 +165,7 @@ def generate_quantize_linear_code(
 
 
 def generate_dequantize_linear_code(
-    layer: DequantizeLinearLayer, input_var: str, output_var: str
+    layer: DequantizeLinearLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate DequantizeLinear code: float = scale * (quantized - zero_point)."""
     builder = STCodeBuilder()
@@ -173,16 +184,21 @@ def generate_dequantize_linear_code(
         builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[i] := {scale_val} * "
-                f"{cast_func}({input_var}[i] - {zero_point_val});"
+                f"{output_var.at('i')} := {scale_val} * "
+                f"{cast_func}({input_var.at('i')} - {zero_point_val});"
             )
         builder.add_line("END_FOR;")
     else:
+        scale_var = Variable(name=f"scale_{layer.layer_id}", shape=(layer.output_size,))
+        zero_point_var = Variable(
+            name=f"zero_point_{layer.layer_id}", shape=(layer.output_size,)
+        )
+
         builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[i] := scale_{layer.layer_id}[i] * "
-                f"{cast_func}({input_var}[i] - zero_point_{layer.layer_id}[i]);"
+                f"{output_var.at('i')} := {scale_var.at('i')} * "
+                f"{cast_func}({input_var.at('i')} - {zero_point_var.at('i')});"
             )
         builder.add_line("END_FOR;")
 
@@ -190,34 +206,40 @@ def generate_dequantize_linear_code(
 
 
 def generate_dropout_code(
-    layer: DropoutLayer, input_var: str, output_var: str
+    layer: DropoutLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate Dropout layer code (identity at inference time)."""
-    pass
+    # Dropout is a no-op at inference time (identity copy)
+    return generate_simple_copy(
+        input_var,
+        output_var,
+        f"Layer {layer.layer_id}: Dropout (identity at inference time)",
+    )
 
 
 def generate_flatten_code(
-    layer: FlattenLayer, input_var: str, output_var: str
+    layer: FlattenLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate Flatten layer code (identity copy)."""
     return generate_simple_copy(
         input_var,
         output_var,
-        layer.output_size,
         f"Layer {layer.layer_id}: Flatten (axis={layer.axis})",
     )
 
 
 def generate_squeeze_code(
-    layer: SqueezeLayer, input_var: str, output_var: str
+    layer: SqueezeLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate Squeeze layer code (identity copy)."""
     return generate_simple_copy(
-        input_var, output_var, layer.output_size, f"Layer {layer.layer_id}: Squeeze"
+        input_var, output_var, f"Layer {layer.layer_id}: Squeeze"
     )
 
 
-def generate_cast_code(layer: CastLayer, input_var: str, output_var: str) -> STCode:
+def generate_cast_code(
+    layer: CastLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate Cast layer code."""
     input_plc = (
         plc_type_from_onnx_dtype(layer.input_type) if layer.input_type else "REAL"
@@ -230,7 +252,6 @@ def generate_cast_code(layer: CastLayer, input_var: str, output_var: str) -> STC
         return generate_simple_copy(
             input_var,
             output_var,
-            layer.output_size,
             f"Layer {layer.layer_id}: Cast (no-op, same type {input_plc})",
         )
 
@@ -240,12 +261,14 @@ def generate_cast_code(layer: CastLayer, input_var: str, output_var: str) -> STC
     cast_func = f"{output_plc}_TO_{input_plc}"
     builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
-        builder.add_line(f"{output_var}[i] := {cast_func}({input_var}[i]);")
+        builder.add_line(f"{output_var.at('i')} := {cast_func}({input_var.at('i')});")
     builder.add_line("END_FOR;")
     return builder.build()
 
 
-def generate_slice_code(layer: SliceLayer, input_var: str, output_var: str) -> STCode:
+def generate_slice_code(
+    layer: SliceLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate Slice layer code."""
     comment = (
         f"Layer {layer.layer_id}: Slice starts={layer.starts} "
@@ -275,9 +298,7 @@ def generate_slice_code(layer: SliceLayer, input_var: str, output_var: str) -> S
         logger.debug(
             f"  Slice: simple offset copy with start={start}, axis={axis}, stride={stride if layer.input_shape else 'N/A'}, offset={offset}"
         )
-        return generate_offset_copy(
-            input_var, output_var, layer.output_size, offset, comment
-        )
+        return generate_offset_copy(input_var, output_var, offset, comment)
 
     elif len(layer.axes) == 1 and layer.steps[0] != 1:
         # Strided copy
@@ -285,9 +306,7 @@ def generate_slice_code(layer: SliceLayer, input_var: str, output_var: str) -> S
         step = layer.steps[0]
 
         logger.debug(f"  Slice: strided copy with start={start}, step={step}")
-        return generate_strided_copy(
-            input_var, output_var, layer.output_size, step, start, comment
-        )
+        return generate_strided_copy(input_var, output_var, step, start, comment)
 
     else:
         # Multi-axis slice — conservative copy
@@ -295,13 +314,12 @@ def generate_slice_code(layer: SliceLayer, input_var: str, output_var: str) -> S
         return generate_simple_copy(
             input_var,
             output_var,
-            layer.output_size,
             f"{comment} (multi-axis, conservative)",
         )
 
 
 def generate_concat_code(
-    layer: ConcatLayer, input_vars: List[str], output_var: str
+    layer: ConcatLayer, input_vars: List[Variable], output_var: Variable
 ) -> STCode:
     """Generate Concat layer code."""
     builder = STCodeBuilder()
@@ -311,13 +329,15 @@ def generate_concat_code(
 
     offset = 0
     for idx, (inp_var, inp_size) in enumerate(zip(input_vars, layer.input_sizes)):
-        builder.add_line(f"(* Concat part {idx}: {inp_var} [{inp_size} elems] *)")
+        builder.add_line(f"(* Concat part {idx}: {inp_var.name} [{inp_size} elems] *)")
         builder.add_line(f"FOR i := 0 TO {inp_size - 1} DO")
         with builder.indent():
             if offset == 0:
-                builder.add_line(f"{output_var}[i] := {inp_var}[i];")
+                builder.add_line(f"{output_var.at('i')} := {inp_var.at('i')};")
             else:
-                builder.add_line(f"{output_var}[i + {offset}] := {inp_var}[i];")
+                builder.add_line(
+                    f"{output_var.at(f'i + {offset}')} := {inp_var.at('i')};"
+                )
         builder.add_line("END_FOR;")
         offset += inp_size
 
@@ -325,7 +345,7 @@ def generate_concat_code(
 
 
 def generate_transpose_code(
-    layer: TransposeLayer, input_var: str, output_var: str
+    layer: TransposeLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate Transpose layer code with nested loops over output shape."""
     builder = STCodeBuilder()
@@ -340,7 +360,7 @@ def generate_transpose_code(
     )
 
     if ndim == 0 or layer.input_size <= 1:
-        builder.add_line(f"{output_var}[0] := {input_var}[0];")
+        builder.add_line(f"{output_var.at('0')} := {input_var.at('0')};")
         return builder.build()
 
     # Compute strides
@@ -383,7 +403,9 @@ def generate_transpose_code(
             in_idx_parts.append(f"{var} * {in_strides[k]}")
     in_idx = " + ".join(in_idx_parts)
 
-    builder.add_line(f"{inner_indent}{output_var}[{out_idx}] := {input_var}[{in_idx}];")
+    builder.add_line(
+        f"{inner_indent}{output_var.at(out_idx)} := {input_var.at(in_idx)};"
+    )
 
     # Close loops
     for d in range(ndim - 1, -1, -1):
@@ -394,7 +416,7 @@ def generate_transpose_code(
 
 
 def generate_unsqueeze_code(
-    layer: UnsqueezeLayer, input_var: str, output_var: str
+    layer: UnsqueezeLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate Unsqueeze layer code (identity copy)."""
     return generate_simple_copy(
@@ -405,7 +427,9 @@ def generate_unsqueeze_code(
     )
 
 
-def generate_expand_code(layer: ExpandLayer, input_var: str, output_var: str) -> STCode:
+def generate_expand_code(
+    layer: ExpandLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate Expand (broadcast) layer code."""
     if layer.input_size == layer.output_size:
         return generate_simple_copy(
@@ -434,7 +458,9 @@ def generate_expand_code(layer: ExpandLayer, input_var: str, output_var: str) ->
         )
 
 
-def generate_shape_code(layer: ShapeLayer, input_var: str, output_var: str) -> STCode:
+def generate_shape_code(
+    layer: ShapeLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate Shape layer code (should be constant-folded)."""
     builder = STCodeBuilder()
     builder.add_line(
@@ -446,7 +472,9 @@ def generate_shape_code(layer: ShapeLayer, input_var: str, output_var: str) -> S
     return builder.build()
 
 
-def generate_gather_code(layer: GatherLayer, input_var: str, output_var: str) -> STCode:
+def generate_gather_code(
+    layer: GatherLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate Gather layer code."""
     if layer.indices is not None and layer.indices.size <= 16:
         flat_indices = layer.indices.flatten().tolist()
@@ -467,7 +495,7 @@ def generate_gather_code(layer: GatherLayer, input_var: str, output_var: str) ->
 
 
 def generate_reduce_mean_code(
-    layer: ReduceMeanLayer, input_var: str, output_var: str
+    layer: ReduceMeanLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate ReduceMean code for arbitrary static-axis reductions."""
     if not layer.input_shape or not layer.output_shape:
@@ -523,7 +551,7 @@ def generate_reduce_mean_code(
 
     builder.add_line(f"FOR j := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
-        builder.add_line(f"{output_var}[j] := 0.0;")
+        builder.add_line(f"{output_var.at('j')} := 0.0;")
     builder.add_line("END_FOR;")
 
     builder.add_line(f"FOR i := 0 TO {layer.input_size - 1} DO")
@@ -536,13 +564,15 @@ def generate_reduce_mean_code(
             out_stride = int(out_strides[out_axis])
             builder.add_line(f"k := (i / {in_stride}) MOD {in_dim};")
             builder.add_line(f"j := j + k * {out_stride};")
-        builder.add_line(f"{output_var}[j] := {output_var}[j] + {input_var}[i];")
+        builder.add_line(
+            f"{output_var.at('j')} := {output_var.at('j')} + {input_var.at('i')};"
+        )
     builder.add_line("END_FOR;")
 
     builder.add_line(f"FOR j := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
         builder.add_line(
-            f"{output_var}[j] := {output_var}[j] / {float(reduction_factor)};"
+            f"{output_var.at('j')} := {output_var.at('j')} / {float(reduction_factor)};"
         )
     builder.add_line("END_FOR;")
 
@@ -550,7 +580,7 @@ def generate_reduce_mean_code(
 
 
 def generate_reduce_prod_code(
-    layer: ReduceProdLayer, input_var: str, output_var: str
+    layer: ReduceProdLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate ReduceProd code for arbitrary static-axis reductions."""
     if not layer.input_shape or not layer.output_shape:
@@ -606,7 +636,7 @@ def generate_reduce_prod_code(
 
     builder.add_line(f"FOR j := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
-        builder.add_line(f"{output_var}[j] := 1.0;")
+        builder.add_line(f"{output_var.at('j')} := 1.0;")
     builder.add_line("END_FOR;")
 
     builder.add_line(f"FOR i := 0 TO {layer.input_size - 1} DO")
@@ -619,14 +649,16 @@ def generate_reduce_prod_code(
             out_stride = int(out_strides[out_axis])
             builder.add_line(f"k := (i / {in_stride}) MOD {in_dim};")
             builder.add_line(f"j := j + k * {out_stride};")
-        builder.add_line(f"{output_var}[j] := {output_var}[j] * {input_var}[i];")
+        builder.add_line(
+            f"{output_var.at('j')} := {output_var.at('j')} * {input_var.at('i')};"
+        )
     builder.add_line("END_FOR;")
 
     return builder.build()
 
 
 def generate_runtime_matmul_code(
-    layer: RuntimeMatMulLayer, input_vars: List[str], output_var: str
+    layer: RuntimeMatMulLayer, input_vars: List[Variable], output_var: Variable
 ) -> STCode:
     """Generate runtime MatMul code for non-constant RHS tensors."""
     if len(input_vars) != 2:
@@ -634,7 +666,7 @@ def generate_runtime_matmul_code(
             f"Runtime MatMul layer {layer.layer_id}: expected 2 inputs, got {len(input_vars)}"
         )
 
-    lhs, rhs = input_vars
+    lhs_var, rhs_var = input_vars
     contract = validate_runtime_matmul_contract(
         tuple(layer.input_shape or ()),
         tuple(layer.rhs_shape or ()),
@@ -651,9 +683,9 @@ def generate_runtime_matmul_code(
         builder.add_line("sum := 0.0;")
         builder.add_line(f"FOR i := 0 TO {lhs_shape[0] - 1} DO")
         with builder.indent():
-            builder.add_line(f"sum := sum + {lhs}[i] * {rhs}[i];")
+            builder.add_line(f"sum := sum + {lhs_var.at('i')} * {rhs_var.at('i')};")
         builder.add_line("END_FOR;")
-        builder.add_line(f"{output_var}[0] := sum;")
+        builder.add_line(f"{output_var.at('0')} := sum;")
         return builder.build()
 
     # Matrix-matrix: (M,K) @ (K,N) -> (M,N)
@@ -667,10 +699,10 @@ def generate_runtime_matmul_code(
             builder.add_line(f"FOR i := 0 TO {k - 1} DO")
             with builder.indent():
                 builder.add_line(
-                    f"sum := sum + {lhs}[(j / {n}) * {k} + i] * {rhs}[i * {n} + (j MOD {n})];"
+                    f"sum := sum + {lhs_var.at(f'(j / {n}) * {k} + i')} * {rhs_var.at(f'i * {n} + (j MOD {n})')} ;"
                 )
             builder.add_line("END_FOR;")
-            builder.add_line(f"{output_var}[j] := sum;")
+            builder.add_line(f"{output_var.at('j')} := sum;")
         builder.add_line("END_FOR;")
         return builder.build()
 
@@ -683,9 +715,11 @@ def generate_runtime_matmul_code(
             builder.add_line("sum := 0.0;")
             builder.add_line(f"FOR i := 0 TO {k - 1} DO")
             with builder.indent():
-                builder.add_line(f"sum := sum + {lhs}[i] * {rhs}[i * {n} + j];")
+                builder.add_line(
+                    f"sum := sum + {lhs_var.at('i')} * {rhs_var.at(f'i * {n} + j')} ;"
+                )
             builder.add_line("END_FOR;")
-            builder.add_line(f"{output_var}[j] := sum;")
+            builder.add_line(f"{output_var.at('j')} := sum;")
         builder.add_line("END_FOR;")
         return builder.build()
 
@@ -698,9 +732,11 @@ def generate_runtime_matmul_code(
             builder.add_line("sum := 0.0;")
             builder.add_line(f"FOR i := 0 TO {k - 1} DO")
             with builder.indent():
-                builder.add_line(f"sum := sum + {lhs}[j * {k} + i] * {rhs}[i];")
+                builder.add_line(
+                    f"sum := sum + {lhs_var.at(f'j * {k} + i')} * {rhs_var.at('i')} ;"
+                )
             builder.add_line("END_FOR;")
-            builder.add_line(f"{output_var}[j] := sum;")
+            builder.add_line(f"{output_var.at('j')} := sum;")
         builder.add_line("END_FOR;")
         return builder.build()
 
@@ -730,11 +766,13 @@ def generate_runtime_matmul_code(
                 builder.add_line(f"FOR i := 0 TO {k - 1} DO")
                 with builder.indent():
                     builder.add_line(
-                        f"sum := sum + {lhs}[b * {lhs_batch_stride} + (j / {n}) * {k} + i] * "
-                        f"{rhs}[b * {rhs_batch_stride} + i * {n} + (j MOD {n})];"
+                        f"sum := sum + {lhs_var.at(f'b * {lhs_batch_stride} + (j / {n}) * {k} + i')} * "
+                        f"{rhs_var.at(f'b * {rhs_batch_stride} + i * {n} + (j MOD {n})')} ;"
                     )
                 builder.add_line("END_FOR;")
-                builder.add_line(f"{output_var}[b * {out_batch_stride} + j] := sum;")
+                builder.add_line(
+                    f"{output_var.at(f'b * {out_batch_stride} + j')} := sum;"
+                )
             builder.add_line("END_FOR;")
         builder.add_line("END_FOR;")
         return builder.build()
@@ -745,7 +783,9 @@ def generate_runtime_matmul_code(
     )
 
 
-def generate_einsum_code(layer: EinsumLayer, input_var: str, output_var: str) -> STCode:
+def generate_einsum_code(
+    layer: EinsumLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate Einsum code for equation ``abcd,cde->abe`` with constant RHS."""
     if layer.equation != "abcd,cde->abe":
         raise NotImplementedError(
@@ -766,6 +806,11 @@ def generate_einsum_code(layer: EinsumLayer, input_var: str, output_var: str) ->
     lhs_size = int(layer.input_size)
 
     builder = STCodeBuilder()
+    # Accept either Variable or raw names
+    from ..variable import ensure_var
+
+    input_var = ensure_var(input_var, layer.input_shape)
+    output_var = ensure_var(output_var, layer.output_shape)
     builder.add_line(
         f"(* Layer {layer.layer_id}: Einsum {layer.equation} {layer.input_shape} -> {layer.output_shape} *)"
     )
@@ -785,14 +830,18 @@ def generate_einsum_code(layer: EinsumLayer, input_var: str, output_var: str) ->
                         )
                         builder.add_line(f"IF tmp_idx < {lhs_size} THEN")
                         with builder.indent():
+                            einsum_rhs_var = Variable(
+                                name=f"einsum_rhs_{layer.layer_id}",
+                                shape=(c_dim * d_dim * e_dim,),
+                            )
                             builder.add_line(
-                                f"sum := sum + {input_var}[tmp_idx] * einsum_rhs_{layer.layer_id}[((l * {d_dim} + m) * {e_dim} + k)];"
+                                f"sum := sum + {input_var.at('tmp_idx')} * {einsum_rhs_var.at(f'((l * {d_dim} + m) * {e_dim} + k)')};"
                             )
                         builder.add_line("END_IF;")
                     builder.add_line("END_FOR;")
                 builder.add_line("END_FOR;")
                 builder.add_line(
-                    f"{output_var}[((i * {b_dim} + j) * {e_dim} + k)] := sum;"
+                    f"{output_var.at('((i * {b_dim} + j) * {e_dim} + k)')} := sum;"
                 )
             builder.add_line("END_FOR;")
         builder.add_line("END_FOR;")
@@ -801,7 +850,7 @@ def generate_einsum_code(layer: EinsumLayer, input_var: str, output_var: str) ->
 
 
 def generate_binary_elementwise_code(
-    layer: BinaryElementwiseLayer, input_vars: List[str], output_var: str
+    layer: BinaryElementwiseLayer, input_vars: List[Variable], output_var: Variable
 ) -> STCode:
     """Generate binary elementwise code for Sub/Mul/Max with optional const RHS."""
     op = layer.operation
@@ -818,24 +867,24 @@ def generate_binary_elementwise_code(
         if rhs_size <= 0:
             raise ValueError(f"{op} layer {layer.layer_id}: empty RHS constant")
 
-        rhs_expr = (
-            f"rhs_const_{layer.layer_id}[i]"
-            if rhs_size == layer.output_size
-            else f"rhs_const_{layer.layer_id}[i MOD {rhs_size}]"
-        )
-        lhs_expr = f"{input_vars[0]}[i]"
+        rhs_var = Variable(name=f"rhs_const_{layer.layer_id}", shape=(rhs_size,))
+        if rhs_size == layer.output_size:
+            rhs_expr = rhs_var.at("i")
+        else:
+            rhs_expr = rhs_var.at(f"i MOD {rhs_size}")
+
+        lhs_expr = input_vars[0].at("i")
     else:
         if len(input_vars) != 2:
             raise ValueError(
                 f"{op} layer {layer.layer_id}: expected 2 runtime inputs, got {len(input_vars)}"
             )
-        lhs_expr = f"{input_vars[0]}[i]"
+        lhs_expr = input_vars[0].at("i")
         rhs_runtime_size = layer.rhs_runtime_size or layer.output_size
-        rhs_expr = (
-            f"{input_vars[1]}[i]"
-            if rhs_runtime_size == layer.output_size
-            else f"{input_vars[1]}[i MOD {rhs_runtime_size}]"
-        )
+        if rhs_runtime_size == layer.output_size:
+            rhs_expr = input_vars[1].at("i")
+        else:
+            rhs_expr = input_vars[1].at(f"i MOD {rhs_runtime_size}")
 
     if op == "Sub":
         expr = f"{lhs_expr} - {rhs_expr}"
@@ -846,13 +895,13 @@ def generate_binary_elementwise_code(
 
     builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
-        builder.add_line(f"{output_var}[i] := {expr};")
+        builder.add_line(f"{output_var.at('i')} := {expr};")
     builder.add_line("END_FOR;")
     return builder.build()
 
 
 def generate_unary_elementwise_code(
-    layer: UnaryElementwiseLayer, input_var: str, output_var: str
+    layer: UnaryElementwiseLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate unary elementwise code for Sqrt/Reciprocal/Neg."""
     op = layer.operation
@@ -866,10 +915,10 @@ def generate_unary_elementwise_code(
     builder.add_line(f"FOR i := 0 TO {layer.output_size - 1} DO")
     with builder.indent():
         if op == "Sqrt":
-            builder.add_line(f"{output_var}[i] := SQRT({input_var}[i]);")
+            builder.add_line(f"{output_var.at('i')} := SQRT({input_var.at('i')});")
         elif op == "Reciprocal":
-            builder.add_line(f"{output_var}[i] := 1.0 / {input_var}[i];")
+            builder.add_line(f"{output_var.at('i')} := 1.0 / {input_var.at('i')};")
         else:
-            builder.add_line(f"{output_var}[i] := -{input_var}[i];")
+            builder.add_line(f"{output_var.at('i')} := -{input_var.at('i')};")
     builder.add_line("END_FOR;")
     return builder.build()

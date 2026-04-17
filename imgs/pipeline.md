@@ -37,7 +37,7 @@ flowchart LR
             Order --> Regionize --> Optimize
         end
 
-        subgraph CodegenStage ["Code Generation"]
+        subgraph CodegenStage ["Code Generation"] 
             Optimize --> Lower
         end
     end

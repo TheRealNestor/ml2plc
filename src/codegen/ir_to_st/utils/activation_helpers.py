@@ -7,6 +7,7 @@ supporting both inline (within matmul) and separate loop implementations.
 
 from typing import Optional
 from ..st_code import STCode, STCodeBuilder
+from ..variable import Variable
 from ...types import ActivationType
 
 
@@ -50,8 +51,8 @@ def generate_activation_inline(
 
 def generate_activation_loop(
     activation: ActivationType,
-    input_var: str,
-    output_var: str,
+    input_var: Variable,
+    output_var: Variable,
     size: int,
 ) -> STCode:
     """
@@ -78,6 +79,12 @@ def generate_activation_loop(
     """
     builder = STCodeBuilder()
 
+    # Accept either Variable or raw name string for backward compatibility
+    from ..variable import ensure_var
+
+    input_var = ensure_var(input_var, (size,))
+    output_var = ensure_var(output_var, (size,))
+
     if activation == ActivationType.NONE:
         # No-op activation
         return STCode.empty()
@@ -85,33 +92,35 @@ def generate_activation_loop(
     elif activation == ActivationType.RELU:
         builder.add_line(f"FOR i := 0 TO {size - 1} DO")
         with builder.indent():
-            builder.add_line(f"{output_var}[i] := MAX({input_var}[i], 0.0);")
+            builder.add_line(f"{output_var.at('i')} := MAX({input_var.at('i')}, 0.0);")
         builder.add_line("END_FOR;")
 
     elif activation == ActivationType.SIGMOID:
         builder.add_line(f"FOR i := 0 TO {size - 1} DO")
         with builder.indent():
-            builder.add_line(f"{output_var}[i] := 1.0 / (1.0 + EXP(-{input_var}[i]));")
+            builder.add_line(
+                f"{output_var.at('i')} := 1.0 / (1.0 + EXP(-{input_var.at('i')}));"
+            )
         builder.add_line("END_FOR;")
 
     elif activation == ActivationType.TANH:
         builder.add_line(f"FOR i := 0 TO {size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[i] := (EXP({input_var}[i]) - EXP(-{input_var}[i])) / "
-                f"(EXP({input_var}[i]) + EXP(-{input_var}[i]));"
+                f"{output_var.at('i')} := (EXP({input_var.at('i')}) - EXP(-{input_var.at('i')})) / "
+                f"(EXP({input_var.at('i')}) + EXP(-{input_var.at('i')}));"
             )
         builder.add_line("END_FOR;")
 
     elif activation == ActivationType.SOFTMAX:
         # Softmax requires 3 passes: find max, compute exp sum, normalize
         builder.add_line(f"(* Softmax: find max *)")
-        builder.add_line(f"max_val := {input_var}[0];")
+        builder.add_line(f"max_val := {input_var.at('0')};")
         builder.add_line(f"FOR i := 1 TO {size - 1} DO")
         with builder.indent():
-            builder.add_line(f"IF {input_var}[i] > max_val THEN")
+            builder.add_line(f"IF {input_var.at('i')} > max_val THEN")
             with builder.indent():
-                builder.add_line(f"max_val := {input_var}[i];")
+                builder.add_line(f"max_val := {input_var.at('i')};")
             builder.add_line("END_IF;")
         builder.add_line("END_FOR;")
         builder.add_line("")
@@ -120,15 +129,17 @@ def generate_activation_loop(
         builder.add_line("exp_sum := 0.0;")
         builder.add_line(f"FOR i := 0 TO {size - 1} DO")
         with builder.indent():
-            builder.add_line(f"{output_var}[i] := EXP({input_var}[i] - max_val);")
-            builder.add_line(f"exp_sum := exp_sum + {output_var}[i];")
+            builder.add_line(
+                f"{output_var.at('i')} := EXP({input_var.at('i')} - max_val);"
+            )
+            builder.add_line(f"exp_sum := exp_sum + {output_var.at('i')};")
         builder.add_line("END_FOR;")
         builder.add_line("")
 
         builder.add_line(f"(* Softmax: normalize *)")
         builder.add_line(f"FOR i := 0 TO {size - 1} DO")
         with builder.indent():
-            builder.add_line(f"{output_var}[i] := {output_var}[i] / exp_sum;")
+            builder.add_line(f"{output_var.at('i')} := {output_var.at('i')} / exp_sum;")
         builder.add_line("END_FOR;")
 
     else:

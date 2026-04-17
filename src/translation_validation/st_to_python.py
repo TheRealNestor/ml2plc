@@ -64,10 +64,53 @@ def translate_st_to_python(st_code: str) -> Tuple[str, str]:
 
     with builder.function(function_name, ["input_data"]):
         # Add variable declarations
+        # First, add non-input variable declarations and collect input decls
+        input_decls: dict = {}
         for block_content, var_type in variables:
-            add_variables(builder, block_content, var_type)
+            if var_type == "input":
+                # Parse input declarations for later normalization decisions
+                input_decls.update(parse_var_input_declarations(block_content))
+            else:
+                add_variables(builder, block_content, var_type)
 
+        # Normalize runtime input_data to scalar ONLY when the ST declaration
+        # declares a scalar (not an ARRAY). This preserves array semantics
+        # when the ST explicitly declares an ARRAY, and is future-proof.
         builder.add_line()
+        builder.add_line(
+            "# Normalize runtime input to scalar only when ST declares a scalar input"
+        )
+        input_decl = input_decls.get("input_data")
+        if input_decl is None:
+            # No input declaration found — be conservative: do not normalize.
+            builder.add_line(
+                "# No VAR_INPUT declaration found for input_data — preserve runtime shape"
+            )
+        else:
+            # Heuristic: if the ST logic indexes into `input_data` anywhere, treat
+            # the runtime input as an array even if the VAR_INPUT declaration
+            # (erroneously) marks it as scalar. This avoids collapsing to a
+            # Python scalar and then having later code attempt to index it,
+            # which produces "invalid index to scalar variable" errors.
+            # This is conservative and non-destructive: it only changes the
+            # translator's runtime normalization behavior, not the original ST.
+            uses_indexing = bool(__import__("re").search(r"\binput_data\s*\[", st_code))
+            if not input_decl.get("is_array", False) and uses_indexing:
+                # Treat as array at runtime
+                builder.add_line(
+                    "# Detected array-style access to input_data in ST; preserve as array at runtime"
+                )
+            elif not input_decl.get("is_array", False):
+                # Scalar declaration and no array access detected: collapse singleton
+                builder.add_line(
+                    "if hasattr(input_data, '__len__') and len(input_data) == 1:"
+                )
+                with builder.indent():
+                    builder.add_line("input_data = input_data[0]")
+            else:
+                builder.add_line(
+                    "# input_data declared as ARRAY in ST — do not collapse to scalar"
+                )
 
         # Parse and add the logic
         parse_st_logic(builder, st_code)
@@ -82,7 +125,8 @@ def translate_st_to_python(st_code: str) -> Tuple[str, str]:
 def add_variables(builder: PyCodeBuilder, variables_block: str, var_type: str):
     """Add variable declarations to the builder."""
     if var_type == "input":
-        return  # Input variables are function parameters and should not be redeclared
+        # Input variables are function parameters and are handled separately
+        return
 
     for line in variables_block.splitlines():
         line = line.strip()
@@ -230,6 +274,50 @@ def translate_expression(expr: str) -> str:
     expr = expr.rstrip(";")
 
     return expr
+
+
+def parse_var_input_declarations(block: str) -> dict:
+    """Parse VAR_INPUT block content and return a mapping of variable name -> info.
+
+    Info dict contains:
+      - is_array: bool
+      - array_dims: list[int] | None
+    """
+    decls: dict = {}
+    for line in block.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # Match ARRAY declarations: e.g. name : ARRAY[0..19] OF REAL;
+        m = re.match(r"(\w+)\s*:\s*ARRAY\[(.*?)\]\s*OF\s*(\w+)", line)
+        if m:
+            name = m.group(1)
+            dims = m.group(2)
+            # dims could be '0..N' or '0..N, 0..M'
+            parts = [p.strip() for p in dims.split(",")]
+            dims_ints: list[int] = []
+            for p in parts:
+                mm = re.match(r"0\.\.(\d+)", p)
+                if mm:
+                    dims_ints.append(int(mm.group(1)) + 1)
+                else:
+                    # Couldn't parse bounds; treat as array with unknown size
+                    dims_ints.append(0)
+
+            decls[name] = {
+                "is_array": True,
+                "array_dims": dims_ints,
+            }
+            continue
+
+        # Match scalar declaration: name : REAL;
+        m2 = re.match(r"(\w+)\s*:\s*(\w+)\s*(?:;|:=)", line)
+        if m2:
+            name = m2.group(1)
+            decls[name] = {"is_array": False, "array_dims": None}
+
+    return decls
 
 
 if __name__ == "__main__":

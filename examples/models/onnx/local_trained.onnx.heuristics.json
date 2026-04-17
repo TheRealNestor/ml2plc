@@ -1,0 +1,13 @@
+{
+  "model": "local_trained.onnx",
+  "heuristic": "single_symbolic_axis_to_1",
+  "changes": [
+    {
+      "input": "flatten_input",
+      "axis": 0,
+      "old": "unk__8",
+      "new": 1
+    }
+  ],
+  "timestamp": "2026-04-17T15:57:20.997759Z"
+}

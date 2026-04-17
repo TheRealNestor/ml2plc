@@ -9,9 +9,12 @@ from typing import Optional
 
 from ...types import Conv2DLayer, Pool2DLayer, BatchNormLayer
 from ..st_code import STCode, STCodeBuilder
+from ..variable import Variable
 
 
-def generate_conv2d_code(layer: Conv2DLayer, input_var: str, output_var: str) -> STCode:
+def generate_conv2d_code(
+    layer: Conv2DLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate Conv2D layer code with 6 nested loops and boundary checking."""
     builder = STCodeBuilder()
 
@@ -47,7 +50,8 @@ def generate_conv2d_code(layer: Conv2DLayer, input_var: str, output_var: str) ->
             builder.add_line(f"FOR ow := 0 TO {out_w - 1} DO")
             with builder.indent():
                 if layer.bias is not None:
-                    builder.add_line(f"sum := bias_{layer.layer_id}[oc];")
+                    bias_var = Variable(name=f"bias_{layer.layer_id}", shape=(out_c,))
+                    builder.add_line(f"sum := {bias_var.at('oc')};")
                 else:
                     builder.add_line("sum := 0.0;")
 
@@ -94,9 +98,12 @@ def generate_conv2d_code(layer: Conv2DLayer, input_var: str, output_var: str) ->
                             else:
                                 weight_idx = f"oc * {w_ic_size} + (ic - {ic_start}) * {kH * kW} + kh * {kW} + kw"
 
+                            weights_var = Variable(
+                                name=f"weights_{layer.layer_id}",
+                                shape=(out_c * w_ic_size,),
+                            )
                             builder.add_line(
-                                f"sum := sum + {input_var}[{input_idx}] "
-                                f"* weights_{layer.layer_id}[{weight_idx}];"
+                                f"sum := sum + {input_var.at(input_idx)} * {weights_var.at(weight_idx)};"
                             )
 
                             if has_padding:
@@ -108,7 +115,7 @@ def generate_conv2d_code(layer: Conv2DLayer, input_var: str, output_var: str) ->
                 builder.add_line("END_FOR;")
 
                 output_idx = f"oc * {out_h * out_w} + oh * {out_w} + ow"
-                builder.add_line(f"{output_var}[{output_idx}] := sum;")
+                builder.add_line(f"{output_var.at(output_idx)} := sum;")
 
             builder.add_line("END_FOR;")
         builder.add_line("END_FOR;")
@@ -117,7 +124,9 @@ def generate_conv2d_code(layer: Conv2DLayer, input_var: str, output_var: str) ->
     return builder.build()
 
 
-def generate_pool2d_code(layer: Pool2DLayer, input_var: str, output_var: str) -> STCode:
+def generate_pool2d_code(
+    layer: Pool2DLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate MaxPool or AveragePool layer code."""
     builder = STCodeBuilder()
 
@@ -159,12 +168,12 @@ def generate_pool2d_code(layer: Pool2DLayer, input_var: str, output_var: str) ->
 
                         input_idx = f"oc * {in_h * in_w} + ih * {in_w} + iw"
                         if is_max:
-                            builder.add_line(f"IF {input_var}[{input_idx}] > sum THEN")
+                            builder.add_line(f"IF {input_var.at(input_idx)} > sum THEN")
                             with builder.indent():
-                                builder.add_line(f"sum := {input_var}[{input_idx}];")
+                                builder.add_line(f"sum := {input_var.at(input_idx)};")
                             builder.add_line("END_IF;")
                         else:
-                            builder.add_line(f"sum := sum + {input_var}[{input_idx}];")
+                            builder.add_line(f"sum := sum + {input_var.at(input_idx)};")
 
                         if has_padding:
                             indent_ctx.__exit__(None, None, None)
@@ -175,11 +184,11 @@ def generate_pool2d_code(layer: Pool2DLayer, input_var: str, output_var: str) ->
 
                 output_idx = f"oc * {out_h * out_w} + oh * {out_w} + ow"
                 if is_max:
-                    builder.add_line(f"{output_var}[{output_idx}] := sum;")
+                    builder.add_line(f"{output_var.at(output_idx)} := sum;")
                 else:
                     kernel_area = kH * kW
                     builder.add_line(
-                        f"{output_var}[{output_idx}] := sum / {float(kernel_area)};"
+                        f"{output_var.at(output_idx)} := sum / {float(kernel_area)};"
                     )
 
             builder.add_line("END_FOR;")
@@ -190,7 +199,7 @@ def generate_pool2d_code(layer: Pool2DLayer, input_var: str, output_var: str) ->
 
 
 def generate_batchnorm_code(
-    layer: BatchNormLayer, input_var: str, output_var: str
+    layer: BatchNormLayer, input_var: Variable, output_var: Variable
 ) -> STCode:
     """Generate BatchNorm layer code (inference mode)."""
     builder = STCodeBuilder()
@@ -210,22 +219,23 @@ def generate_batchnorm_code(
     )
 
     if spatial_size == 1:
+        bn_scale_var = Variable(name=f"bn_scale_{lid}", shape=(C,))
+        bn_bias_var = Variable(name=f"bn_bias_{lid}", shape=(C,))
         builder.add_line(f"FOR oc := 0 TO {C - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"{output_var}[oc] := bn_scale_{lid}[oc] * {input_var}[oc] "
-                f"+ bn_bias_{lid}[oc];"
+                f"{output_var.at('oc')} := {bn_scale_var.at('oc')} * {input_var.at('oc')} + {bn_bias_var.at('oc')};"
             )
         builder.add_line("END_FOR;")
     else:
+        bn_scale_var = Variable(name=f"bn_scale_{lid}", shape=(C,))
+        bn_bias_var = Variable(name=f"bn_bias_{lid}", shape=(C,))
         builder.add_line(f"FOR oc := 0 TO {C - 1} DO")
         with builder.indent():
             builder.add_line(f"FOR i := 0 TO {spatial_size - 1} DO")
             with builder.indent():
                 builder.add_line(
-                    f"{output_var}[oc * {spatial_size} + i] := "
-                    f"bn_scale_{lid}[oc] * {input_var}[oc * {spatial_size} + i] "
-                    f"+ bn_bias_{lid}[oc];"
+                    f"{output_var.at(f'oc * {spatial_size} + i')} := {bn_scale_var.at('oc')} * {input_var.at(f'oc * {spatial_size} + i')} + {bn_bias_var.at('oc')};"
                 )
             builder.add_line("END_FOR;")
         builder.add_line("END_FOR;")

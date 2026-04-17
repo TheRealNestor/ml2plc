@@ -13,11 +13,14 @@ from .recurrent_utils import (
     initialize_hidden_states,
     write_output,
 )
+from ..variable import Variable
 
 logger = logging.getLogger(__name__)
 
 
-def generate_lstm_code(layer: LSTMLayer, input_var: str, output_var: str) -> STCode:
+def generate_lstm_code(
+    layer: LSTMLayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate LSTM layer code with full temporal unrolling.
 
     LSTM equations:
@@ -28,6 +31,12 @@ def generate_lstm_code(layer: LSTMLayer, input_var: str, output_var: str) -> STC
     - c_t = f_t * c_{t-1} + i_t * g_t                          # cell state
     - h_t = o_t * tanh(c_t)                                     # hidden state
     """
+    # Accept either Variable or raw string names for backward compatibility
+    from ..variable import ensure_var
+
+    input_var = ensure_var(input_var, layer.input_shape)
+    output_var = ensure_var(output_var, layer.output_shape)
+
     builder = STCodeBuilder()
 
     h_size = layer.hidden_size
@@ -62,10 +71,11 @@ def generate_lstm_code(layer: LSTMLayer, input_var: str, output_var: str) -> STC
             ("Cell Gate", "g_gate", "g", "tanh"),
             ("Output Gate", "o_gate", "o", "sigmoid"),
         ]:
+            gate_var = Variable(name=f"{var_name}_{lid}", shape=(h_size,))
             emit_gate_computation(
                 builder,
                 gate_name=gate_name,
-                gate_var=f"{var_name}_{lid}",
+                gate_var=gate_var,
                 layer_id=lid,
                 hidden_size=h_size,
                 input_size=x_size,
@@ -80,23 +90,29 @@ def generate_lstm_code(layer: LSTMLayer, input_var: str, output_var: str) -> STC
         # Cell state update: c_t = f_t * c_{t-1} + i_t * g_t
         builder.add_line("")
         builder.add_line(f"(* Cell state: c_t = f_t * c_{{t-1}} + i_t * g_t *)")
+        c_state_var = Variable(name=f"c_state_{lid}", shape=(h_size,))
+        f_gate_var = Variable(name=f"f_gate_{lid}", shape=(h_size,))
+        i_gate_var = Variable(name=f"i_gate_{lid}", shape=(h_size,))
+        g_gate_var = Variable(name=f"g_gate_{lid}", shape=(h_size,))
+
         builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"c_state_{lid}[j] := f_gate_{lid}[j] * c_state_{lid}[j] + "
-                f"i_gate_{lid}[j] * g_gate_{lid}[j];"
+                f"{c_state_var.at('j')} := {f_gate_var.at('j')} * {c_state_var.at('j')} + {i_gate_var.at('j')} * {g_gate_var.at('j')};"
             )
         builder.add_line("END_FOR;")
 
         # Hidden state update: h_t = o_t * tanh(c_t)
         builder.add_line("")
         builder.add_line(f"(* Hidden state: h_t = o_t * tanh(c_t) *)")
+        h_state_var = Variable(name=f"h_state_{lid}", shape=(h_size,))
+        o_gate_var = Variable(name=f"o_gate_{lid}", shape=(h_size,))
+
         builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
         with builder.indent():
-            builder.add_line(f"exp_val := EXP(2.0 * c_state_{lid}[j]);")
+            builder.add_line(f"exp_val := EXP(2.0 * {c_state_var.at('j')});")
             builder.add_line(
-                f"h_state_{lid}[j] := o_gate_{lid}[j] * "
-                f"((exp_val - 1.0) / (exp_val + 1.0));"
+                f"{h_state_var.at('j')} := {o_gate_var.at('j')} * ((exp_val - 1.0) / (exp_val + 1.0));"
             )
         builder.add_line("END_FOR;")
 
@@ -116,7 +132,9 @@ def generate_lstm_code(layer: LSTMLayer, input_var: str, output_var: str) -> STC
     return builder.build()
 
 
-def generate_gru_code(layer: GRULayer, input_var: str, output_var: str) -> STCode:
+def generate_gru_code(
+    layer: GRULayer, input_var: Variable, output_var: Variable
+) -> STCode:
     """Generate GRU (Gated Recurrent Unit) layer code with full temporal unrolling.
 
     GRU equations:
@@ -128,6 +146,12 @@ def generate_gru_code(layer: GRULayer, input_var: str, output_var: str) -> STCod
 
     Where lbr = linear_before_reset attribute.
     """
+    # Accept either Variable or raw string names for backward compatibility
+    from ..variable import ensure_var
+
+    input_var = ensure_var(input_var, layer.input_shape)
+    output_var = ensure_var(output_var, layer.output_shape)
+
     builder = STCodeBuilder()
 
     h_size = layer.hidden_size
@@ -159,10 +183,11 @@ def generate_gru_code(layer: GRULayer, input_var: str, output_var: str) -> STCod
 
     with builder.indent():
         # Reset gate: r_t = sigmoid(W_r @ x_t + R_r @ h_{t-1} + b_r)
+        r_gate_var = Variable(name=f"r_gate_{lid}", shape=(h_size,))
         emit_gate_computation(
             builder,
             gate_name="Reset Gate",
-            gate_var=f"r_gate_{lid}",
+            gate_var=r_gate_var,
             layer_id=lid,
             hidden_size=h_size,
             input_size=x_size,
@@ -175,10 +200,11 @@ def generate_gru_code(layer: GRULayer, input_var: str, output_var: str) -> STCod
         )
 
         # Update gate: u_t = sigmoid(W_u @ x_t + R_u @ h_{t-1} + b_u)
+        u_gate_var = Variable(name=f"u_gate_{lid}", shape=(h_size,))
         emit_gate_computation(
             builder,
             gate_name="Update Gate",
-            gate_var=f"u_gate_{lid}",
+            gate_var=u_gate_var,
             layer_id=lid,
             hidden_size=h_size,
             input_size=x_size,
@@ -205,11 +231,12 @@ def generate_gru_code(layer: GRULayer, input_var: str, output_var: str) -> STCod
         builder.add_line(
             f"(* Hidden state: h_t = u_t * h_{{t-1}} + (1 - u_t) * h'_t *)"
         )
+        h_state_var = Variable(name=f"h_state_{lid}", shape=(h_size,))
+        h_new_var = Variable(name=f"h_new_{lid}", shape=(h_size,))
         builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
         with builder.indent():
             builder.add_line(
-                f"h_state_{lid}[j] := u_gate_{lid}[j] * h_state_{lid}[j] + "
-                f"(1.0 - u_gate_{lid}[j]) * h_new_{lid}[j];"
+                f"{h_state_var.at('j')} := {u_gate_var.at('j')} * {h_state_var.at('j')} + (1.0 - {u_gate_var.at('j')}) * {h_new_var.at('j')};"
             )
         builder.add_line("END_FOR;")
 
@@ -234,7 +261,7 @@ def _emit_gru_candidate_gate(
     layer_id: int,
     hidden_size: int,
     input_size: int,
-    input_var: str,
+    input_var: Variable,
     linear_before_reset: int,
 ) -> None:
     """Generate candidate hidden state gate for GRU.
@@ -246,6 +273,7 @@ def _emit_gru_candidate_gate(
     x_size = input_size
 
     builder.add_line("")
+    # Candidate header (same structure for both lbr variants)
     if linear_before_reset == 1:
         builder.add_line(
             f"(* Candidate (lbr=1): h'_t = tanh(Wx + r_t * (Rh + Rb_h) + Wb_h) *)"
@@ -255,6 +283,7 @@ def _emit_gru_candidate_gate(
             f"(* Candidate (lbr=0): h'_t = tanh(Wx + R(r_t * h) + Wb_h + Rb_h) *)"
         )
 
+    # Always iterate over output units 'j' for the candidate computation
     builder.add_line(f"FOR j := 0 TO {h_size - 1} DO")
     with builder.indent():
         builder.add_line("sum := 0.0;")
@@ -262,9 +291,9 @@ def _emit_gru_candidate_gate(
         # Input contribution: W_h @ x_t
         builder.add_line(f"FOR i := 0 TO {x_size - 1} DO")
         with builder.indent():
+            weights_wh = Variable(name=f"weights_{lid}_h", shape=(h_size * x_size,))
             builder.add_line(
-                f"sum := sum + {input_var}[t * {x_size} + i] "
-                f"* weights_{lid}_h[j * {x_size} + i];"
+                f"sum := sum + {input_var.at(f't * {x_size} + i')} * {weights_wh.at(f'j * {x_size} + i')} ;"
             )
         builder.add_line("END_FOR;")
 
@@ -273,26 +302,38 @@ def _emit_gru_candidate_gate(
             builder.add_line("exp_val := 0.0;")
             builder.add_line(f"FOR i := 0 TO {h_size - 1} DO")
             with builder.indent():
+                recurrent_h = Variable(
+                    name=f"recurrent_{lid}_h", shape=(h_size * h_size,)
+                )
+                h_state_var = Variable(name=f"h_state_{lid}", shape=(h_size,))
                 builder.add_line(
-                    f"exp_val := exp_val + h_state_{lid}[i] "
-                    f"* recurrent_{lid}_h[j * {h_size} + i];"
+                    f"exp_val := exp_val + {h_state_var.at('i')} * {recurrent_h.at(f'j * {h_size} + i')} ;"
                 )
             builder.add_line("END_FOR;")
+            bias_r_h = Variable(name=f"bias_r_{lid}_h", shape=(h_size,))
+            bias_w_h = Variable(name=f"bias_w_{lid}_h", shape=(h_size,))
+            r_gate_var = Variable(name=f"r_gate_{lid}", shape=(h_size,))
             builder.add_line(
-                f"sum := sum + r_gate_{lid}[j] * (exp_val + bias_r_{lid}_h[j]);"
+                f"sum := sum + {r_gate_var.at('j')} * (exp_val + {bias_r_h.at('j')});"
             )
-            builder.add_line(f"sum := sum + bias_w_{lid}_h[j];")
+            builder.add_line(f"sum := sum + {bias_w_h.at('j')};")
         else:
             builder.add_line(f"FOR i := 0 TO {h_size - 1} DO")
             with builder.indent():
+                recurrent_h = Variable(
+                    name=f"recurrent_{lid}_h", shape=(h_size * h_size,)
+                )
+                h_state_var = Variable(name=f"h_state_{lid}", shape=(h_size,))
+                r_gate_var = Variable(name=f"r_gate_{lid}", shape=(h_size,))
                 builder.add_line(
-                    f"sum := sum + (h_state_{lid}[i] * r_gate_{lid}[i]) "
-                    f"* recurrent_{lid}_h[j * {h_size} + i];"
+                    f"sum := sum + ({h_state_var.at('i')} * {r_gate_var.at('i')}) * {recurrent_h.at(f'j * {h_size} + i')} ;"
                 )
             builder.add_line("END_FOR;")
-            builder.add_line(f"sum := sum + bias_w_{lid}_h[j] + bias_r_{lid}_h[j];")
+            bias_w_h = Variable(name=f"bias_w_{lid}_h", shape=(h_size,))
+            bias_r_h = Variable(name=f"bias_r_{lid}_h", shape=(h_size,))
+            builder.add_line(f"sum := sum + {bias_w_h.at('j')} + {bias_r_h.at('j')};")
 
         # Apply tanh activation
-        apply_activation(builder, f"h_new_{lid}[j]", "tanh")
+    apply_activation(builder, f"h_new_{lid}[j]", "tanh")
 
     builder.add_line("END_FOR;")

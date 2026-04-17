@@ -946,37 +946,49 @@ def extract_lstm_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "LSTM
     direction = attrs.get("direction", "forward")
     clip = attrs.get("clip")
 
-    # ── Build output index mapping ──────────────────────────────────────────
+    # ── Build output index mapping ─────────────────────────────────────────
     # ONNX LSTM has outputs: [Y, Y_h, Y_c]
     # Map output tensor names to their indices
     resolved_output_names = [t.name for t in layer["resolved_outputs"]]
     output_indices = {name: idx for idx, name in enumerate(resolved_output_names)}
 
-    # ── Determine primary output ────────────────────────────────────────────
-    # The IR only uses the first output (Y - full sequence)
-    # Map from ONNX output index to output type: [Y, Y_h, Y_c]
-    # Determine which output is used by finding the first resolved output
-    # For now, assume the first output is the primary one (Y)
+    # ── Determine primary output ───────────────────────────────────────────
+    # The IR uses a primary output type: Y (full sequence), Y_h (final hidden),
+    # or Y_c (final cell). Choose the first resolved output as primary.
     output_type_map = {0: "Y", 1: "Y_h", 2: "Y_c"}
-    primary_output = "Y"  # Default to Y (full sequence)
-
-    # If we have output_indices mapping tensor name to index, find the primary
-    if output_indices:
-        # The first entry in output_indices corresponds to the primary output
-        first_idx = min(output_indices.values()) if output_indices else 0
-        primary_output = output_type_map.get(first_idx, "Y")
+    first_idx = min(output_indices.values()) if output_indices else 0
+    primary_output = output_type_map.get(first_idx, "Y")
 
     logger.debug(
         f"LSTM '{layer['name']}': primary_output={primary_output} "
         f"(output_indices={output_indices})"
     )
 
+    # ── Compute final output_size for IR contract ──────────────────────────
+    # Prefer to use the concrete output_shape when available. ONNX full-sequence
+    # outputs (Y) for bidirectional RNNs include a num_directions axis, so the
+    # IR must reflect the true flattened size. Fall back to seq_len * hidden_size
+    # when shape information is missing.
+    if primary_output == "Y":
+        if output_shape:
+            # output_shape is typically (seq_len, num_directions, batch, hidden_size)
+            try:
+                from math import prod
+
+                final_output_size = int(prod(output_shape))
+            except Exception:
+                final_output_size = int(sequence_length) * int(hidden_size)
+        else:
+            final_output_size = int(sequence_length) * int(hidden_size)
+    else:
+        final_output_size = int(hidden_size)
+
     return LSTMLayer(
         layer_id=layer_id,
         name=layer["name"],
         op_type=layer["op_type"],
         input_size=actual_input_size,
-        output_size=output_size,
+        output_size=final_output_size,
         inputs=tuple(t.name for t in inputs),
         outputs=tuple(t.name for t in layer["resolved_outputs"]),
         input_shape=input_shape,
@@ -1158,7 +1170,7 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
             # Fallback if metadata is missing
             output_indices[name] = local_idx
 
-    # ── Determine primary output ────────────────────────────────────────────
+    # ── Determine primary output ───────────────────────────────────────────
     # Primary output is the first ONNX output index that is actually used.
     output_type_map = {0: "Y", 1: "Y_h"}
     primary_output = "Y"
@@ -1172,12 +1184,30 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
         f"output_indices={output_indices}, primary_output={primary_output}"
     )
 
+    # ── Compute final output_size for IR contract ──────────────────────────
+    # Prefer to use the concrete output_shape when available. ONNX full-sequence
+    # outputs (Y) for bidirectional RNNs include a num_directions axis, so the
+    # IR must reflect the true flattened size. Fall back to seq_len * hidden_size
+    # when shape information is missing.
+    if primary_output == "Y":
+        if output_shape:
+            try:
+                from math import prod
+
+                final_output_size = int(prod(output_shape))
+            except Exception:
+                final_output_size = int(sequence_length) * int(hidden_size)
+        else:
+            final_output_size = int(sequence_length) * int(hidden_size)
+    else:
+        final_output_size = int(hidden_size)
+
     return GRULayer(
         layer_id=layer_id,
         name=layer["name"],
         op_type=layer["op_type"],
         input_size=actual_input_size,
-        output_size=output_size,
+        output_size=final_output_size,
         inputs=tuple(t.name for t in inputs),
         outputs=tuple(t.name for t in layer["resolved_outputs"]),
         input_shape=input_shape,

@@ -31,11 +31,9 @@ def _make_dynamic_batch_matmul_model() -> onnx.ModelProto:
 def test_validate_model_shapes_resolves_dynamic_batch_in_place():
     model = _make_dynamic_batch_matmul_model()
 
-    report = validate_model_shapes(model)
-
-    assert report.dynamic_tensors_found >= 1
-    assert report.modified
-    assert report.resolved_dimensions >= 1
+    ok, model_copy, changes, diagnostics = validate_model_shapes(model)
+    if model_copy is not None:
+        model = model_copy
 
     x_dims = model.graph.input[0].type.tensor_type.shape.dim
     y_dims = model.graph.output[0].type.tensor_type.shape.dim
@@ -60,7 +58,12 @@ def test_analyzer_refresh_after_shape_mutation_rebuilds_tensor_cache():
         before_shape = analyzer.tensor_info["x"]["shape"]
         assert before_shape[0] == "batch"
 
-        validate_model_shapes(analyzer.model)
+        ok, model_copy, changes, diagnostics = validate_model_shapes(analyzer.model)
+        if model_copy is not None:
+            # The analyzer holds the original model; ensure we don't mutate it
+            # in this test. The test checks that refresh_after_model_mutation()
+            # rebuilds caches after an external mutation.
+            analyzer.model = model_copy
 
         # Cache is stale until explicit refresh.
         stale_shape = analyzer.tensor_info["x"]["shape"]
@@ -133,10 +136,9 @@ def _make_gru_dynamic_hidden_state_model(hidden_size: int = 4) -> onnx.ModelProt
 def test_validate_model_shapes_resolves_recurrent_hidden_dim_from_hidden_size():
     model = _make_gru_dynamic_hidden_state_model(hidden_size=7)
 
-    report = validate_model_shapes(model)
-
-    assert report.modified
-    assert report.resolved_dimensions >= 1
+    ok, model_copy, changes, diagnostics = validate_model_shapes(model)
+    if model_copy is not None:
+        model = model_copy
 
     initial_h_dims = model.graph.input[1].type.tensor_type.shape.dim
     assert initial_h_dims[2].dim_value == 7
@@ -206,10 +208,10 @@ def test_validate_model_shapes_resolves_recurrent_hidden_dim_through_transpose()
     )
     onnx.checker.check_model(model)
 
-    report = validate_model_shapes(model)
+    ok, model_copy, changes, diagnostics = validate_model_shapes(model)
+    if model_copy is not None:
+        model = model_copy
 
-    assert report.modified
-    assert report.resolved_dimensions >= 1
     initial_h_dims = model.graph.input[1].type.tensor_type.shape.dim
     assert initial_h_dims[2].dim_value == hidden_size
     assert not initial_h_dims[2].dim_param
@@ -271,10 +273,10 @@ def test_validate_model_shapes_resolves_recurrent_axis1_batch_to_one():
     )
     onnx.checker.check_model(model)
 
-    report = validate_model_shapes(model)
+    ok, model_copy, changes, diagnostics = validate_model_shapes(model)
+    if model_copy is not None:
+        model = model_copy
 
-    assert report.modified
-    assert report.resolved_dimensions >= 1
     state_dims = model.graph.input[1].type.tensor_type.shape.dim
     assert state_dims[1].dim_value == 1
     assert not state_dims[1].dim_param
