@@ -3,10 +3,9 @@ import copy
 from pathlib import Path
 
 import onnx
-import pytest
 
 from src.codegen.onnx_model_heuristics import heuristically_resolve_symbolic_inputs
-from src.codegen.onnx_model import ONNXModel, ShapeValidationError
+from src.codegen.onnx_model import ONNXModel
 
 
 def make_simple_model_with_symbolic_input(dim_name: str = "unk__N") -> onnx.ModelProto:

@@ -10,8 +10,7 @@ multidimensional data. Handles:
 - Boundary calculations
 """
 
-from typing import List, Tuple, Optional, Union
-import numpy as np
+from typing import List, Tuple, Union
 
 
 def compute_array_stride(shape: Tuple[int, ...], axis: int = -1) -> int:

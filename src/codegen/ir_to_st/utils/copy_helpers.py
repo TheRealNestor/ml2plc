@@ -125,7 +125,7 @@ def generate_selective_copy(
             )
     else:
         builder.add_line(
-            f"(* WARNING: large Gather index list, using conservative copy *)"
+            "(* WARNING: large Gather index list, using conservative copy *)"
         )
         builder.add_line(f"FOR i := 0 TO {len(indices) - 1} DO")
         with builder.indent():

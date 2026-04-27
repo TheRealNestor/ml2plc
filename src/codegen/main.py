@@ -21,14 +21,20 @@ from typing import Dict, Optional
 
 from codegen.onnx_model import ONNXModel
 from codegen.onnx_to_ir import (
-    onnx_to_ir,
     regionize_network_ir,
     normalize_model_for_ir,
     extract_typed_ir_graph,
     schedule_network_ir as schedule_ir_graph,
     NormalizedIRInputs,
 )
-from codegen.ir_optimizer import optimize_model_regions, OptimizationResult
+from codegen.ir_optimizer import (
+    optimize_model_regions,
+    OptimizationResult,
+    DEFAULT_PASSES,
+    PROFILE_PASSES,
+)
+from codegen.ir_optimizer.passes import RemoveSoftmaxPass
+from codegen.quantization.scaffold import apply_post_training_quantization
 from codegen.memory_check.memory_analyzer import check_memory
 from codegen.ir_to_st import translate_model_to_st
 from codegen.types import ModelIR, RegionKind, NetworkIR
@@ -245,9 +251,12 @@ def generate_st(
 def compile_onnx_to_st(
     model_path: str,
     optimize: bool = True,
-    output_path: str = None,
+    output_path: Optional[str] = None,
     fb_name: Optional[str] = None,
     allow_heuristics: bool = False,
+    enable_argmax: bool = False,
+    auto_quant: bool = False,
+    profile: str = "safe",
 ) -> str:
     """
                 Complete compilation pipeline: ONNX → ModelIR → Optimized regions → ST code.
@@ -279,9 +288,23 @@ def compile_onnx_to_st(
     # Stage 2: Build IR (internally normalize → extract → schedule → regionize)
     model_ir = build_model_ir(analyzer)
 
+    # Optional quantization scaffold (post-training quantization)
+    if auto_quant:
+        model_ir = apply_post_training_quantization(model_ir)
+
     # Stage 3: Optimize
     if optimize:
-        optimization_results = optimize_regions(model_ir)
+        # Build custom pass list from named profiles. Profiles define exact
+        # sequences of pass instances in the desired order.
+        custom_passes = list(PROFILE_PASSES.get(profile, DEFAULT_PASSES))
+
+        # Honor explicit argmax flag (highest precedence) by ensuring a
+        # RemoveSoftmaxPass instance is present (avoid duplicate types).
+        if enable_argmax and not any(isinstance(p, RemoveSoftmaxPass) for p in custom_passes):
+            custom_passes.append(RemoveSoftmaxPass())
+
+        # Always pass explicit custom_passes to the optimizer for determinism
+        optimization_results = optimize_model_regions(model_ir, passes=custom_passes)
     else:
         logger.info("Stage 3: Skipping optimization (optimize=False)")
         # Wrap unoptimized graphs
@@ -371,6 +394,26 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--argmax",
+        action="store_true",
+        help=("Replace final Softmax activations with ArgMax (opt-in, lossy)."),
+    )
+
+    parser.add_argument(
+        "--auto-quant",
+        action="store_true",
+        help=("Apply lightweight post-training quantization scaffold (opt-in)."),
+    )
+
+    parser.add_argument(
+        "--profile",
+        type=str,
+        choices=["safe", "aggressive"],
+        default="safe",
+        help=("Optimization profile: 'safe' (default) or 'aggressive' (enables lossy optimizations)."),
+    )
+
     return parser.parse_args()
 
 
@@ -405,6 +448,9 @@ def main():
             output_path=str(output_path),
             fb_name=args.fb_name,
             allow_heuristics=bool(getattr(args, "allow_heuristics", False)),
+            enable_argmax=bool(getattr(args, "argmax", False)),
+            auto_quant=bool(getattr(args, "auto_quant", False)),
+            profile=getattr(args, "profile", "safe"),
         )
 
         logger.info(f"Successfully compiled {input_path.name}")

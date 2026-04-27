@@ -1,6 +1,6 @@
 import pytest
 
-from src.codegen.ir_to_st.variable import Variable, VarRef, ensure_var
+from src.codegen.ir_to_st.variable import Variable, ensure_var
 
 
 def test_scalar_variable():

@@ -2,11 +2,9 @@ import pytest
 from unittest.mock import MagicMock
 from codegen.ir_to_st.codegen_core import (
     translate_model_to_st,
-    generate_model_function_block,
 )
 from codegen.types import (
     ModelIR,
-    RegionIR,
     AcyclicRegionIR,
     RecurrentRegionIR,
     RegionKind,

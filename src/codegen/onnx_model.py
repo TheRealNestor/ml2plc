@@ -239,6 +239,9 @@ class ONNXModel:
             logger.warning(f"Shape inference failed: {e}. Using raw graph.")
             inferred = self.model
 
+        # Help static analyzers: inferred is expected to be a ModelProto here
+        assert inferred is not None
+
         tensor_info = {}
         initializer_names = {init.name for init in inferred.graph.initializer}
 
@@ -327,6 +330,10 @@ class ONNXModel:
             logger.error("Model not loaded. Call load_model() first.")
             return {}
 
+        if self.graph is None:
+            logger.error("Model graph unavailable. Call load_model() first.")
+            return {}
+
         weights = {}
         for initializer in self.graph.initializer:
             tensor_data = onnx.numpy_helper.to_array(initializer)
@@ -344,6 +351,10 @@ class ONNXModel:
         """
         if not self.model:
             logger.error("Model not loaded. Call load_model() first.")
+            return []
+
+        if self.graph is None:
+            logger.error("Model graph unavailable. Call load_model() first.")
             return []
 
         if self.layers:
@@ -388,6 +399,10 @@ class ONNXModel:
         """
         if not self.model:
             logger.error("Model not loaded. Call load_model() first.")
+            return {}, {}
+
+        if self.graph is None:
+            logger.error("Model graph unavailable. Call load_model() first.")
             return {}, {}
 
         initializer_names = {init.name for init in self.graph.initializer}
@@ -524,7 +539,7 @@ class ONNXModel:
         print("=" * 60)
 
 
-def load_and_analyze_onnx_model(model_path: str | Path) -> ONNXModel:
+def load_and_analyze_onnx_model(model_path: str | Path) -> Optional[ONNXModel]:
     """
     Convenience function to load and analyze an ONNX model.
 

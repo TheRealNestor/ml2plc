@@ -6,7 +6,7 @@ and state management across different recurrent architectures.
 """
 
 import logging
-from ..st_code import STCode, STCodeBuilder
+from ..st_code import STCodeBuilder
 from ..variable import Variable
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ def apply_activation(builder: STCodeBuilder, var_name: str, activation: str) -> 
     if activation == "sigmoid":
         builder.add_line(f"{var_name} := 1.0 / (1.0 + EXP(-sum));")
     elif activation == "tanh":
-        builder.add_line(f"exp_val := EXP(2.0 * sum);")
+        builder.add_line("exp_val := EXP(2.0 * sum);")
         builder.add_line(f"{var_name} := (exp_val - 1.0) / (exp_val + 1.0);")
     else:
         raise ValueError(f"Unknown activation: {activation}")
@@ -120,7 +120,7 @@ def initialize_hidden_states(
         states: List of state names (e.g., ["h_state", "c_state"])
     """
     builder.add_line("")
-    builder.add_line(f"(* Initialize states to zero *)")
+    builder.add_line("(* Initialize states to zero *)")
     builder.add_line(f"FOR j := 0 TO {hidden_size - 1} DO")
     with builder.indent():
         for state in states:
@@ -158,7 +158,7 @@ def write_output(
     builder.add_line("")
 
     if primary_output == "Y":
-        builder.add_line(f"(* Y output: Full sequence *)")
+        builder.add_line("(* Y output: Full sequence *)")
         builder.add_line(f"FOR j := 0 TO {hidden_size - 1} DO")
         with builder.indent():
             builder.add_line(

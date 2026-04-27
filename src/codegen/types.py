@@ -203,7 +203,7 @@ class FusedGemmLayer(FusedLinearLayer):
 class AddLayer(BaseLayer):
     """Represents an ONNX Add layer"""
 
-    bias: np.ndarray
+    bias: Optional[np.ndarray]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -237,6 +237,16 @@ class UnaryElementwiseLayer(BaseLayer):
     """Represents unary elementwise ops (Sqrt, Reciprocal, etc.)."""
 
     operation: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArgMaxLayer(BaseLayer):
+    """Represents an ArgMax reduction that returns the index of the maximum value.
+
+    This compiler emits a single integer index (INT32/DINT) per ArgMax layer.
+    """
+
+    axis: int = -1
 
 
 @dataclass(frozen=True, kw_only=True)

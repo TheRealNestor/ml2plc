@@ -1,7 +1,5 @@
 from src.codegen.types import ActivationLayer, ActivationType, NetworkIR
-from src.codegen.types import BaseLayer
 from src.codegen.ir_to_st.codegen_core import translate_ir_to_st
-from src.codegen.types import NetworkIR
 
 
 def make_network(layer):

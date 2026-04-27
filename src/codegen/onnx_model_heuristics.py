@@ -14,7 +14,6 @@ The helpers operate in-place on the provided model object.
 
 from __future__ import annotations
 
-from typing import Optional
 import onnx
 import logging
 

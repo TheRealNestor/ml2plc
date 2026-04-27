@@ -89,7 +89,7 @@ def generate_lstm_code(
 
         # Cell state update: c_t = f_t * c_{t-1} + i_t * g_t
         builder.add_line("")
-        builder.add_line(f"(* Cell state: c_t = f_t * c_{{t-1}} + i_t * g_t *)")
+        builder.add_line("(* Cell state: c_t = f_t * c_{t-1} + i_t * g_t *)")
         c_state_var = Variable(name=f"c_state_{lid}", shape=(h_size,))
         f_gate_var = Variable(name=f"f_gate_{lid}", shape=(h_size,))
         i_gate_var = Variable(name=f"i_gate_{lid}", shape=(h_size,))
@@ -104,7 +104,7 @@ def generate_lstm_code(
 
         # Hidden state update: h_t = o_t * tanh(c_t)
         builder.add_line("")
-        builder.add_line(f"(* Hidden state: h_t = o_t * tanh(c_t) *)")
+        builder.add_line("(* Hidden state: h_t = o_t * tanh(c_t) *)")
         h_state_var = Variable(name=f"h_state_{lid}", shape=(h_size,))
         o_gate_var = Variable(name=f"o_gate_{lid}", shape=(h_size,))
 
@@ -229,7 +229,7 @@ def generate_gru_code(
         # Update hidden state: h_t = (1 - u_t) * h'_t + u_t * h_{t-1}
         builder.add_line("")
         builder.add_line(
-            f"(* Hidden state: h_t = u_t * h_{{t-1}} + (1 - u_t) * h'_t *)"
+            "(* Hidden state: h_t = u_t * h_{t-1} + (1 - u_t) * h'_t *)"
         )
         h_state_var = Variable(name=f"h_state_{lid}", shape=(h_size,))
         h_new_var = Variable(name=f"h_new_{lid}", shape=(h_size,))
@@ -276,11 +276,11 @@ def _emit_gru_candidate_gate(
     # Candidate header (same structure for both lbr variants)
     if linear_before_reset == 1:
         builder.add_line(
-            f"(* Candidate (lbr=1): h'_t = tanh(Wx + r_t * (Rh + Rb_h) + Wb_h) *)"
+            "(* Candidate (lbr=1): h'_t = tanh(Wx + r_t * (Rh + Rb_h) + Wb_h) *)"
         )
     else:
         builder.add_line(
-            f"(* Candidate (lbr=0): h'_t = tanh(Wx + R(r_t * h) + Wb_h + Rb_h) *)"
+            "(* Candidate (lbr=0): h'_t = tanh(Wx + R(r_t * h) + Wb_h + Rb_h) *)"
         )
 
     # Always iterate over output units 'j' for the candidate computation

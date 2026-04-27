@@ -9,7 +9,7 @@ Provides utilities for:
 
 import logging
 from typing import Dict, List, Set, Tuple
-from collections import deque, defaultdict
+from collections import deque
 
 from codegen.types import BaseLayer
 from onnx import GraphProto

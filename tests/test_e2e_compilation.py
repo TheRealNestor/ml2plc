@@ -79,8 +79,6 @@ from translation_validation.validation import (
     translate_and_save,
     load_translated_function,
     compare_inference,
-    run_onnx_inference,
-    generate_test_inputs,
 )
 
 logger = logging.getLogger(__name__)

@@ -1,4 +1,3 @@
-import pytest
 from codegen.main import compile_onnx_to_st
 from codegen.types import RegionKind
 from unittest.mock import patch, MagicMock

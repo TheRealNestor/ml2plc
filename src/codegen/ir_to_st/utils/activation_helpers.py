@@ -5,7 +5,6 @@ Provides helpers for generating ST code for various activation functions,
 supporting both inline (within matmul) and separate loop implementations.
 """
 
-from typing import Optional
 from ..st_code import STCode, STCodeBuilder
 from ..variable import Variable
 from ...types import ActivationType
@@ -114,7 +113,7 @@ def generate_activation_loop(
 
     elif activation == ActivationType.SOFTMAX:
         # Softmax requires 3 passes: find max, compute exp sum, normalize
-        builder.add_line(f"(* Softmax: find max *)")
+        builder.add_line("(* Softmax: find max *)")
         builder.add_line(f"max_val := {input_var.at('0')};")
         builder.add_line(f"FOR i := 1 TO {size - 1} DO")
         with builder.indent():
@@ -125,7 +124,7 @@ def generate_activation_loop(
         builder.add_line("END_FOR;")
         builder.add_line("")
 
-        builder.add_line(f"(* Softmax: compute exponentials and sum *)")
+        builder.add_line("(* Softmax: compute exponentials and sum *)")
         builder.add_line("exp_sum := 0.0;")
         builder.add_line(f"FOR i := 0 TO {size - 1} DO")
         with builder.indent():
@@ -136,7 +135,7 @@ def generate_activation_loop(
         builder.add_line("END_FOR;")
         builder.add_line("")
 
-        builder.add_line(f"(* Softmax: normalize *)")
+        builder.add_line("(* Softmax: normalize *)")
         builder.add_line(f"FOR i := 0 TO {size - 1} DO")
         with builder.indent():
             builder.add_line(f"{output_var.at('i')} := {output_var.at('i')} / exp_sum;")

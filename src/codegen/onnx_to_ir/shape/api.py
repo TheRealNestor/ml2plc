@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Optional, Tuple
 
-import numpy as np
 
 from .engine import infer_layer_shapes
 from .validation import (

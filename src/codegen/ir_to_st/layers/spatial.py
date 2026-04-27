@@ -5,7 +5,6 @@ Handles convolution, pooling, and batch normalization operations.
 """
 
 import numpy as np
-from typing import Optional
 
 from ...types import Conv2DLayer, Pool2DLayer, BatchNormLayer
 from ..st_code import STCode, STCodeBuilder

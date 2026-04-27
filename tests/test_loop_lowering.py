@@ -8,10 +8,7 @@ Validates that Loop/Scan control-flow regions are correctly lowered to ST code w
 - Carry propagation through iterations
 """
 
-import pytest
 from codegen.types import (
-    BaseLayer,
-    MatMulLayer,
     NetworkIR,
     LoopRegionIR,
     RegionKind,
@@ -19,7 +16,6 @@ from codegen.types import (
 from codegen.ir_optimizer import OptimizationResult
 from codegen.ir_to_st.lowerers import lower_region_to_st
 from codegen.ir_to_st.st_code import STCode
-import numpy as np
 from fixtures import create_simple_matmul_layer
 
 

@@ -6,7 +6,7 @@ Identifies which tensors represent state (vs regular intermediate tensors).
 """
 
 import logging
-from typing import Dict, Set
+from typing import Dict
 from ..types import BaseLayer
 from ..onnx_model import ONNXModel
 

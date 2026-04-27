@@ -6,6 +6,7 @@ from .optimizer import (
     IROptimizer,
     DEFAULT_PASSES,
     optimize_model_regions,
+    PROFILE_PASSES,
 )
 
 from .result import OptimizationResult
@@ -17,11 +18,13 @@ from .passes import (
     RemoveWeightDequantPass,
     BufferAllocationPass,
     RemoveDropoutPass,
+    InsertQuantizePass,
 )
 
 __all__ = [
     "IROptimizer",
     "DEFAULT_PASSES",
+    "PROFILE_PASSES",
     "OptimizationPass",
     "RemoveIdentityPass",
     "RemoveNoOpReshapePass",

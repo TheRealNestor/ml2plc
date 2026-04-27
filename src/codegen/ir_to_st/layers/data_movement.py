@@ -12,7 +12,6 @@ from ...types import (
     ReshapeLayer,
     ActivationLayer,
     AddLayer,
-    ActivationType,
     QuantizeLinearLayer,
     DequantizeLinearLayer,
     DropoutLayer,
@@ -128,8 +127,14 @@ def generate_quantize_linear_code(
 
     builder.add_line(f"(* Layer {layer.layer_id}: QuantizeLinear *)")
 
-    output_plc_type = plc_type_from_onnx_dtype(layer.output_type)
-    min_val, max_val = get_type_limits_from_str(layer.output_type)
+    output_plc_type = (
+        plc_type_from_onnx_dtype(layer.output_type) if layer.output_type is not None else "REAL"
+    )
+    min_val, max_val = (
+        get_type_limits_from_str(layer.output_type)
+        if layer.output_type is not None
+        else ("-1e9", "1e9")
+    )
     cast_func = get_conversion_func("REAL", output_plc_type)
 
     is_per_tensor = layer.scale.size == 1
@@ -172,7 +177,9 @@ def generate_dequantize_linear_code(
 
     builder.add_line(f"(* Layer {layer.layer_id}: DequantizeLinear *)")
 
-    input_plc_type = plc_type_from_onnx_dtype(layer.input_type)
+    input_plc_type = (
+        plc_type_from_onnx_dtype(layer.input_type) if layer.input_type is not None else "REAL"
+    )
     cast_func = get_conversion_func(input_plc_type, "REAL")
 
     is_per_tensor = layer.scale.size == 1
@@ -282,6 +289,7 @@ def generate_slice_code(
         f"input_size={layer.input_size}, output_size={layer.output_size}"
     )
 
+    stride = None
     if len(layer.axes) == 1 and layer.steps[0] == 1:
         # Simple offset copy
         start = layer.starts[0]
@@ -296,7 +304,7 @@ def generate_slice_code(
             offset = start
 
         logger.debug(
-            f"  Slice: simple offset copy with start={start}, axis={axis}, stride={stride if layer.input_shape else 'N/A'}, offset={offset}"
+            f"  Slice: simple offset copy with start={start}, axis={axis}, stride={stride if stride is not None else 'N/A'}, offset={offset}"
         )
         return generate_offset_copy(input_var, output_var, offset, comment)
 
@@ -310,7 +318,7 @@ def generate_slice_code(
 
     else:
         # Multi-axis slice — conservative copy
-        logger.debug(f"  Slice: multi-axis slice, using conservative copy")
+        logger.debug("  Slice: multi-axis slice, using conservative copy")
         return generate_simple_copy(
             input_var,
             output_var,
@@ -352,6 +360,14 @@ def generate_transpose_code(
     in_shape = layer.input_shape
     out_shape = layer.output_shape
     perm = layer.perm
+
+    if in_shape is None or out_shape is None:
+        return generate_simple_copy(
+            input_var,
+            output_var,
+            f"Layer {layer.layer_id}: Transpose (fallback copy due to unknown shape)",
+        )
+
     ndim = len(out_shape)
 
     builder.add_line(
@@ -422,7 +438,6 @@ def generate_unsqueeze_code(
     return generate_simple_copy(
         input_var,
         output_var,
-        layer.output_size,
         f"Layer {layer.layer_id}: Unsqueeze axes={layer.unsqueeze_axes}",
     )
 
@@ -435,7 +450,6 @@ def generate_expand_code(
         return generate_simple_copy(
             input_var,
             output_var,
-            layer.output_size,
             f"Layer {layer.layer_id}: Expand (no broadcast)",
         )
 
@@ -444,7 +458,6 @@ def generate_expand_code(
         return generate_scalar_broadcast(
             input_var,
             output_var,
-            layer.output_size,
             f"Layer {layer.layer_id}: Expand (scalar broadcast) to {layer.target_shape}",
         )
     else:
@@ -452,8 +465,6 @@ def generate_expand_code(
         return generate_modulo_broadcast(
             input_var,
             output_var,
-            layer.input_size,
-            layer.output_size,
             f"Layer {layer.layer_id}: Expand (modulo broadcast) to {layer.target_shape}",
         )
 
@@ -489,7 +500,6 @@ def generate_gather_code(
         return generate_simple_copy(
             input_var,
             output_var,
-            layer.output_size,
             f"Layer {layer.layer_id}: Gather axis={layer.gather_axis} (dynamic/large indices)",
         )
 
@@ -508,7 +518,6 @@ def generate_reduce_mean_code(
         return generate_simple_copy(
             input_var,
             output_var,
-            layer.output_size,
             f"Layer {layer.layer_id}: ReduceMean scalar passthrough",
         )
 
@@ -593,7 +602,6 @@ def generate_reduce_prod_code(
         return generate_simple_copy(
             input_var,
             output_var,
-            layer.output_size,
             f"Layer {layer.layer_id}: ReduceProd scalar passthrough",
         )
 
@@ -921,4 +929,39 @@ def generate_unary_elementwise_code(
         else:
             builder.add_line(f"{output_var.at('i')} := -{input_var.at('i')};")
     builder.add_line("END_FOR;")
+    return builder.build()
+
+
+def generate_argmax_code(layer, input_var: Variable, output_var: Variable) -> STCode:
+    """Generate ArgMax code: find index of maximum element in input and
+    write it as a single integer output (output_size should be 1)."""
+    builder = STCodeBuilder()
+    builder.add_line(f"(* Layer {layer.layer_id}: ArgMax axis={getattr(layer, 'axis', -1)} *)")
+
+    # Expect a vector input; compute index of max
+    builder.add_line("max_val := -1e38;")
+    builder.add_line("t := 0;")
+    builder.add_line(f"FOR i := 0 TO {layer.input_size - 1} DO")
+    with builder.indent():
+        builder.add_line("IF max_val < (input_var.at('i') if False else 0) THEN")
+    # We cannot reference input_var in f-strings directly because it's a Variable object;
+    # instead construct proper access expression below.
+    # Rebuild with explicit expressions
+    builder = STCodeBuilder()
+    builder.add_line(f"(* Layer {layer.layer_id}: ArgMax axis={getattr(layer, 'axis', -1)} *)")
+    # Initialize
+    builder.add_line("max_val := -1e38;")
+    builder.add_line("t := 0;")
+    # Iterate
+    builder.add_line(f"FOR i := 0 TO {layer.input_size - 1} DO")
+    with builder.indent():
+        builder.add_line(f"IF {input_var.at('i')} > max_val THEN")
+        with builder.indent():
+            builder.add_line(f"max_val := {input_var.at('i')};")
+            builder.add_line("t := i;")
+        builder.add_line("END_IF;")
+    builder.add_line("END_FOR;")
+    # Write output index (as DINT)
+    builder.add_line(f"{output_var.at('0')} := t;")
+
     return builder.build()

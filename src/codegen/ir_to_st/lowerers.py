@@ -4,7 +4,7 @@ Eliminates duplication across AcyclicLowerer, RecurrentLowerer, LoopLowerer.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict
+from typing import Dict
 from dataclasses import dataclass
 
 from ..types import (

@@ -89,7 +89,7 @@ def export_or_load_model(
         # Export to ONNX
         print(" [onnx]", end="", flush=True)
         onnx_path = model.export_to_onnx()
-        print(f" [OK]", flush=True)
+        print(" [OK]", flush=True)
         return Path(onnx_path)
 
     except Exception as e:
@@ -141,7 +141,7 @@ def setup_test_models():
                 onnx_dir,
                 prefix,
             )
-        except Exception as e:
+        except Exception:
             print(f"  [SKIP] {prefix} (export failed, will use cache)", flush=True)
 
     print("=" * 70)

@@ -8,7 +8,7 @@ passes should not run on recurrent regions).
 
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Any
 from ..types import NetworkIR, RegionKind, BaseLayer
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ class OptimizationPass(ABC):
     def __init__(self):
         self.removed_layers: Set[str] = set()
         self.tensor_mapping: Dict[str, str] = {}  # Maps removed tensor -> replacement
+        self.buffer_assignments: Dict[str, Any] = {}
 
     @abstractmethod
     def get_name(self) -> str:

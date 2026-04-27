@@ -1,4 +1,3 @@
-import numpy as np
 import pytest
 
 from codegen.onnx_to_ir.shape import (

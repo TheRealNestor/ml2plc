@@ -11,7 +11,7 @@ patterns for declaring arrays and scalars with initialization values.
 from typing import Union
 import numpy as np
 from ..st_code import STCode, STCodeBuilder
-from ..type_conversion import numpy_to_plc_type, plc_type_from_onnx_dtype
+from ..type_conversion import plc_type_from_onnx_dtype
 
 
 def generate_array_constant(

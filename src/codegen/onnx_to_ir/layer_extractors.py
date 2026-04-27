@@ -6,8 +6,42 @@ Convert enriched layer dicts to IR layer objects.
 import numpy as np
 import logging
 from typing import Dict, List
-from ..types import *
-from .shape import (
+from ..types import (
+    ActivationType,
+    ActivationLayer,
+    AddLayer,
+    BaseLayer,
+    RuntimeMatMulLayer,
+    MatMulLayer,
+    GemmLayer,
+    FusedGemmLayer,
+    ReshapeLayer,
+    QuantizeLinearLayer,
+    DequantizeLinearLayer,
+    DropoutLayer,
+    Conv2DLayer,
+    Pool2DLayer,
+    FlattenLayer,
+    TransposeLayer,
+    BatchNormLayer,
+    SqueezeLayer,
+    LSTMLayer,
+    GRULayer,
+    CastLayer,
+    SliceLayer,
+    ConcatLayer,
+    UnsqueezeLayer,
+    ExpandLayer,
+    GatherLayer,
+    EinsumLayer,
+    
+    ShapeLayer,
+    ReduceMeanLayer,
+    ReduceProdLayer,
+    BinaryElementwiseLayer,
+    UnaryElementwiseLayer,
+)
+from .shape.api import (
     infer_layer_shapes,
     infer_reshape_output_shape,
     get_feature_sizes,
@@ -18,7 +52,7 @@ from .weight_utils import extract_quantized_weight, validate_weight_quantization
 from ..onnx_model import ONNXModel
 from .tensor_resolution import ResolvedTensor
 import onnx
-from onnx import TensorProto
+# Use `onnx.TensorProto` where needed; avoid direct symbol import for static analysis.
 
 logger = logging.getLogger(__name__)
 
@@ -1236,7 +1270,7 @@ def extract_gru_layer(layer: Dict, layer_id: int, analyzer: ONNXModel) -> "GRULa
 def _extract_cast_layer(enriched_layer: Dict, layer_id: int, analyzer) -> CastLayer:
     """Extract Cast layer — element-wise type conversion."""
     attrs = enriched_layer.get("attributes", {})
-    to_type = attrs.get("to", TensorProto.FLOAT)
+    to_type = attrs.get("to", onnx.TensorProto.FLOAT)
     np_dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE.get(to_type, np.float32)
     target_type_str = str(np_dtype)
 
@@ -1245,7 +1279,6 @@ def _extract_cast_layer(enriched_layer: Dict, layer_id: int, analyzer) -> CastLa
     input_size, output_size = get_feature_sizes(input_shape, output_shape)
 
     resolved_in = enriched_layer["resolved_inputs"]
-    resolved_out = enriched_layer["resolved_outputs"]
 
     input_dtype = resolved_in[0].dtype if resolved_in else None
     output_dtype = target_type_str
@@ -1269,7 +1302,7 @@ def _extract_cast_layer(enriched_layer: Dict, layer_id: int, analyzer) -> CastLa
 def _extract_slice_layer(enriched_layer: Dict, layer_id: int, analyzer) -> SliceLayer:
     """Extract Slice layer — sub-tensor extraction along axes."""
     resolved_in = enriched_layer["resolved_inputs"]
-    resolved_out = enriched_layer["resolved_outputs"]
+    resolved_out = enriched_layer.get("resolved_outputs")
 
     # Slice has up to 5 inputs: data, starts, ends, axes, steps
     # starts/ends/axes/steps are typically constants already resolved
@@ -1356,7 +1389,7 @@ def _extract_concat_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Conc
     axis = attrs.get("axis", 0)
 
     resolved_in = enriched_layer["resolved_inputs"]
-    resolved_out = enriched_layer["resolved_outputs"]
+    resolved_out = enriched_layer.get("resolved_outputs")
 
     input_sizes = [ri.size for ri in resolved_in]
     total_size = sum(input_sizes)
@@ -1392,7 +1425,6 @@ def _extract_unsqueeze_layer(
 ) -> UnsqueezeLayer:
     """Extract Unsqueeze layer — insert size-1 dimensions (identity on flat data)."""
     resolved_in = enriched_layer["resolved_inputs"]
-    resolved_out = enriched_layer["resolved_outputs"]
 
     # Axes from second input (opset 13+) or from attribute (opset < 13)
     if len(resolved_in) > 1 and resolved_in[1].value is not None:
@@ -1456,9 +1488,9 @@ def _extract_expand_layer(enriched_layer: Dict, layer_id: int, analyzer) -> Expa
     if output_dtype is None:
         logger.warning(
             f"Expand layer '{enriched_layer.get('name')}': output dtype is None, "
-            f"using input dtype or TensorProto.FLOAT as fallback"
+            f"using input dtype or onnx.TensorProto.FLOAT as fallback"
         )
-        output_dtype = "TensorProto.FLOAT"
+        output_dtype = onnx.TensorProto.FLOAT
 
     return ExpandLayer(
         layer_id=layer_id,
@@ -1530,7 +1562,6 @@ def _extract_shape_layer(enriched_layer: Dict, layer_id: int, analyzer) -> "Shap
     has a known static shape from shape inference, so we emit a no-op layer.
     """
     resolved_in = enriched_layer["resolved_inputs"]
-    resolved_out = enriched_layer["resolved_outputs"]
 
     input_shape = (
         tuple(resolved_in[0].shape) if resolved_in and resolved_in[0].shape else ()
@@ -1825,12 +1856,22 @@ LAYER_EXTRACTORS = {
     "ReduceMean": _extract_reduce_mean_layer,
     "ReduceProd": _extract_reduce_prod_layer,
     "Einsum": _extract_einsum_layer,
-    "Sub": lambda l, i, a: _extract_binary_elementwise_layer(l, i, a, "Sub"),
-    "Mul": lambda l, i, a: _extract_binary_elementwise_layer(l, i, a, "Mul"),
-    "Max": lambda l, i, a: _extract_binary_elementwise_layer(l, i, a, "Max"),
-    "Sqrt": lambda l, i, a: _extract_unary_elementwise_layer(l, i, a, "Sqrt"),
-    "Reciprocal": lambda l, i, a: _extract_unary_elementwise_layer(
-        l, i, a, "Reciprocal"
+    "Sub": lambda layer, inputs, analyzer: _extract_binary_elementwise_layer(
+        layer, inputs, analyzer, "Sub"
     ),
-    "Neg": lambda l, i, a: _extract_unary_elementwise_layer(l, i, a, "Neg"),
+    "Mul": lambda layer, inputs, analyzer: _extract_binary_elementwise_layer(
+        layer, inputs, analyzer, "Mul"
+    ),
+    "Max": lambda layer, inputs, analyzer: _extract_binary_elementwise_layer(
+        layer, inputs, analyzer, "Max"
+    ),
+    "Sqrt": lambda layer, inputs, analyzer: _extract_unary_elementwise_layer(
+        layer, inputs, analyzer, "Sqrt"
+    ),
+    "Reciprocal": lambda layer, inputs, analyzer: _extract_unary_elementwise_layer(
+        layer, inputs, analyzer, "Reciprocal"
+    ),
+    "Neg": lambda layer, inputs, analyzer: _extract_unary_elementwise_layer(
+        layer, inputs, analyzer, "Neg"
+    ),
 }

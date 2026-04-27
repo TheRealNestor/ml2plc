@@ -10,7 +10,7 @@ from typing import List, Optional, Dict
 
 from ..graph import LayerGraph
 from ..ir_utils import TensorMapBuilder
-from ..types import NetworkIR, ModelIR, RegionKind
+from ..types import NetworkIR, ModelIR
 from .base_pass import OptimizationPass
 from .result import OptimizationResult
 from .passes import (
@@ -22,11 +22,26 @@ from .passes import (
     BufferAllocationPass,
     RemoveDropoutPass,
 )
+from .passes import (
+    InsertQuantizePass,
+    PrecisionReductionPass,
+    PruneWeightsPass,
+    FoldQuantizedWeightsPass,
+    LoopUnrollingPass,
+    RemoveSoftmaxPass,
+)
+from .passes import (
+    TransposeWeightsPass,
+    DeadVariableEliminationPass,
+    ConstantFoldingPass,
+    IndexPrecomputationPass,
+)
 from .region_strategies import optimize_region_with_passes, validate_pass_applicability
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PASSES: List[OptimizationPass] = [
+# Base (safe) pass sequence: conservative, semantics-preserving passes only
+SAFE_PASSES: List[OptimizationPass] = [
     RemoveDropoutPass(),
     RemoveIdentityPass(),
     RemoveWeightDequantPass(),
@@ -35,6 +50,45 @@ DEFAULT_PASSES: List[OptimizationPass] = [
     FuseLinearActivationPass(),
     BufferAllocationPass(),  # Produces code generation hints, doesn't modify IR
 ]
+
+# Aggressive profile: ordered sequence that includes all safe passes plus
+# lossy and opt-in transforms in a deterministic order. The order is chosen
+# to respect data dependencies and maximize the opportunity for later passes
+# to observe simplified tensors (e.g., prune -> reduce precision -> quantize).
+AGGRESSIVE_PASSES: List[OptimizationPass] = [
+    # Early cleanups (semantics-preserving)
+    RemoveDropoutPass(),
+    RemoveIdentityPass(),
+    RemoveWeightDequantPass(),
+    RemoveNoOpReshapePass(),
+    RemoveRedundantQuantPairPass(),
+
+    # Lossy / aggressive sequence (user-specified ordering)
+    PruneWeightsPass(),
+    PrecisionReductionPass(),
+    InsertQuantizePass(),
+    FoldQuantizedWeightsPass(),
+    TransposeWeightsPass(),
+    FuseLinearActivationPass(),
+    RemoveSoftmaxPass(),
+    LoopUnrollingPass(),
+
+    # Cleanups and simplifications after transformations
+    DeadVariableEliminationPass(),
+    ConstantFoldingPass(),
+    IndexPrecomputationPass(),
+
+    # Final codegen hints / buffer allocation
+    BufferAllocationPass(),
+]
+
+# Expose profiles as a mapping. Keep DEFAULT_PASSES for backwards compatibility
+PROFILE_PASSES: Dict[str, List[OptimizationPass]] = {
+    "safe": SAFE_PASSES,
+    "aggressive": AGGRESSIVE_PASSES,
+}
+
+DEFAULT_PASSES: List[OptimizationPass] = PROFILE_PASSES["safe"]
 
 
 def optimize_model_regions(

@@ -17,7 +17,7 @@ from .variable import Variable
 from ..types import *
 from ..ir_optimizer import OptimizationResult
 from .st_code import STCode, STCodeBuilder, st_comment
-from .type_conversion import plc_type_from_onnx_dtype, get_type_limits_from_str
+from .type_conversion import plc_type_from_onnx_dtype
 from .layer_constants import (
     generate_layer_weights,
     generate_layer_bias,

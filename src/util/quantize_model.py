@@ -90,7 +90,7 @@ class ModelQuantizer:
             else:
                 raise ValueError(f"Unsupported model format: {self.model_path.suffix}")
                 
-            print(f"Model loaded successfully!")
+            print("Model loaded successfully!")
             
         except Exception as e:
             print(f"Error loading model: {e}")
@@ -243,12 +243,12 @@ class ModelQuantizer:
         
         if original_size > 0:
             compression_ratio = (1 - quantized_size / original_size) * 100
-            print(f"\nQuantization complete!")
+            print("\nQuantization complete!")
             print(f"Original model size: {original_size / 1024 / 1024:.2f} MB")
             print(f"Quantized model size: {quantized_size / 1024 / 1024:.2f} MB")
             print(f"Size reduction: {compression_ratio:.1f}%")
         else:
-            print(f"\nQuantization complete!")
+            print("\nQuantization complete!")
             print(f"Quantized model size: {quantized_size / 1024 / 1024:.2f} MB")
 
 

@@ -34,6 +34,7 @@ from .data_movement import (
     generate_unary_elementwise_code,
     generate_runtime_matmul_code,
     generate_einsum_code,
+    generate_argmax_code,
 )
 
 __all__ = [
@@ -65,4 +66,5 @@ __all__ = [
     "generate_unary_elementwise_code",
     "generate_runtime_matmul_code",
     "generate_einsum_code",
+    "generate_argmax_code",
 ]

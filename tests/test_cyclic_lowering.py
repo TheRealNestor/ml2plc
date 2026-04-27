@@ -9,8 +9,6 @@ Validates that recurrent regions are correctly lowered to ST code with:
 
 import pytest
 from codegen.types import (
-    BaseLayer,
-    MatMulLayer,
     NetworkIR,
     RecurrentRegionIR,
     AcyclicRegionIR,
@@ -20,7 +18,6 @@ from codegen.types import (
 from codegen.ir_optimizer import OptimizationResult
 from codegen.ir_to_st.lowerers import lower_region_to_st
 from codegen.ir_to_st.st_code import STCode
-import numpy as np
 from unittest.mock import MagicMock
 from fixtures import create_simple_matmul_layer
 

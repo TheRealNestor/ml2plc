@@ -143,7 +143,6 @@ def test_has_cycle_acyclic_graph():
 
 def test_tarjan_scc_single_cycle():
     """Simple cycle should produce one SCC."""
-    from codegen.graph_algorithms import tarjan_scc
 
     adjacency = {
         "A": {"B"},
@@ -157,7 +156,6 @@ def test_tarjan_scc_single_cycle():
 
 def test_tarjan_scc_multiple_sccs():
     """Multiple SCCs should be separated."""
-    from codegen.graph_algorithms import tarjan_scc
 
     adjacency = {
         "A": {"B"},
@@ -185,7 +183,6 @@ def test_tarjan_scc_multiple_sccs():
 
 def test_tarjan_scc_acyclic_graph():
     """Each node is its own SCC in acyclic graph."""
-    from codegen.graph_algorithms import tarjan_scc
 
     adjacency = {
         "A": {"B"},
@@ -286,7 +283,6 @@ def test_condensation_execution_order_single_node():
 
 def test_build_layer_graph_simple_chain():
     """Simple linear chain produces correct adjacency."""
-    from codegen.graph_algorithms import build_layer_graph
 
     layers = {
         "A": _layer("A", inputs=("x",), outputs=("a",)),
@@ -307,7 +303,6 @@ def test_build_layer_graph_simple_chain():
 
 def test_build_layer_graph_fan_in_fan_out():
     """Complex fan-in/fan-out structure."""
-    from codegen.graph_algorithms import build_layer_graph
 
     layers = {
         "A": _layer("A", inputs=("x",), outputs=("a",)),

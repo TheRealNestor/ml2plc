@@ -14,7 +14,41 @@ from typing import Dict, Callable, Optional, Set
 from dataclasses import dataclass
 import logging
 
-from ..types import *
+from ..types import (
+    BaseLayer,
+    MatMulLayer,
+    GemmLayer,
+    FusedGemmLayer,
+    FusedLinearLayer,
+    AddLayer,
+    ReduceMeanLayer,
+    ReduceProdLayer,
+    RuntimeMatMulLayer,
+    EinsumLayer,
+    BinaryElementwiseLayer,
+    UnaryElementwiseLayer,
+    ReshapeLayer,
+    FlattenLayer,
+    SqueezeLayer,
+    TransposeLayer,
+    UnsqueezeLayer,
+    ExpandLayer,
+    SliceLayer,
+    CastLayer,
+    ShapeLayer,
+    GatherLayer,
+    ConcatLayer,
+    ActivationLayer,
+    ArgMaxLayer,
+    QuantizeLinearLayer,
+    DequantizeLinearLayer,
+    DropoutLayer,
+    Conv2DLayer,
+    Pool2DLayer,
+    BatchNormLayer,
+    LSTMLayer,
+    GRULayer,
+)
 from .st_code import STCode
 
 logger = logging.getLogger(__name__)
@@ -27,7 +61,7 @@ class GeneratorMetadata:
     layer_type: type
     generator: Callable
     wrap_single_input: bool = False
-    supported_regions: Set[str] = None
+    supported_regions: Optional[Set[str]] = None
     requires_state: bool = False
     fused_activation: bool = False
 
@@ -39,7 +73,7 @@ class GeneratorMetadata:
 
     def supports_region(self, region_type: str) -> bool:
         """Check if this generator supports a specific region type."""
-        return region_type in self.supported_regions
+        return region_type in (self.supported_regions or set())
 
 
 class LayerCodeGeneratorRegistry:
@@ -216,10 +250,22 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
         UnsqueezeLayer, gen.generate_unsqueeze_code, wrap_single_input=True
     )
     registry.register(ExpandLayer, gen.generate_expand_code, wrap_single_input=True)
-    registry.register(SliceLayer, lambda l, i, o: gen.generate_slice_code(l, i[0], o))
-    registry.register(CastLayer, lambda l, i, o: gen.generate_cast_code(l, i[0], o))
-    registry.register(ShapeLayer, lambda l, i, o: gen.generate_shape_code(l, i[0], o))
-    registry.register(GatherLayer, lambda l, i, o: gen.generate_gather_code(l, i[0], o))
+    registry.register(
+        SliceLayer,
+        lambda layer, inputs, output: gen.generate_slice_code(layer, inputs[0], output),
+    )
+    registry.register(
+        CastLayer,
+        lambda layer, inputs, output: gen.generate_cast_code(layer, inputs[0], output),
+    )
+    registry.register(
+        ShapeLayer,
+        lambda layer, inputs, output: gen.generate_shape_code(layer, inputs[0], output),
+    )
+    registry.register(
+        GatherLayer,
+        lambda layer, inputs, output: gen.generate_gather_code(layer, inputs[0], output),
+    )
 
     # Concatenation (multiple inputs)
     registry.register(
@@ -231,6 +277,13 @@ def _initialize_default_generators(registry: LayerCodeGeneratorRegistry) -> None
     registry.register(
         ActivationLayer,
         gen.generate_activation_layer_code,
+        wrap_single_input=True,
+    )
+
+    # ArgMax (index of maximum)
+    registry.register(
+        ArgMaxLayer,
+        gen.generate_argmax_code,
         wrap_single_input=True,
     )
 
