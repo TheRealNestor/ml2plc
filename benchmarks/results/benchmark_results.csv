@@ -1,22 +1,22 @@
 Model Name,Type,Description,Parameters,ONNX Size (KB),ST Size (KB),Deployable,Max Abs Error,Status,Test Accuracy
-MLP1,MLP,"2 layers, 8/8",115,2.56,3.56,Yes,2.505882460424047e-07,OK,0.975
-MLP2,MLP,"2 layers, 16/12",275,3.32,5.63,Yes,1.6119689812132965e-07,OK,0.9833
-MLP3,MLP,"3 layers, 16/12/8",367,4.33,7.16,Yes,3.826241683491105e-07,OK,0.993
-MLP4,MLP,"5 layers, 12",687,6.98,11.95,Yes,5.889362413302734e-07,OK,0.994
-MLP5,MLP,"11 layers, 8",763,11.28,14.71,Yes,2.1700331300222864e-06,OK,0.987
-MLP6,MLP,"2 layers, 32/24",931,5.94,14.21,Yes,1.8694877990110825e-07,OK,0.988
-MLP7,MLP,"5 layers, 24",2523,14.16,36.36,Yes,5.450020621466933e-07,OK,0.9867
-MLP8,MLP,"2 layers, 64/48",3395,15.56,47.09,Yes,1.4762149835867433e-07,OK,0.994
-LSTM1,LSTM,"1 layer, 14 units",941,7.39,17.38,Yes,1.4625853872463068e-07,OK,0.963
-LSTM2,LSTM,"1 layer, 32 units",4451,21.49,65.96,Yes,1.772592722604216e-07,OK,0.9723
-GRU1,GRU,"1 layer, 16 units",963,7.22,16.86,Yes,3.201436791222534e-07,OK,0.9623
-GRU2,GRU,"1 layer, 36 units",4323,20.42,62.78,Yes,2.7153857823369876e-07,OK,0.975
-CNN1,CNN,"1 layer, 6 filters",175,3.22,4.85,Yes,2.6467495584103773e-07,OK,0.978
-CNN2,CNN,"2 layers, 10 filters",357,4.92,8.13,Yes,3.791302199407376e-07,OK,0.9937
-ResNet1,ResNet,"1 skip block, width 16",627,5.06,10.86,Yes,1.4720353391783902e-07,OK,0.9873
-ResNet2,ResNet,"2 skip blocks, width 32",4387,21.23,62.07,Yes,4.1985826693125006e-07,OK,0.9943
-MLP9,MLP,"2 layers, 128/96",12931,52.88,176.69,No,4.137265225967468e-07,OK,0.9907
-LSTM3,LSTM,"2 layers, 64 units",50115,203.81,699.05,No,8.498164318915258e-07,OK,0.9877
-GRU3,GRU,"2 layers, 64 units",38019,154.34,524.44,No,3.3032791701970154e-07,OK,0.99
-CNN3,CNN,"3 layers, 32 filters",2755,15.09,40.84,Yes,4.0095321252042737e-07,OK,0.9917
-ResNet3,ResNet,"3 skip blocks, width 64",25283,104.18,346.76,No,6.430025264458905e-07,OK,0.9943
+MLP1,MLP,"2 layers, 8/8",115,7.01,0.0,No,,ST Compile Failed,0.7333
+MLP2,MLP,"2 layers, 16/12",275,7.62,0.0,No,,ST Compile Failed,0.8917
+MLP3,MLP,"3 layers, 16/12/8",367,9.97,0.0,No,,ST Compile Failed,0.9173
+MLP4,MLP,"5 layers, 12",687,15.07,0.0,No,,ST Compile Failed,0.958
+MLP5,MLP,"11 layers, 8",763,28.91,0.0,No,,ST Compile Failed,0.745
+MLP6,MLP,"2 layers, 32/24",931,8.46,0.0,No,,ST Compile Failed,0.982
+MLP7,MLP,"5 layers, 24",2523,17.05,0.0,No,,ST Compile Failed,0.957
+MLP8,MLP,"2 layers, 64/48",3395,11.03,0.0,No,,ST Compile Failed,0.934
+LSTM1,LSTM,"1 layer, 14 units",941,5.66,0.0,No,,ST Compile Failed,0.665
+LSTM2,LSTM,"1 layer, 32 units",4451,9.69,0.0,No,,ST Compile Failed,0.776
+GRU1,GRU,"1 layer, 16 units",963,7.73,0.0,No,,ST Compile Failed,0.8767
+GRU2,GRU,"1 layer, 36 units",4323,20.79,0.0,No,,ST Compile Failed,0.873
+CNN1,CNN,"1 layer, 6 filters",175,9.16,0.0,No,,ST Compile Failed,0.9393
+CNN2,CNN,"2 layers, 10 filters",357,12.99,0.0,No,,ST Compile Failed,0.8807
+ResNet1,ResNet,"1 skip block, width 16",627,9.44,0.0,No,,ST Compile Failed,0.9167
+ResNet2,ResNet,"2 skip blocks, width 32",4387,18.14,0.0,No,,ST Compile Failed,0.9537
+MLP9,MLP,"2 layers, 128/96",12931,20.88,0.0,No,,ST Compile Failed,0.9453
+LSTM3,LSTM,"2 layers, 64 units",50115,57.8,0.0,No,,ST Compile Failed,0.91
+GRU3,GRU,"2 layers, 64 units",38019,152.74,0.0,No,,ST Compile Failed,0.9367
+CNN3,CNN,"3 layers, 32 filters",2755,19.04,0.0,No,,ST Compile Failed,0.9637
+ResNet3,ResNet,"3 skip blocks, width 64",25283,43.71,0.0,No,,ST Compile Failed,0.989

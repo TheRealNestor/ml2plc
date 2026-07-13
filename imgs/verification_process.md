@@ -11,24 +11,24 @@ flowchart LR
     classDef fail fill:#f8d7da,stroke:#dc3545,stroke-width:1px,color:black
 
     %% --- Inputs ---
-    X[Test Vectors]:::data
+    X[Test Inputs]:::data
 
     %% --- Reference Path ---
-    subgraph Ref ["ONNX Reference"]
+    subgraph Ref ["Reference Model (ONNX)"]
         ONNX[ONNX Inference]:::process
     end
 
     %% --- Compiled Path ---
-    subgraph Comp ["Compiled ST Program"]
-        ST[ST Simulation]:::process
+    subgraph Comp ["Compiled Program"]
+        ST[ST Simulation in Python]:::process
     end
 
     %% --- Comparison ---
-    Diff[Compute E_max]:::compute
-    Check{E_max < ε ?}:::decision
+    Diff[Output Comparison]:::compute
+    Check{Within Tolerance}:::decision
 
-    Pass[Validation PASSED]:::pass
-    Fail[Validation FAILED]:::fail
+    Pass[Semantics Preserved]:::pass
+    Fail[Deviation Detected]:::fail
 
     %% --- Connections ---
     X --> ONNX

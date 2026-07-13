@@ -8,6 +8,7 @@ version = "0.0.1"
 dependencies = [
     "numpy==1.24.3",
     "matplotlib",
+    "scipy",
     "pytest",
     "scikit-learn",
     "tensorflow==2.15.0",
