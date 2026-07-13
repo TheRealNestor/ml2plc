@@ -60,3 +60,16 @@ pip install -e .
 - The compiler now includes first-class support for recurrent/stateful lowering (LSTM/GRU) and common spatial operators.
 - Some operators are pattern-limited (for example selected Einsum equations) to keep generated ST deterministic and PLC-friendly.
 - If compilation fails, use the reported operator list to prioritize new extractor/generator additions.
+
+## Citation
+
+If you use this compiler or the accompanying models in your research, please cite our IEEE ETFA 2026 paper:
+
+```bibtex
+@inproceedings{jakobsen2026deploying,
+  title={Deploying Neural Networks on Resource-Constrained PLCs via IEC 61131-3 Compilation},
+  author={Jakobsen, Nikolaj K{\"u}hne and Saleh, Firas Harbo and Hill, Kristian Dueholm},
+  booktitle={Proceedings of the IEEE International Conference on Emerging Technologies and Factory Automation (ETFA)},
+  year={2026},
+  organization={IEEE}
+}
